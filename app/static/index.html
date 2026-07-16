@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>GeoSAM2 — Evaluation</title>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<style>
+:root{
+  --bg:#fafaf9; --surface:#ffffff; --surface2:#f5f5f4; --surface3:#e7e5e4;
+  --border:#e7e5e4; --border2:#d6d3d1;
+  --ink:#292524; --ink2:#57534e; --ink3:#78716c; --ink4:#a8a29e;
+  --accent:#44403c; --accent-dim:rgba(68,64,60,.10);
+  --warn:#b45309; --warn-bg:#fffbeb; --warn-border:#fcd34d;
+  --radius:12px;
+  --sans:'Aspekta','Inter',system-ui,-apple-system,Arial,sans-serif;
+  --mono:'Geist Mono','JetBrains Mono','Fira Code',monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--bg);color:var(--ink)}
+#app{display:flex;height:100vh}
+
+/* ── Left panel ───────────────────────────────────────────── */
+#left-panel{width:400px;min-width:340px;display:flex;flex-direction:column;
+  background:var(--surface);border-right:1px solid var(--border2);overflow:hidden}
+#input-viewer-wrap{height:210px;position:relative;border-bottom:1px solid var(--border2);background:var(--surface3)}
+#input-canvas{display:block;width:100%;height:100%}
+#input-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--ink4);font-size:12px;pointer-events:none}
+#controls{flex:1;overflow-y:auto;padding:16px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+
+/* ── Center panel ─────────────────────────────────────────── */
+#center-panel{flex:1;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--bg)}
+#output-canvas-wrap{flex:1;position:relative;overflow:hidden}
+#output-canvas{display:block;width:100%;height:100%}
+#center-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--ink4);font-size:13px;pointer-events:none;text-align:center;line-height:1.7}
+#output-stats{display:none;flex-wrap:wrap;background:var(--surface2);border-top:1px solid var(--border2);padding:6px 14px}
+#output-stats.visible{display:flex}
+.stat-block{display:flex;flex-direction:column;align-items:center;padding:4px 18px;border-right:1px solid var(--border);min-width:80px}
+.stat-block:last-child{border-right:none}
+.stat-label{font-size:10px;color:var(--ink3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:2px}
+.stat-value{font-size:15px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums;font-family:var(--mono)}
+#spinner-overlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  background:rgba(250,250,249,.85);z-index:20;flex-direction:column;gap:14px}
+#spinner-overlay.visible{display:flex}
+.spinner{width:44px;height:44px;border:4px solid var(--surface3);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#spinner-note{font-size:12px;color:var(--ink3);font-family:var(--mono)}
+
+/* ── Right panel ──────────────────────────────────────────── */
+#right-panel{width:260px;min-width:220px;display:flex;flex-direction:column;
+  background:var(--surface);border-left:1px solid var(--border2);overflow:hidden}
+.panel-header{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink3);
+  font-family:var(--mono);padding:12px 14px 8px;border-bottom:1px solid var(--border2)}
+#parts{flex:1;overflow-y:auto;padding:12px 14px;font-size:13px}
+.parts-empty{color:var(--ink4);font-size:12px;line-height:1.6}
+.part-row{display:flex;align-items:center;gap:7px;padding:3px 0}
+.part-swatch{width:12px;height:12px;border-radius:3px;border:1px solid var(--border2);flex-shrink:0}
+.part-name{font-size:12.5px;color:var(--ink2);flex:1}
+.part-faces{font-size:11px;color:var(--ink4);font-family:var(--mono)}
+.part-root{font-size:12.5px;color:var(--ink);font-weight:600;margin-bottom:6px;
+  word-break:break-all;padding-bottom:6px;border-bottom:1px solid var(--border)}
+
+/* ── Controls ─────────────────────────────────────────────── */
+.section{border-top:1px solid var(--border2);padding-top:15px;margin-top:15px}
+#controls > .section:first-child{border-top:none;padding-top:0;margin-top:0}
+.section-title{font-size:13px;font-weight:600;color:var(--ink);margin-bottom:12px;cursor:pointer;
+  user-select:none;display:flex;align-items:center;gap:8px}
+.section-title::before{content:'▸';font-size:11px;transition:transform .2s;color:var(--ink3)}
+.section-title.open::before{transform:rotate(90deg)}
+.section-body{display:none;flex-direction:column;gap:9px}
+.section-body.open{display:flex}
+.row{display:flex;align-items:center;gap:10px}
+.row > label{font-size:12px;flex:0 0 128px;width:128px;user-select:none;color:var(--ink2);line-height:1.25}
+.row input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+.row input[type=number],.row select{background:var(--surface);color:var(--ink);border:1px solid var(--border2);
+  border-radius:6px;padding:4px 6px;font-size:12px;outline:none}
+.row input[type=range]{flex:2;min-width:70px;accent-color:var(--accent)}
+.row select{flex:1;min-width:0}
+.row input:focus,.row select:focus{border-color:var(--accent)}
+.hint{font-size:11px;color:var(--ink4);line-height:1.5}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 14px;
+  border:1.5px solid var(--ink);border-radius:var(--radius);font-size:13px;font-weight:500;
+  cursor:pointer;transition:background .2s,border-color .2s;width:100%;background:var(--surface);color:var(--ink)}
+.btn-primary{background:var(--ink);color:var(--bg)}
+.btn-primary:hover:not(:disabled){background:var(--ink2);border-color:var(--ink2)}
+.btn:disabled{background:var(--border2);border-color:var(--border2);color:var(--surface);cursor:not-allowed}
+#segment-btn{margin-top:20px}
+#download-btn{margin-top:8px;display:none}
+#download-btn.visible{display:inline-flex}
+#status{font-size:11px;color:var(--ink3);text-align:center;min-height:30px;margin-top:10px;
+  font-family:var(--mono);line-height:1.5;word-break:break-word}
+#status.error{color:#b91c1c}
+.banner{background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;
+  padding:9px 11px;margin-bottom:14px;font-size:11.5px;color:var(--warn);line-height:1.5}
+#file-input{display:none}
+.env{font-size:10.5px;color:var(--ink4);font-family:var(--mono);padding:8px 14px;
+  border-top:1px solid var(--border2);line-height:1.6}
+</style>
+</head>
+
+<body>
+<div id="app">
+
+  <div id="left-panel">
+    <div id="input-viewer-wrap">
+      <canvas id="input-canvas"></canvas>
+      <div id="input-empty">input mesh</div>
+    </div>
+
+    <div id="controls">
+      <div id="banners"></div>
+
+      <div class="section">
+        <div class="section-title open" data-toggle>Input</div>
+        <div class="section-body open">
+          <div class="row">
+            <label for="sample-select">Sample</label>
+            <select id="sample-select"></select>
+          </div>
+          <button class="btn" id="upload-btn">Upload a mesh…</button>
+          <input type="file" id="file-input" accept=".glb,.gltf,.obj,.ply,.stl"/>
+          <div class="hint" id="input-hint">
+            Bundled samples ship pre-rendered views and run without Blender.
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-title open" data-toggle>Parameters</div>
+        <div class="section-body open">
+          <div class="row">
+            <label for="prompt-select">Seed prompt</label>
+            <select id="prompt-select"></select>
+          </div>
+          <div class="row">
+            <label for="pa-range">Small-part cutoff</label>
+            <input type="range" id="pa-range" min="0" max="0.1" step="0.005" value="0.02"/>
+            <input type="number" id="pa-num" min="0" max="0.1" step="0.005" value="0.02" style="width:66px;text-align:right"/>
+          </div>
+          <div class="row">
+            <label for="postprocess-cb">Post-process</label>
+            <input type="checkbox" id="postprocess-cb" checked/>
+          </div>
+          <div class="row">
+            <label for="opposite-cb">Opposite auto-seg</label>
+            <input type="checkbox" id="opposite-cb" checked/>
+          </div>
+          <div class="hint">
+            View count and resolution are fixed at 12 / 1024 in GeoSAM2 and are
+            deliberately not exposed — changing them corrupts the lift silently.
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="segment-btn" disabled>Segment</button>
+      <button class="btn" id="download-btn">Download GLB</button>
+      <div id="status"></div>
+    </div>
+
+    <div class="env" id="env-info">checking environment…</div>
+  </div>
+
+  <div id="center-panel">
+    <div id="output-canvas-wrap">
+      <canvas id="output-canvas"></canvas>
+      <div id="center-empty">Pick a sample and press Segment.<br/>GeoSAM2 takes roughly 30 s per object.</div>
+      <div id="spinner-overlay">
+        <div class="spinner"></div>
+        <div id="spinner-note">segmenting…</div>
+      </div>
+    </div>
+    <div id="output-stats">
+      <div class="stat-block"><div class="stat-label">Parts</div><div class="stat-value" id="stat-parts">—</div></div>
+      <div class="stat-block"><div class="stat-label">Unlabeled</div><div class="stat-value" id="stat-unlabeled">—</div></div>
+      <div class="stat-block"><div class="stat-label">Seed view</div><div class="stat-value" id="stat-seed">—</div></div>
+      <div class="stat-block"><div class="stat-label">Elapsed</div><div class="stat-value" id="stat-elapsed">—</div></div>
+    </div>
+  </div>
+
+  <div id="right-panel">
+    <div class="panel-header">Parts</div>
+    <div id="parts"><div class="parts-empty">
+      GeoSAM2 returns unnamed, unordered parts — this list is a legend, not a
+      hierarchy. Naming would need a separate VLM pass.
+    </div></div>
+  </div>
+
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+document.querySelectorAll('[data-toggle]').forEach(t => {
+  t.onclick = () => { t.classList.toggle('open'); t.nextElementSibling.classList.toggle('open'); };
+});
+
+/* ── Viewer ───────────────────────────────────────────────── */
+const gltfLoader = new GLTFLoader();
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/');
+gltfLoader.setDRACOLoader(dracoLoader);
+
+function createViewer(canvasId, wrapId) {
+  const canvas = $(canvasId), wrap = $(wrapId);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color('#e7e5e4');
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  // No tone mapping: parts are identified by exact colour, nothing may remap hues.
+  renderer.toneMapping = THREE.NoToneMapping;
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true; controls.dampingFactor = 0.08;
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x888888, 1.0),
+            new THREE.AmbientLight(0xffffff, 0.4));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.5); dir.position.set(5, 10, 5);
+  scene.add(dir);
+
+  const v = { scene, camera, renderer, controls, wrap, currentModel: null };
+  const resize = () => {
+    const w = wrap.clientWidth, h = wrap.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+  };
+  window.addEventListener('resize', resize);
+  new ResizeObserver(resize).observe(wrap);
+  resize();
+  (function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+  return v;
+}
+
+function disposeModel(v) {
+  if (!v.currentModel) return;
+  v.currentModel.traverse(ch => {
+    if (ch.isMesh) {
+      ch.geometry?.dispose();
+      (Array.isArray(ch.material) ? ch.material : [ch.material]).forEach(m => m?.dispose());
+    }
+  });
+  v.scene.remove(v.currentModel);
+  v.currentModel = null;
+}
+
+function loadGlb(v, blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    gltfLoader.load(url, (gltf) => {
+      URL.revokeObjectURL(url);
+      disposeModel(v);
+      const model = gltf.scene;
+      v.scene.add(model);
+      v.currentModel = model;
+      model.traverse(ch => {
+        if (!ch.isMesh) return;
+        // Vertex-colour-only parts carry no material, so glTF's default applies
+        // (metalness=1) and a fully metallic surface hides the diffuse colour.
+        for (const m of Array.isArray(ch.material) ? ch.material : [ch.material]) {
+          if (m && m.isMeshStandardMaterial) m.metalness = 0;
+        }
+      });
+      const box = new THREE.Box3().setFromObject(model);
+      const center = box.getCenter(new THREE.Vector3());
+      const radius = box.getBoundingSphere(new THREE.Sphere()).radius || 1;
+      model.position.sub(center);
+      const dist = radius * 2.5;
+      v.camera.near = Math.max(0.01, radius / 100);
+      v.camera.far = radius * 200;
+      v.camera.position.set(dist * 0.7, dist * 0.5, dist * 0.7);
+      v.camera.updateProjectionMatrix();
+      v.controls.target.set(0, 0, 0); v.controls.update();
+      resolve();
+    }, undefined, (err) => { URL.revokeObjectURL(url); reject(err); });
+  });
+}
+
+const inputViewer = createViewer('input-canvas', 'input-viewer-wrap');
+const outputViewer = createViewer('output-canvas', 'output-canvas-wrap');
+
+/* ── State ────────────────────────────────────────────────── */
+let samples = [], uploadFile = null, lastGlbUrl = null, env = null;
+
+const sampleSelect = $('sample-select'), promptSelect = $('prompt-select');
+const paRange = $('pa-range'), paNum = $('pa-num');
+paRange.oninput = () => paNum.value = paRange.value;
+paNum.oninput = () => paRange.value = paNum.value;
+
+function setStatus(text, isError = false) {
+  const s = $('status');
+  s.textContent = text;
+  s.classList.toggle('error', isError);
+}
+
+/* ── Bootstrap ────────────────────────────────────────────── */
+async function boot() {
+  const [statusRes, samplesRes] = await Promise.all([
+    fetch('/api/status').then(r => r.json()),
+    fetch('/api/samples').then(r => r.json()),
+  ]);
+  env = statusRes;
+  samples = samplesRes.samples || [];
+
+  $('env-info').textContent =
+    `ckpt ${env.checkpoint.present ? '✓ ' + env.checkpoint.size_mb + ' MB' : '✗ missing'}` +
+    ` · cuda ${env.cuda.available ? '✓' : '✗'}` +
+    ` · blender ${env.blender.usable ? '✓ ' + env.blender.version : '✗'}`;
+
+  const banners = $('banners');
+  if (!env.checkpoint.present) {
+    banners.append(el('div', 'banner', `Checkpoint missing at ${env.checkpoint.path}. Segmentation will fail.`));
+  }
+  if (!env.cuda.available) {
+    banners.append(el('div', 'banner', 'No CUDA device — GeoSAM2 needs bf16 (Ampere+). CPU will be very slow or fail.'));
+  }
+  if (!env.blender.usable) {
+    banners.append(el('div', 'banner', `Blender unusable: ${env.blender.note} Uploads are disabled; bundled samples still work.`));
+    $('upload-btn').disabled = true;
+  }
+
+  sampleSelect.innerHTML = '';
+  if (!samples.length) {
+    sampleSelect.append(el('option', null, 'no pre-rendered samples found'));
+    sampleSelect.disabled = true;
+  } else {
+    samples.forEach(s => { const o = el('option', null, s.name); o.value = s.name; sampleSelect.append(o); });
+  }
+  sampleSelect.onchange = onSampleChange;
+  await onSampleChange();
+}
+
+async function onSampleChange() {
+  uploadFile = null;
+  const sample = samples.find(s => s.name === sampleSelect.value);
+  renderPromptOptions(sample);
+  $('segment-btn').disabled = !sample;
+  if (!sample) return;
+  try {
+    const blob = await fetch(`/api/sample_mesh/${sample.name}`).then(r => r.blob());
+    await loadGlb(inputViewer, blob);
+    $('input-empty').style.display = 'none';
+  } catch (err) {
+    setStatus('Could not preview input mesh: ' + err.message, true);
+  }
+}
+
+function renderPromptOptions(sample) {
+  promptSelect.innerHTML = '';
+
+  const prompts = sample?.point_prompts || [];
+  const masks = sample?.masks || [];
+
+  // Point prompts first and pre-selected: that is the reference pipeline, the
+  // one the paper evaluates. "None" runs SAM2's automatic mask generator, which
+  // the paper never measures — it is the odd one out, not the default.
+  if (prompts.length) {
+    const g = el('optgroup'); g.label = 'Point prompts (reference)';
+    prompts.forEach(p => {
+      const o = el('option', null, p.replace(/^point_prompts_|\.json$/g, '') + ' — clicks');
+      o.value = p; g.append(o);
+    });
+    promptSelect.append(g);
+  }
+  if (masks.length) {
+    const g = el('optgroup'); g.label = 'Reference masks';
+    masks.forEach(m => { const o = el('option', null, m); o.value = m; g.append(o); });
+    promptSelect.append(g);
+  }
+  const g = el('optgroup'); g.label = 'No prompt';
+  const none = el('option', null, 'None (automatic — not in the paper)'); none.value = '';
+  g.append(none); promptSelect.append(g);
+
+  promptSelect.disabled = !sample;
+  promptSelect.value = prompts[0] || masks[0] || '';
+
+  $('input-hint').textContent = !sample ? ''
+    : prompts.length ? `${sample.name} ships ${prompts.length} prompt scales (coarse→fine granularity).`
+    : masks.length ? `${sample.name} ships reference masks, one per seed view.`
+    : `${sample.name} ships no prompt — automatic mode only.`;
+}
+
+/* ── Upload ───────────────────────────────────────────────── */
+$('upload-btn').onclick = () => $('file-input').click();
+$('file-input').onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  uploadFile = file;
+  sampleSelect.value = '';
+  renderPromptOptions(null);
+  setStatus(`${file.name} — will be rendered by Blender (~1 min) then segmented.`);
+  $('segment-btn').disabled = false;
+  const form = new FormData(); form.append('file', file);
+  try {
+    const blob = await fetch('/api/convert_to_glb', { method: 'POST', body: form }).then(r => {
+      if (!r.ok) throw new Error('preview failed'); return r.blob();
+    });
+    await loadGlb(inputViewer, blob);
+    $('input-empty').style.display = 'none';
+  } catch (err) {
+    setStatus('Could not preview: ' + err.message, true);
+  }
+};
+
+/* ── Segment ──────────────────────────────────────────────── */
+$('segment-btn').onclick = async () => {
+  const settings = {
+    postprocess_pa: parseFloat(paNum.value),
+    enable_postprocess: $('postprocess-cb').checked,
+    opposite_auto_segmentation: $('opposite-cb').checked,
+    prompt: promptSelect.value || null,
+  };
+
+  if (!settings.prompt && !settings.opposite_auto_segmentation) {
+    setStatus('With no seed prompt, opposite auto-seg must stay on — GeoSAM2 would produce nothing.', true);
+    return;
+  }
+
+  const form = new FormData();
+  form.append('settings', JSON.stringify(settings));
+  if (uploadFile) form.append('file', uploadFile);
+  else form.append('sample', sampleSelect.value);
+
+  $('segment-btn').disabled = true;
+  $('spinner-overlay').classList.add('visible');
+  $('spinner-note').textContent = settings.prompt?.endsWith('.json')
+    ? 'clicks → 2D mask → 3D propagation…'
+    : 'segmenting…';
+  setStatus('running…');
+  const started = performance.now();
+
+  try {
+    const res = await fetch('/api/segment', { method: 'POST', body: form });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { detail = (await res.json()).detail || detail; } catch (_) {}
+      throw new Error(detail);
+    }
+    const header = res.headers.get('X-Hierarchy');
+    const meta = header ? JSON.parse(atob(header)) : {};
+    const blob = await res.blob();
+
+    await loadGlb(outputViewer, blob);
+    $('center-empty').style.display = 'none';
+
+    if (lastGlbUrl) URL.revokeObjectURL(lastGlbUrl);
+    lastGlbUrl = URL.createObjectURL(blob);
+    $('download-btn').classList.add('visible');
+
+    renderParts(meta.structure);
+    const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+    $('stat-parts').textContent = meta.n_parts ?? '—';
+    $('stat-unlabeled').textContent = meta.unlabeled_faces ?? '—';
+    $('stat-seed').textContent = meta.seed_view != null ? meta.seed_view : '—';
+    $('stat-elapsed').textContent = elapsed + 's';
+    $('output-stats').classList.add('visible');
+    setStatus(meta.status || 'done');
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    $('spinner-overlay').classList.remove('visible');
+    $('segment-btn').disabled = false;
+  }
+};
+
+$('download-btn').onclick = () => {
+  if (!lastGlbUrl) return;
+  const a = document.createElement('a');
+  a.href = lastGlbUrl; a.download = 'segmented.glb'; a.click();
+};
+
+/* ── Parts panel ──────────────────────────────────────────── */
+function renderParts(structure) {
+  const box = $('parts');
+  box.innerHTML = '';
+  if (!structure || !structure.children?.length) {
+    box.append(el('div', 'parts-empty', 'No parts returned.'));
+    return;
+  }
+  box.append(el('div', 'part-root', structure.name));
+  for (const part of structure.children) {
+    const row = el('div', 'part-row');
+    const swatch = el('div', 'part-swatch');
+    swatch.style.background = part.color;
+    row.append(swatch, el('div', 'part-name', part.name), el('div', 'part-faces', part.faces.toLocaleString()));
+    box.append(row);
+  }
+}
+
+boot().catch(err => setStatus('Startup failed: ' + err.message, true));
+</script>
+</body>
+</html>

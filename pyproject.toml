@@ -32,7 +32,8 @@ dependencies = [
     "omegaconf>=2.3",
     "iopath",
     "pillow",
-    "opencv-python",
+    # 5.x dropped the OpenEXR codec, which the depth maps need. See requirements.txt.
+    "opencv-python<5",
     "matplotlib",
     "tqdm",
     "trimesh",

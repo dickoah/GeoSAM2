@@ -8,7 +8,7 @@ hydra-core>=1.3
 omegaconf>=2.3
 iopath
 pillow
-opencv-python
+opencv-python<5
 matplotlib
 tqdm
 trimesh

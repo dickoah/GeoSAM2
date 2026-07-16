@@ -1,0 +1,8 @@
+# Extra dependencies for the evaluation app only.
+# The inference library itself needs nothing from this file — install it on top
+# of the repo root requirements.txt:
+#     pip install -r requirements.txt -r app/requirements.txt
+
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9   # required by FastAPI for the multipart upload endpoints
