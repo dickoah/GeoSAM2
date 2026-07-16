@@ -79,10 +79,12 @@ def is_view_directory(path: Path) -> bool:
 def blender_info() -> Dict[str, Any]:
     """Locate Blender and report its version.
 
-    ``GEOSAM2_BLENDER`` overrides the binary. This exists because
-    ``geosam2_render.py`` hard-codes the ``BLENDER_EEVEE`` engine name, which
-    Blender removed in 4.2 -- so the Blender on PATH may well be unusable even
-    though it satisfies the README's "4.0+".
+    ``GEOSAM2_BLENDER`` overrides the binary. This gate exists because
+    ``geosam2_render.py`` is written against the Blender 4.0/4.1 API and 5.x
+    rewrote the compositor: ``scene.node_tree`` became
+    ``scene.compositing_node_group``. That is not cosmetic -- the compositor is
+    what emits the depth and normal passes the model actually consumes -- so the
+    Blender on PATH can satisfy the README's "4.0+" and still be unusable.
     """
     binary = os.environ.get("GEOSAM2_BLENDER", "blender")
     resolved = shutil.which(binary)
@@ -97,16 +99,23 @@ def blender_info() -> Dict[str, Any]:
                 "note": f"could not query version: {exc}"}
 
     major, minor = _parse_blender_version(version)
-    usable = major is not None and (major, minor) < (4, 2) and major >= 4
-    note = ""
     if major is None:
-        note = "unrecognised version string"
-        usable = False
+        usable, note = False, "unrecognised version string"
     elif major < 4:
-        note = "geosam2_render.py requires Blender 4.x"
-    elif (major, minor) >= (4, 2):
-        note = ("BLENDER_EEVEE was removed in 4.2; geosam2_render.py hard-codes it. "
-                "Point GEOSAM2_BLENDER at a 4.0/4.1 build to render.")
+        usable, note = False, "geosam2_render.py requires Blender 4.0/4.1"
+    elif major >= 5:
+        usable, note = False, (
+            "Blender 5.x replaced scene.node_tree with scene.compositing_node_group; "
+            "geosam2_render.py builds its depth/normal passes on the old compositor API. "
+            "Point GEOSAM2_BLENDER at a 4.0/4.1 build to render."
+        )
+    elif minor >= 2:
+        usable, note = False, (
+            "Blender 4.2+ (EEVEE Next) drops render settings geosam2_render.py sets. "
+            "Point GEOSAM2_BLENDER at a 4.0/4.1 build to render."
+        )
+    else:
+        usable, note = True, ""
     return {"available": True, "binary": resolved, "version": version, "usable": usable, "note": note}
 
 

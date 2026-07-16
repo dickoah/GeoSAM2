@@ -47,3 +47,7 @@ multirun/
 .coverage
 htmlcov/
 .tox/
+
+# Comparison sheets written by `python -m utils.render --images`.
+# Regenerate them; they are renders, not source.
+example/render_comparison/

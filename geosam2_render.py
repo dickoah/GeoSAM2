@@ -9,7 +9,6 @@ import shutil
 import mathutils
 import bpy_extras
 import numpy as np
-from PIL import Image
 from mathutils import Vector
 from mathutils import Matrix, Vector, Euler
 from typing import List, Optional, Literal, Tuple, Dict
@@ -469,8 +468,14 @@ def eevee_init():
     bpy.context.scene.render.engine = 'BLENDER_EEVEE'
     bpy.context.scene.eevee.taa_render_samples = RENDER_SAMPLES
     if CLOSE_SHADOW == False:
-        bpy.context.scene.eevee.use_gtao = True
-        bpy.context.scene.eevee.use_ssr = True
+        # EEVEE Next (Blender 4.2+) folded ambient occlusion and screen-space
+        # reflections into its raytracing settings and dropped these flags. They
+        # only affect the shaded colour pass, which the model never reads -- it
+        # consumes the normal and depth passes, and only the colour alpha is used
+        # (as a visibility mask). So skip them rather than fail the render.
+        for flag in ("use_gtao", "use_ssr"):
+            if hasattr(bpy.context.scene.eevee, flag):
+                setattr(bpy.context.scene.eevee, flag, True)
     bpy.context.scene.render.use_high_quality_normals = True
 
 
