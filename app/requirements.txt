@@ -6,3 +6,28 @@
 fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9   # required by FastAPI for the multipart upload endpoints
+
+# Rasterises the 12 canonical views in-process (utils/render.py), replacing the
+# Blender stage. Needs a GL context; it is driven headless through EGL.
+pyrender>=0.1.45
+
+# pyrender pins PyOpenGL==3.1.0, which predates numpy 2 by nine years: under it
+# glGenTextures raises a ctypes ArgumentError, so *any* textured mesh fails to
+# render. Overriding the pin is deliberate -- pip will warn about the conflict.
+PyOpenGL>=3.1.7
+
+# VLM-generated seed prompts (utils/mask_agent.py): Gemini reads the render and
+# paints a part map.
+#
+# >=2.11 is not arbitrary. That release moved ImageGenerationTool and BinaryImage
+# to the package root; PixMesh imports them from pydantic_ai.builtin_tools, which
+# no longer exists, so its call sites do not port over verbatim.
+pydantic-ai>=2.11
+
+# Loads GEMINI_API_KEY from .env. pydantic-ai's Google provider reads either
+# GOOGLE_API_KEY or GEMINI_API_KEY, despite only naming the first when it fails.
+python-dotenv>=1.0
+
+# Connected components and distance transforms for turning that map into point
+# prompts (utils/auto_prompt.py). Also pulled in by pyrender.
+scipy>=1.10

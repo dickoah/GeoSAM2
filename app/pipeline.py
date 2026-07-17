@@ -4,10 +4,10 @@ This module is the single seam between the evaluation app and GeoSAM2. The app
 never sees a label array, a view directory, or a subprocess -- it hands a mesh to
 ``GeoSAM2Segmenter.process`` and gets a ``trimesh.Scene`` back.
 
-GeoSAM2 cannot consume a mesh directly: it needs 12 canonical views rendered by
-Blender first. Passing a directory that already holds those views skips the
-render stage, which is what makes the bundled ``example/sample_*`` roots usable
-without a working Blender install.
+GeoSAM2 cannot consume a mesh directly: it needs 12 canonical views first, which
+``utils/render.py`` rasterises in-process. Passing a directory that already holds
+those views skips that stage, which is how the bundled ``example/sample_*`` roots
+are used.
 
 The segmentation itself is driven by running ``inference.py`` as a subprocess.
 That is deliberate for this placeholder -- swapping it for direct imports is the
@@ -30,12 +30,21 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import trimesh
 
+from utils.render import render_views
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 NUM_VIEWS = 12
 
-# The label GeoSAM2 assigns to faces it could not attribute to any part.
-UNLABELED = 0
+# Labels that mean "no part here", not "a part numbered this".
+#
+# 999 is the value mask_aggregation initialises its label volume with
+# (utils/inference_utils.py:409), so it survives on any face no mask ever
+# covered. It is not rare -- the reference sample_00 run carries it on 0.7% of
+# faces -- and counting it as a part inflates every part count by one and paints
+# a phantom region. 0 is the background label the exporter paints black
+# (:500); it does not appear in practice, but it costs nothing to treat alike.
+UNASSIGNED_LABELS = (0, 999)
 
 _UNLABELED_RGBA = np.array([120, 120, 120, 255], dtype=np.uint8)
 
@@ -76,58 +85,6 @@ def is_view_directory(path: Path) -> bool:
     return True
 
 
-def blender_info() -> Dict[str, Any]:
-    """Locate Blender and report its version.
-
-    ``GEOSAM2_BLENDER`` overrides the binary. This gate exists because
-    ``geosam2_render.py`` is written against the Blender 4.0/4.1 API and 5.x
-    rewrote the compositor: ``scene.node_tree`` became
-    ``scene.compositing_node_group``. That is not cosmetic -- the compositor is
-    what emits the depth and normal passes the model actually consumes -- so the
-    Blender on PATH can satisfy the README's "4.0+" and still be unusable.
-    """
-    binary = os.environ.get("GEOSAM2_BLENDER", "blender")
-    resolved = shutil.which(binary)
-    if resolved is None:
-        return {"available": False, "binary": binary, "version": None, "usable": False,
-                "note": "not found on PATH (set GEOSAM2_BLENDER to override)"}
-    try:
-        out = subprocess.run([resolved, "--version"], capture_output=True, text=True, timeout=30)
-        version = out.stdout.strip().splitlines()[0] if out.stdout.strip() else "unknown"
-    except (subprocess.SubprocessError, OSError) as exc:
-        return {"available": True, "binary": resolved, "version": None, "usable": False,
-                "note": f"could not query version: {exc}"}
-
-    major, minor = _parse_blender_version(version)
-    if major is None:
-        usable, note = False, "unrecognised version string"
-    elif major < 4:
-        usable, note = False, "geosam2_render.py requires Blender 4.0/4.1"
-    elif major >= 5:
-        usable, note = False, (
-            "Blender 5.x replaced scene.node_tree with scene.compositing_node_group; "
-            "geosam2_render.py builds its depth/normal passes on the old compositor API. "
-            "Point GEOSAM2_BLENDER at a 4.0/4.1 build to render."
-        )
-    elif minor >= 2:
-        usable, note = False, (
-            "Blender 4.2+ (EEVEE Next) drops render settings geosam2_render.py sets. "
-            "Point GEOSAM2_BLENDER at a 4.0/4.1 build to render."
-        )
-    else:
-        usable, note = True, ""
-    return {"available": True, "binary": resolved, "version": version, "usable": usable, "note": note}
-
-
-def _parse_blender_version(version_string: str) -> Tuple[Optional[int], int]:
-    for token in version_string.split():
-        parts = token.split(".")
-        if parts and parts[0].isdigit():
-            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            return int(parts[0]), minor
-    return None, 0
-
-
 class GeoSAM2Segmenter:
     """Runs GeoSAM2 end-to-end and returns a scene of coloured parts.
 
@@ -160,7 +117,6 @@ class GeoSAM2Segmenter:
         point_prompt_file: Optional[Union[str, Path]] = None,
         seed_view: Optional[int] = None,
         mask_threshold: float = 0.0,
-        render_samples: int = 64,
     ) -> Dict[str, Any]:
         """Segment ``source`` and return a result dict.
 
@@ -188,7 +144,7 @@ class GeoSAM2Segmenter:
             if point_prompt_file is not None and mask_path is not None:
                 raise ValueError("Provide either point_prompt_file or mask_path, not both")
 
-            data_root, render_log = self._resolve_views(source, work_dir, render_samples)
+            data_root, render_log = self._resolve_views(source, work_dir)
             result["log"] += render_log
             result["data_root"] = str(data_root)
 
@@ -255,7 +211,6 @@ class GeoSAM2Segmenter:
         self,
         source: Union[str, Path, trimesh.Trimesh, trimesh.Scene],
         work_dir: Path,
-        render_samples: int,
     ) -> Tuple[Path, str]:
         """Return a directory holding the 12 views, rendering them if needed."""
         if isinstance(source, (str, Path)):
@@ -274,30 +229,19 @@ class GeoSAM2Segmenter:
 
         if not mesh_path.is_file():
             raise FileNotFoundError(f"mesh not found: {mesh_path}")
-        return self._render(mesh_path, work_dir / "views", render_samples)
+        return self._render(mesh_path, work_dir / "views")
 
-    def _render(self, mesh_path: Path, output_dir: Path, render_samples: int) -> Tuple[Path, str]:
-        info = blender_info()
-        if not info["available"]:
-            raise RuntimeError(f"Blender is required to render views but was {info['note']}")
-        if not info["usable"]:
-            raise RuntimeError(f"Blender {info['version']} cannot run geosam2_render.py: {info['note']}")
+    def _render(self, mesh_path: Path, output_dir: Path) -> Tuple[Path, str]:
+        """Rasterise the twelve views in-process.
 
-        output_dir.mkdir(parents=True, exist_ok=True)
-        # geosam2_render.py only handles glb and obj, and inference.py then
-        # hard-codes mesh.glb, so glb is the only end-to-end format.
-        command = [
-            info["binary"], "-b", "-P", str(self.repo_root / "geosam2_render.py"),
-            str(mesh_path), "glb", str(output_dir),
-        ]
-        env = dict(os.environ, RENDER_SAMPLES=str(render_samples))
-        completed = subprocess.run(
-            command, cwd=str(self.repo_root), env=env, capture_output=True, text=True
-        )
-        log = f"$ {' '.join(command)}\n{_tail(completed.stdout)}{_tail(completed.stderr)}\n"
-        if completed.returncode != 0 or not is_view_directory(output_dir):
-            raise RuntimeError(f"Blender render failed (exit {completed.returncode}). Log:\n{log}")
-        return output_dir, log
+        Uses utils/render.py rather than shelling out to Blender: the model only
+        reads geometry buffers, so there is nothing to shade, and the Blender
+        script only runs under 4.0/4.1 anyway.
+        """
+        render_views(mesh_path, output_dir)
+        if not is_view_directory(output_dir):
+            raise RuntimeError(f"render produced an incomplete view directory at {output_dir}")
+        return output_dir, f"Rendered 12 views: {output_dir}\n"
 
     def _run_point_prompts(
         self,
@@ -416,12 +360,11 @@ class GeoSAM2Segmenter:
             )
 
         labels = np.unique(face_label)
-        part_labels = [int(v) for v in labels if int(v) != UNLABELED]
+        part_labels = [int(v) for v in labels if int(v) not in UNASSIGNED_LABELS]
         palette = _distinct_palette(len(part_labels))
 
         scene = trimesh.Scene()
         children: List[Dict[str, Any]] = []
-        unlabeled_faces = 0
 
         for index, label in enumerate(part_labels):
             mask = face_label == label
@@ -430,12 +373,15 @@ class GeoSAM2Segmenter:
             self._add_part(scene, mesh, mask, rgba, name)
             children.append({"name": name, "color": _rgba_to_hex(rgba), "faces": int(mask.sum())})
 
-        if UNLABELED in labels:
-            mask = face_label == UNLABELED
-            unlabeled_faces = int(mask.sum())
-            self._add_part(scene, mesh, mask, _UNLABELED_RGBA, "unlabeled")
+        # Every unassigned label collapses into one grey region: they all mean
+        # the same thing, and how much of the mesh lands here is the signal --
+        # a prompt set that misses whole areas shows up as this growing.
+        unassigned = np.isin(face_label, UNASSIGNED_LABELS)
+        unlabeled_faces = int(unassigned.sum())
+        if unlabeled_faces:
+            self._add_part(scene, mesh, unassigned, _UNLABELED_RGBA, "unassigned")
             children.append({
-                "name": "unlabeled",
+                "name": "unassigned",
                 "color": _rgba_to_hex(_UNLABELED_RGBA),
                 "faces": unlabeled_faces,
             })

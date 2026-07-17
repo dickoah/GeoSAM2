@@ -64,6 +64,17 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
   font-family:var(--mono);padding:12px 14px 8px;border-bottom:1px solid var(--border2)}
 #parts{flex:1;overflow-y:auto;padding:12px 14px;font-size:13px}
 .parts-empty{color:var(--ink4);font-size:12px;line-height:1.6}
+/* A row, not a column: stacked at panel width these three would be ~700px tall
+   and squeeze #parts out of the panel entirely. */
+#seed-maps{padding:10px 14px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+  border-bottom:1px solid var(--border2);flex-shrink:0}
+.seed-map{display:flex;flex-direction:column;gap:3px;min-width:0}
+.seed-map figcaption{font-size:9px;color:var(--ink4);font-family:var(--mono);text-align:center}
+/* Checkerboard: color/normal carry alpha, and a plain background would make the
+   visibility mask -- the only channel the model reads here -- invisible. */
+.seed-map a{display:block;border:1px solid var(--border2);border-radius:4px;overflow:hidden;
+  background:repeating-conic-gradient(#e8e8e6 0% 25%, #f8f8f6 0% 50%) 50% / 12px 12px}
+.seed-map img{width:100%;display:block}
 .part-row{display:flex;align-items:center;gap:7px;padding:3px 0}
 .part-swatch{width:12px;height:12px;border-radius:3px;border:1px solid var(--border2);flex-shrink:0}
 .part-name{font-size:12.5px;color:var(--ink2);flex:1}
@@ -104,12 +115,26 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
 .banner{background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:8px;
   padding:9px 11px;margin-bottom:14px;font-size:11.5px;color:var(--warn);line-height:1.5}
 #file-input{display:none}
+
+/* Drop target: covers the viewport, but never eats pointer events when idle. */
+#drop-overlay{position:fixed;inset:0;z-index:100;display:none;pointer-events:none;
+  align-items:center;justify-content:center;flex-direction:column;gap:10px;
+  background:var(--accent-dim);border:3px dashed var(--accent);
+  font-size:20px;font-weight:600;color:var(--ink)}
+#drop-overlay.active{display:flex}
+#drop-overlay .hint{font-size:12px;color:var(--ink3);font-weight:400}
 .env{font-size:10.5px;color:var(--ink4);font-family:var(--mono);padding:8px 14px;
   border-top:1px solid var(--border2);line-height:1.6}
 </style>
 </head>
 
 <body>
+
+<div id="drop-overlay">
+  <div>Drop a mesh to segment it</div>
+  <div class="hint">.glb .gltf .obj .ply .stl</div>
+</div>
+
 <div id="app">
 
   <div id="left-panel">
@@ -128,10 +153,10 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
             <label for="sample-select">Sample</label>
             <select id="sample-select"></select>
           </div>
-          <button class="btn" id="upload-btn">Upload a mesh…</button>
+          <button class="btn" id="upload-btn">Upload a mesh…  <span style="color:var(--ink4);font-size:11px">&nbsp;or drop one</span></button>
           <input type="file" id="file-input" accept=".glb,.gltf,.obj,.ply,.stl"/>
           <div class="hint" id="input-hint">
-            Bundled samples ship pre-rendered views and run without Blender.
+            Bundled samples ship pre-rendered views.
           </div>
         </div>
       </div>
@@ -189,6 +214,8 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
   </div>
 
   <div id="right-panel">
+    <div class="panel-header" id="seed-header" hidden>Seed view</div>
+    <div id="seed-maps" hidden></div>
     <div class="panel-header">Parts</div>
     <div id="parts"><div class="parts-empty">
       GeoSAM2 returns unnamed, unordered parts — this list is a legend, not a
@@ -320,8 +347,7 @@ async function boot() {
 
   $('env-info').textContent =
     `ckpt ${env.checkpoint.present ? '✓ ' + env.checkpoint.size_mb + ' MB' : '✗ missing'}` +
-    ` · cuda ${env.cuda.available ? '✓' : '✗'}` +
-    ` · blender ${env.blender.usable ? '✓ ' + env.blender.version : '✗'}`;
+    ` · cuda ${env.cuda.available ? '✓ ' + env.cuda.device : '✗'}`;
 
   const banners = $('banners');
   if (!env.checkpoint.present) {
@@ -329,10 +355,6 @@ async function boot() {
   }
   if (!env.cuda.available) {
     banners.append(el('div', 'banner', 'No CUDA device — GeoSAM2 needs bf16 (Ampere+). CPU will be very slow or fail.'));
-  }
-  if (!env.blender.usable) {
-    banners.append(el('div', 'banner', `Blender unusable: ${env.blender.note} Uploads are disabled; bundled samples still work.`));
-    $('upload-btn').disabled = true;
   }
 
   sampleSelect.innerHTML = '';
@@ -343,6 +365,7 @@ async function boot() {
     samples.forEach(s => { const o = el('option', null, s.name); o.value = s.name; sampleSelect.append(o); });
   }
   sampleSelect.onchange = onSampleChange;
+  promptSelect.onchange = refreshSeedMaps;
   await onSampleChange();
 }
 
@@ -394,18 +417,68 @@ function renderPromptOptions(sample) {
     : prompts.length ? `${sample.name} ships ${prompts.length} prompt scales (coarse→fine granularity).`
     : masks.length ? `${sample.name} ships reference masks, one per seed view.`
     : `${sample.name} ships no prompt — automatic mode only.`;
+
+  refreshSeedMaps();
+}
+
+// The three maps of the seeded view: what GeoSAM2 is handed there. Uploads have
+// no prompt and no pre-rendered views, so this only ever shows for samples.
+// Caption is the bare name -- the tile is a third of a 260px panel, anything
+// longer wraps into a paragraph. The explanation rides in the tooltip.
+const SEED_MAP_HINTS = {
+  color: 'color — alpha is the visibility mask; the model ignores the RGB. Click to open full size.',
+  normal: 'normal — world-space normals encoded (n + 1) / 2. Click to open full size.',
+  depth: 'depth — EXR rendered to greyscale, scaled to the object. Click to open full size.',
+};
+
+async function refreshSeedMaps() {
+  const header = $('seed-header'), box = $('seed-maps');
+  const sample = sampleSelect.value;
+  const hide = () => { header.hidden = true; box.hidden = true; box.innerHTML = ''; };
+  if (!sample || uploadFile) return hide();
+
+  let info;
+  try {
+    const url = `/api/seed/${encodeURIComponent(sample)}?prompt=${encodeURIComponent(promptSelect.value || '')}`;
+    info = await (await fetch(url)).json();
+  } catch { return hide(); }
+  if (info.view === null || info.view === undefined) return hide();
+
+  header.textContent = `Seed view ${info.view}`;
+  header.hidden = false;
+  box.hidden = false;
+  box.innerHTML = '';
+  for (const [kind, href] of Object.entries(info.maps)) {
+    const fig = el('figure', 'seed-map');
+    const link = el('a'); link.href = href; link.target = '_blank';
+    link.title = SEED_MAP_HINTS[kind] || kind;
+    const img = el('img'); img.src = href; img.alt = kind; img.loading = 'lazy';
+    link.append(img);
+    fig.append(link, el('figcaption', null, kind));
+    box.append(fig);
+  }
 }
 
 /* ── Upload ───────────────────────────────────────────────── */
-$('upload-btn').onclick = () => $('file-input').click();
-$('file-input').onchange = async (e) => {
-  const file = e.target.files[0];
+const ACCEPTED = ['.glb', '.gltf', '.obj', '.ply', '.stl'];
+
+async function acceptUpload(file) {
   if (!file) return;
+  const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+  if (!ACCEPTED.includes(ext)) {
+    setStatus(`${file.name}: expected one of ${ACCEPTED.join(', ')}`, true);
+    return;
+  }
+
   uploadFile = file;
   sampleSelect.value = '';
   renderPromptOptions(null);
-  setStatus(`${file.name} — will be rendered by Blender (~1 min) then segmented.`);
+  // An uploaded mesh has no prompts, so this necessarily runs the automatic
+  // mode — which is not the mode the paper evaluates. Say so rather than let
+  // the part count look like a verdict on GeoSAM2.
+  setStatus(`${file.name} — no prompts ship with an upload, so this runs automatic mode (not the paper's).`);
   $('segment-btn').disabled = false;
+
   const form = new FormData(); form.append('file', file);
   try {
     const blob = await fetch('/api/convert_to_glb', { method: 'POST', body: form }).then(r => {
@@ -416,7 +489,37 @@ $('file-input').onchange = async (e) => {
   } catch (err) {
     setStatus('Could not preview: ' + err.message, true);
   }
-};
+}
+
+$('upload-btn').onclick = () => $('file-input').click();
+$('file-input').onchange = (e) => acceptUpload(e.target.files[0]);
+
+/* Drag and drop anywhere on the page. */
+const dropOverlay = $('drop-overlay');
+// dragenter/dragleave also fire when crossing between child elements, so a
+// plain boolean would flicker the overlay off mid-drag. Count instead.
+let dragDepth = 0;
+
+window.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer?.types.includes('Files')) return;
+  e.preventDefault();
+  if (++dragDepth === 1) dropOverlay.classList.add('active');
+});
+// Without preventDefault here the browser refuses the drop and navigates to the
+// file instead.
+window.addEventListener('dragover', (e) => {
+  if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+});
+window.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  if (--dragDepth <= 0) { dragDepth = 0; dropOverlay.classList.remove('active'); }
+});
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropOverlay.classList.remove('active');
+  acceptUpload(e.dataTransfer?.files?.[0]);
+});
 
 /* ── Segment ──────────────────────────────────────────────── */
 $('segment-btn').onclick = async () => {

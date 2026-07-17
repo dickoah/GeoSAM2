@@ -32,7 +32,9 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app.pipeline import REPO_ROOT, GeoSAM2Segmenter, blender_info, list_samples
+from PIL import Image
+
+from app.pipeline import REPO_ROOT, GeoSAM2Segmenter, _prompt_frames, list_samples
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger("geosam2_app")
@@ -86,7 +88,6 @@ async def status() -> dict:
             "present": checkpoint.is_file(),
             "size_mb": round(checkpoint.stat().st_size / 1e6, 1) if checkpoint.is_file() else 0,
         },
-        "blender": blender_info(),
         "cuda": {
             "available": torch.cuda.is_available(),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
@@ -106,6 +107,66 @@ async def sample_mesh(name: str) -> FileResponse:
     if not _is_within(path, REPO_ROOT / "example") or not path.is_file():
         raise HTTPException(status_code=404, detail=f"No mesh for sample '{name}'")
     return FileResponse(path, media_type="model/gltf-binary")
+
+
+@app.get("/api/seed/{sample}")
+async def seed(sample: str, prompt: str = "") -> dict:
+    """Which view a prompt seeds, and the maps GeoSAM2 reads there.
+
+    Resolved server-side because the answer is only in the data: a mask carries
+    its view in its name, a point-prompt file in its ``frame_idx`` entries.
+    Without a prompt there is no seed view -- automatic mode segments from every
+    view -- so the UI gets ``null`` and shows nothing.
+    """
+    sample_dir = REPO_ROOT / "example" / sample
+    if not _is_within(sample_dir, REPO_ROOT / "example") or not sample_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Unknown sample '{sample}'")
+    if not prompt:
+        return {"view": None, "maps": {}}
+
+    prompt_path = sample_dir / prompt
+    if not _is_within(prompt_path, sample_dir) or not prompt_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Prompt '{prompt}' not found")
+
+    if prompt_path.suffix.lower() == ".json":
+        frames = sorted(_prompt_frames(prompt_path))
+        view = frames[0] if len(frames) == 1 else None
+    else:
+        view = _view_index(prompt)
+
+    if view is None:
+        return {"view": None, "maps": {}}
+    return {
+        "view": view,
+        "maps": {kind: f"/api/view_map/{sample}/{kind}/{view}"
+                 for kind in ("color", "normal", "depth")},
+    }
+
+
+@app.get("/api/view_map/{sample}/{kind}/{view}")
+async def view_map(sample: str, kind: str, view: int) -> Response:
+    """One of a view's three maps, as something a browser can show.
+
+    ``color`` and ``normal`` are already webp. ``depth`` is an OpenEXR float
+    buffer no browser decodes, so it is rendered to greyscale here -- scaled to
+    the object's own range, or it would be a black rectangle.
+    """
+    suffix = {"color": "webp", "normal": "webp", "depth": "exr"}.get(kind)
+    if suffix is None:
+        raise HTTPException(status_code=400, detail=f"Unknown map '{kind}'")
+
+    path = REPO_ROOT / "example" / sample / f"{kind}_{view:04d}.{suffix}"
+    if not _is_within(path, REPO_ROOT / "example") or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No {kind} map for view {view}")
+
+    if kind != "depth":
+        return FileResponse(path, media_type="image/webp")
+
+    from utils.render import _colorize_depth, _load_depth
+
+    buffer = io.BytesIO()
+    Image.fromarray(_colorize_depth(_load_depth(path))).save(buffer, format="PNG")
+    return Response(content=buffer.getvalue(), media_type="image/png")
 
 
 @app.post("/api/convert_to_glb")
@@ -191,13 +252,6 @@ async def _resolve_source(
     if file is None:
         raise HTTPException(status_code=400, detail="No input: provide a sample or upload a mesh.")
 
-    info = blender_info()
-    if not info["usable"]:
-        raise HTTPException(
-            status_code=503,
-            detail=("Uploaded meshes must be rendered to 12 views by Blender first, "
-                    f"which is unavailable: {info['note']}. Pick a bundled sample instead."),
-        )
     suffix = Path(file.filename or "mesh.glb").suffix.lower() or ".glb"
     payload = await file.read()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -233,6 +287,7 @@ def _prepare_params(params: Dict[str, Any], sample_dir: Optional[Path]) -> Dict[
     if sample_dir is None:
         raise HTTPException(status_code=400,
                             detail="Prompts are only available for bundled samples.")
+
     prompt_path = sample_dir / prompt
     if not _is_within(prompt_path, sample_dir) or not prompt_path.is_file():
         raise HTTPException(status_code=404,

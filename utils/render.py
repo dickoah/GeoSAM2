@@ -3,11 +3,16 @@
     from utils.render import render_views
     render_views("mesh.glb", "views/")   # 12 views + meta.json + mesh.glb
 
-Replaces the ``geosam2_render.py`` Blender stage. This is not a rendering job:
-the network never sees a shaded image (``sam2/utils/misc.py:506`` rewrites every
-``color_*`` path to ``normal_*``, and :func:`_load_img_as_tensor` alpha-composites
-what is left onto white), so there is no lighting, no material and no sampling
-here -- only geometry buffers. Blender was shading 64 samples and discarding them.
+Replaces the ``geosam2_render.py`` Blender stage. The network never sees a shaded
+image (``sam2/utils/misc.py:506`` rewrites every ``color_*`` path to ``normal_*``,
+and ``sam2_base_geosam2.py:470`` encodes only the normal and point maps -- the
+``img_batch`` it is handed is never used), so nothing here is rendered for the
+model's benefit. Blender was shading 64 samples and discarding them.
+
+``color_*`` carries a lit render of the mesh anyway: its RGB is free space, and
+the VLM stage that seeds prompts has to look at *something*. Note that on a mesh
+that is already segmented, those materials are the part colours -- so a sample
+built from one cannot double as a VLM benchmark: it hands over the answer.
 
 Nothing here imports GeoSAM2, so the file can be lifted into another project.
 
@@ -16,7 +21,9 @@ Output contract
 ::
 
     views/
-      color_0000..0011.webp    RGBA -- only the alpha is read
+      color_0000..0011.webp    RGBA -- alpha is the visibility mask; the RGB is
+                               a lit render (supersampled), which the model never
+                               reads (see below) but a VLM asked to find parts does
       depth_0000..0011.exr     float32, 3 channels, z-depth; invalid = 65504
       normal_0000..0011.webp   RGBA, world-space normals encoded (n + 1) / 2
       meta.json                camera_angle_x, 12 c2w transforms, scaling_factor, translation
@@ -69,9 +76,12 @@ render: if Blender-4.1-vs-reference also lands near 87%, this renderer is as
 faithful as another Blender version and the gap is GeoSAM2's own sensitivity to
 input perturbation rather than a defect here. That check has not been run.
 
-Requires ``pyrender``, ``trimesh``, ``numpy``, ``opencv-python<5``, ``pillow``.
-The opencv pin is not cosmetic: 5.x ships without the OpenEXR codec entirely, so
-``cv2.imread`` returns ``None`` on every depth map.
+Requires ``pyrender``, ``trimesh``, ``numpy``, ``opencv-python<5``, ``pillow``,
+``PyOpenGL>=3.1.7``. Neither pin is cosmetic: opencv 5.x ships without the
+OpenEXR codec entirely, so ``cv2.imread`` returns ``None`` on every depth map --
+and pyrender pins ``PyOpenGL==3.1.0``, which predates numpy 2 by nine years and
+raises a ctypes ArgumentError from ``glGenTextures`` on any textured mesh.
+Overriding that pin is deliberate; pip warns about the conflict.
 """
 
 from __future__ import annotations
@@ -98,7 +108,7 @@ import cv2
 import numpy as np
 import pyrender
 import trimesh
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 
 
@@ -235,13 +245,60 @@ RESOLUTION = 1024
 _Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=float)
 
 
-def _as_mesh(source: Union[str, Path, trimesh.Trimesh, trimesh.Scene]) -> trimesh.Trimesh:
-    mesh = trimesh.load(source, force="mesh") if isinstance(source, (str, Path)) else source
-    if isinstance(mesh, trimesh.Scene):
-        mesh = mesh.to_geometry()
-    if mesh is None or mesh.is_empty:
+def _as_scene(source: Union[str, Path, trimesh.Trimesh, trimesh.Scene]) -> trimesh.Scene:
+    """Load ``source`` as a scene, untouched.
+
+    Never ``force="mesh"``: that concatenates, which makes trimesh merge every
+    material into one atlas and remap the UVs onto it badly -- an eight-texture
+    asset comes back scrambled. ``process=False`` for the same reason: welding
+    vertices at load time is a change to the asset nobody asked for.
+    """
+    if isinstance(source, (str, Path)):
+        source = trimesh.load(source, force="scene", process=False)
+    if isinstance(source, trimesh.Trimesh):
+        source = trimesh.Scene(source)
+    if not isinstance(source, trimesh.Scene) or not source.geometry:
         raise ValueError(f"no geometry in {source}")
-    return mesh
+    return source
+
+
+def _parts(scene: trimesh.Scene) -> List[trimesh.Trimesh]:
+    """The scene's meshes, with its graph transforms baked in."""
+    parts = [g for g in scene.dump(concatenate=False) if isinstance(g, trimesh.Trimesh)]
+    if not parts:
+        raise ValueError("no mesh geometry in scene")
+    return parts
+
+
+def _as_mesh(source: Union[str, Path, trimesh.Trimesh, trimesh.Scene]) -> trimesh.Trimesh:
+    """One mesh, for the geometry passes. Appearance is not preserved."""
+    return trimesh.util.concatenate(_parts(_as_scene(source)))
+
+
+def normalize_matrix(mesh: trimesh.Trimesh) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
+    """The transform :func:`normalize` applies, as a 4x4, plus what meta.json needs.
+
+    Exposed separately so a *scene* can be normalised geometry by geometry --
+    concatenating it first would force trimesh to merge every material into one
+    atlas, which is how the textures get scrambled.
+    """
+    rotated = mesh.copy()
+    rotated.apply_transform(_Y_UP_TO_Z_UP)
+
+    lo, hi = rotated.bounds
+    extent = hi - lo
+    longest = float(extent.max())
+    if longest <= 0:
+        raise ValueError("mesh is degenerate: zero extent")
+
+    scaling_factor = NORMALIZATION_RANGE / longest
+    translation = -(lo + hi) / 2.0
+
+    translate = np.eye(4)
+    translate[:3, 3] = translation
+    scale = np.eye(4)
+    scale[:3, :3] *= scaling_factor
+    return scale @ translate @ _Y_UP_TO_Z_UP, scaling_factor, translation, extent * scaling_factor
 
 
 def normalize(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, float, np.ndarray, np.ndarray]:
@@ -253,21 +310,10 @@ def normalize(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, float, np.ndarray
     defined to satisfy *that* formula rather than to mirror how Blender happened
     to compose its own transform.
     """
-    mesh = mesh.copy()
-    mesh.apply_transform(_Y_UP_TO_Z_UP)
-
-    lo, hi = mesh.bounds
-    extent = hi - lo
-    longest = float(extent.max())
-    if longest <= 0:
-        raise ValueError("mesh is degenerate: zero extent")
-
-    scaling_factor = NORMALIZATION_RANGE / longest
-    translation = -(lo + hi) / 2.0
-
-    mesh.apply_translation(translation)
-    mesh.apply_scale(scaling_factor)
-    return mesh, scaling_factor, translation, extent * scaling_factor
+    matrix, scaling_factor, translation, bbox_size = normalize_matrix(mesh)
+    out = mesh.copy()
+    out.apply_transform(matrix)
+    return out, scaling_factor, translation, bbox_size
 
 
 def _normal_carrier(mesh: trimesh.Trimesh, smooth: bool) -> trimesh.Trimesh:
@@ -299,6 +345,85 @@ def _normal_carrier(mesh: trimesh.Trimesh, smooth: bool) -> trimesh.Trimesh:
     return carrier
 
 
+# pyrender exposes no MSAA -- OffscreenRenderer takes a size and nothing else,
+# and RenderFlags has no antialiasing bit. Supersampling is the only lever:
+# render the lit pass at this multiple and box it back down. It applies to that
+# pass alone; resampling depth or normals would invent geometry that is not there.
+SSAA = 2
+
+# Three dim lamps around the camera rather than one bright headlamp. A single
+# lamp puts its specular lobe dead centre, and on a metallic material (the
+# bundled vase is 0.68) over faceted geometry that lands as a hard bright patch
+# -- measured: it vanishes under FLAT and under ambient alone, so it is the lamp.
+# Spreading the same light kills the lobe and keeps the relief.
+LIGHT_YAWS: Tuple[float, ...] = (-40.0, 0.0, 40.0)
+LIGHT_INTENSITY = 0.5
+AMBIENT = 0.45
+
+
+def _lit_scene(scene: trimesh.Scene, matrix: np.ndarray, smooth_normals: bool = False):
+    """The mesh as it is -- textures, PBR factors, everything -- lit from the camera.
+
+    Returns ``(pyrender_scene, camera_node, lights)``, where ``lights`` is what
+    :func:`_pose_lit` needs. Pose them together with the camera: the lamps ride
+    on it, so a boundary visible only as a shading break stays visible from all
+    twelve views rather than falling into shadow on half of them.
+
+    Each geometry is added separately, carrying its own material, and normalised
+    by ``matrix`` rather than by concatenating first -- concatenation is exactly
+    what merges the materials into one atlas and scrambles them.
+    """
+    pr_scene = pyrender.Scene(bg_color=[1.0, 1.0, 1.0, 0.0], ambient_light=[AMBIENT] * 3)
+    for part in _parts(scene):
+        placed = part.copy()
+        placed.apply_transform(matrix)
+        pr_scene.add(pyrender.Mesh.from_trimesh(placed, smooth=smooth_normals))
+
+    camera_node = pr_scene.add(pyrender.PerspectiveCamera(yfov=camera_angle_x(), aspectRatio=1.0))
+    lights = []
+    for yaw in LIGHT_YAWS:
+        node = pr_scene.add(pyrender.DirectionalLight(color=[1.0, 1.0, 1.0],
+                                                      intensity=LIGHT_INTENSITY))
+        offset = trimesh.transformations.rotation_matrix(np.radians(yaw), [0.0, 1.0, 0.0])
+        lights.append((node, offset))
+    return pr_scene, camera_node, lights
+
+
+def _pose_lit(pr_scene, camera_node, lights, pose: np.ndarray) -> None:
+    """Aim the camera and its lamps at one canonical view."""
+    pr_scene.set_pose(camera_node, pose)
+    for node, offset in lights:
+        pr_scene.set_pose(node, pose @ offset)
+
+
+def _downsample(image: np.ndarray, resolution: int) -> np.ndarray:
+    """Box a supersampled render back to ``resolution``."""
+    return np.asarray(Image.fromarray(image).resize((resolution, resolution), Image.LANCZOS))
+
+
+# Ported from PixMesh's ViewGenerator, which renders for the same reason -- a
+# vision model looking for parts. Directional-lit pyrender output is flatter than
+# what Blender's environment lighting gives, and these recover the separation
+# between neighbouring surfaces that the flatness costs.
+SATURATION_BOOST = 1.4
+CONTRAST_BOOST = 1.15
+
+
+def _enhance(image: np.ndarray) -> np.ndarray:
+    """Lift saturation and contrast on an RGB render.
+
+    Applied to the lit pass only. The normal carrier must never see this: its
+    RGB is an encoded direction, not a colour, and a contrast curve would bend
+    every normal.
+    """
+    alpha = image[..., 3:] if image.shape[-1] == 4 else None
+    out = Image.fromarray(image[..., :3])
+    out = ImageEnhance.Color(out).enhance(SATURATION_BOOST)
+    out = ImageEnhance.Contrast(out).enhance(CONTRAST_BOOST)
+    out = np.asarray(out)
+    return np.dstack([out, alpha]) if alpha is not None else out
+
+
 def render_views(
     source: Union[str, Path, trimesh.Trimesh, trimesh.Scene],
     output_dir: Union[str, Path],
@@ -320,8 +445,11 @@ def render_views(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mesh = _as_mesh(source)
-    normalized, scaling_factor, translation, bbox_size = normalize(mesh)
+    scene_in = _as_scene(source)
+    mesh = trimesh.util.concatenate(_parts(scene_in))
+    matrix, scaling_factor, translation, bbox_size = normalize_matrix(mesh)
+    normalized = mesh.copy()
+    normalized.apply_transform(matrix)
 
     transforms = camera_transforms(camera_distance(bbox_size), azimuths)
     carrier = _normal_carrier(normalized, smooth_normals)
@@ -331,12 +459,27 @@ def render_views(
     camera = pyrender.PerspectiveCamera(yfov=camera_angle_x(), aspectRatio=1.0)
     camera_node = scene.add(camera, pose=np.eye(4))
 
+    # Two sequential passes, never two renderers at once: each OffscreenRenderer
+    # owns an EGL context, and a second one alive at the same time makes
+    # eglMakeCurrent fail. They also want different sizes -- the lit pass is
+    # supersampled, the geometry passes must not be.
+    geometry = []
     renderer = pyrender.OffscreenRenderer(resolution, resolution)
     try:
-        for view, pose in enumerate(transforms):
+        for pose in transforms:
             scene.set_pose(camera_node, pose)
-            color, depth = renderer.render(scene, flags=pyrender.RenderFlags.FLAT)
-            _write_view(output_dir, view, color, depth)
+            geometry.append(renderer.render(scene, flags=pyrender.RenderFlags.FLAT))
+    finally:
+        renderer.delete()
+
+    lit_scene, lit_camera, lit_lights = _lit_scene(scene_in, matrix, smooth_normals)
+    renderer = pyrender.OffscreenRenderer(resolution * SSAA, resolution * SSAA)
+    try:
+        for view, pose in enumerate(transforms):
+            _pose_lit(lit_scene, lit_camera, lit_lights, pose)
+            lit, _ = renderer.render(lit_scene, flags=pyrender.RenderFlags.RGBA)
+            color, depth = geometry[view]
+            _write_view(output_dir, view, color, depth, _downsample(lit, resolution))
     finally:
         renderer.delete()
 
@@ -347,7 +490,39 @@ def render_views(
     return output_dir
 
 
-def _write_view(output_dir: Path, view: int, color: np.ndarray, depth: np.ndarray) -> None:
+def shaded_view(
+    source: Union[str, Path, trimesh.Trimesh, trimesh.Scene],
+    view: int = 0,
+    resolution: int = RESOLUTION,
+    azimuths: Sequence[float] = AZIMUTHS_REFERENCE,
+) -> Image.Image:
+    """A lit render of one canonical view, for a human or a VLM to look at.
+
+    The model itself never needs this -- it reads normals and depth, and a normal
+    map is a poor thing to ask a vision model to reason about.
+
+    The camera matches ``render_views`` exactly, so pixel coordinates picked here
+    are valid prompts for the same view -- and this is bit for bit the render
+    that lands in that view's ``color_*.webp``.
+    """
+    scene_in = _as_scene(source)
+    matrix, _, _, bbox_size = normalize_matrix(trimesh.util.concatenate(_parts(scene_in)))
+    pose = camera_transforms(camera_distance(bbox_size), azimuths)[view]
+
+    scene, camera_node, lights = _lit_scene(scene_in, matrix)
+    _pose_lit(scene, camera_node, lights, pose)
+
+    renderer = pyrender.OffscreenRenderer(resolution * SSAA, resolution * SSAA)
+    try:
+        color, _ = renderer.render(scene)
+    finally:
+        renderer.delete()
+    return Image.fromarray(_enhance(_downsample(color[..., :3], resolution)))
+
+
+def _write_view(
+    output_dir: Path, view: int, color: np.ndarray, depth: np.ndarray, lit: np.ndarray
+) -> None:
     hit = depth > 0.0
 
     # pyrender leaves misses at 0.0; GeoSAM2 reads "no geometry" as >= 65500.
@@ -362,11 +537,15 @@ def _write_view(output_dir: Path, view: int, color: np.ndarray, depth: np.ndarra
     normal[..., 3] = np.where(hit, 255, 0)
     Image.fromarray(normal, mode="RGBA").save(output_dir / f"normal_{view:04d}.webp", lossless=True)
 
-    # Only this file's alpha is ever read (inference.py:385 uses it as the
-    # visibility mask); its RGB is discarded, so there is nothing to shade.
-    rgba = np.zeros_like(normal)
-    rgba[..., :3] = 255
-    rgba[..., 3] = normal[..., 3]
+    # inference.py:385 reads only this file's alpha, as the visibility mask. The
+    # RGB is the lit render: free to the model, and the only human- (or VLM-)
+    # readable view of the object in the directory.
+    #
+    # Alpha comes from the supersampled lit pass, not from `hit`: a binary cut
+    # leaves the silhouette stepped, and the reference renders carry ~8k partial
+    # alpha pixels on this view. `> 0` reads them as covered either way, so
+    # matching them costs nothing and is what antialiases the outline.
+    rgba = _enhance(lit) if lit.shape[-1] == 4 else np.dstack([_enhance(lit[..., :3]), normal[..., 3:]])
     Image.fromarray(rgba, mode="RGBA").save(output_dir / f"color_{view:04d}.webp", lossless=True)
 
 

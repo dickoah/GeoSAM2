@@ -51,3 +51,12 @@ htmlcov/
 # Comparison sheets written by `python -m utils.render --images`.
 # Regenerate them; they are renders, not source.
 example/render_comparison/
+
+# Samples built from meshes that live elsewhere, and the results scored off
+# them. Renders and label arrays, not source: `python -m utils.sample <mesh>
+# example/sample_04` and `python -m app.multiview_demo` rebuild them. The
+# bundled sample_00..03 stay tracked -- they are the reference data.
+example/sample_0[4-9]/
+example/sample_1*/
+example/sample_*_our/
+example/multiview_results/
