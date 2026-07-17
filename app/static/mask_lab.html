@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"/>
+<title>GeoSAM2 Mask Lab</title>
+<style>
+:root{--bg:#111;--surface:#1b1b1f;--border:#2e2e33;--ink:#e8e8ea;--ink2:#9a9aa2;--ink4:#66666c;--accent:#6ea8fe}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:13px/1.45 system-ui,sans-serif;padding:14px}
+h1{font-size:15px;margin-bottom:2px}
+.sub{color:var(--ink2);font-size:12px;margin-bottom:12px}
+#bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--surface);
+     border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px}
+#file{color:var(--ink2)}
+button{background:var(--accent);color:#0b1626;border:0;border-radius:6px;padding:8px 16px;
+       font-weight:600;font-size:13px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+#status{color:var(--ink2);font-size:12px;margin-left:auto}
+.warn{color:#ffb454}
+#grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:hidden;
+       display:flex;flex-direction:column;min-height:180px}
+.panel h2{font-size:12px;font-weight:600;padding:8px 10px;border-bottom:1px solid var(--border)}
+.panel .body{flex:1;display:flex;align-items:center;justify-content:center;padding:8px}
+.panel img{max-width:100%;max-height:420px;background:#fff}
+.empty{color:var(--ink4);font-size:12px}
+#legend{margin-top:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;display:none}
+#legend h2{font-size:12px;color:var(--ink2);margin-bottom:8px}
+#chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);
+  border-radius:12px;padding:2px 10px;font-size:12px}
+.chip i{width:12px;height:12px;border-radius:3px;border:1px solid var(--border)}
+</style>
+</head>
+<body>
+<h1>Mask Lab — GLB → part map (flux PixMesh)</h1>
+<div class="sub">Grille 4 vues → describe hiérarchique (Gemini) → palette Kelly → part map sur la vue 3/4.
+Deux appels VLM par run, compter ~30–60 s.</div>
+
+<div id="bar">
+  <input type="file" id="file" accept=".glb,.gltf"/>
+  <button id="run-btn" disabled>Segmenter</button>
+  <span id="status"></span>
+</div>
+
+<div id="grid">
+  <div class="panel"><h2>1 · Grille (describe)</h2>
+    <div class="body"><span class="empty" id="e-grid">Charge un GLB</span><img id="img-grid" hidden/></div></div>
+  <div class="panel"><h2>2 · Vue 3/4 (cible)</h2>
+    <div class="body"><span class="empty" id="e-target">—</span><img id="img-target" hidden/></div></div>
+  <div class="panel"><h2>3 · Envoyé au VLM (contours)</h2>
+    <div class="body"><span class="empty" id="e-contours">—</span><img id="img-contours" hidden/></div></div>
+  <div class="panel"><h2>4 · Part map (VLM)</h2>
+    <div class="body"><span class="empty" id="e-partmap">—</span><img id="img-partmap" hidden/></div></div>
+</div>
+
+<div id="legend"><h2 id="legend-title">Parties</h2><div id="chips"></div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let fileSel = null;
+function setStatus(m, warn) { $("status").textContent = m; $("status").className = warn ? "warn" : ""; }
+function show(imgId, emptyId, url) {
+  const img = $(imgId), empty = $(emptyId);
+  if (url) { img.src = url + "?t=" + Date.now(); img.hidden = false; empty.hidden = true; }
+  else { img.hidden = true; empty.hidden = false; empty.textContent = "…"; }
+}
+
+fetch("/api/config").then(r => r.json()).then(c => {
+  if (!c.has_key) setStatus("⚠ GEMINI_API_KEY absente — le flux VLM ne marchera pas", true);
+});
+
+$("file").addEventListener("change", e => { fileSel = e.target.files[0] || null; $("run-btn").disabled = !fileSel; });
+
+$("run-btn").addEventListener("click", async () => {
+  if (!fileSel) return;
+  $("run-btn").disabled = true; setStatus("Rendu + VLM en cours… (~30–60 s)");
+  for (const [i, e] of [["img-grid","e-grid"],["img-target","e-target"],["img-contours","e-contours"],["img-partmap","e-partmap"]]) show(i, e, null);
+  $("legend").style.display = "none";
+  try {
+    const fd = new FormData(); fd.append("file", fileSel);
+    const r = await fetch("/api/segment", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const j = await r.json();
+    show("img-grid","e-grid", j.grid);
+    show("img-target","e-target", j.target);
+    show("img-contours","e-contours", j.contours);
+    show("img-partmap","e-partmap", j.partmap);
+    $("legend-title").textContent = `Parties — ${j.scene} (${j.parts.length})`;
+    $("chips").innerHTML = j.parts.map(p =>
+      `<span class="chip"><i style="background:${p.color}"></i>${p.name}</span>`).join("");
+    $("legend").style.display = "block";
+    setStatus("✓ Terminé");
+  } catch (err) { setStatus("❌ " + err.message, true); }
+  finally { $("run-btn").disabled = false; }
+});
+</script>
+</body>
+</html>

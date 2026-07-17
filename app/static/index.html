@@ -181,6 +181,15 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
             <label for="opposite-cb">Opposite auto-seg</label>
             <input type="checkbox" id="opposite-cb" checked/>
           </div>
+          <div class="row">
+            <label for="vlm-cb">VLM seed mask</label>
+            <input type="checkbox" id="vlm-cb" checked/>
+          </div>
+          <div class="hint">
+            VLM seed mask: describe the object, paint a part map on the most
+            detailed 3/4 view, and seed from it. Used when no prompt is picked;
+            ignored otherwise. Two Gemini calls, ~30–60 s.
+          </div>
           <div class="hint">
             View count and resolution are fixed at 12 / 1024 in GeoSAM2 and are
             deliberately not exposed — changing them corrupts the lift silently.
@@ -443,16 +452,25 @@ async function refreshSeedMaps() {
     info = await (await fetch(url)).json();
   } catch { return hide(); }
   if (info.view === null || info.view === undefined) return hide();
+  renderSeedMaps(info.view, info.maps);
+}
 
-  header.textContent = `Seed view ${info.view}`;
+/* Fill the seed panel with a view index and its {kind: url} maps. Shared by the
+   sample preview (refreshSeedMaps) and the run result (the maps GeoSAM2 read). */
+function renderSeedMaps(view, maps) {
+  const header = $('seed-header'), box = $('seed-maps');
+  if (view === null || view === undefined || !maps) {
+    header.hidden = true; box.hidden = true; box.innerHTML = ''; return;
+  }
+  header.textContent = `Seed view ${view}`;
   header.hidden = false;
   box.hidden = false;
   box.innerHTML = '';
-  for (const [kind, href] of Object.entries(info.maps)) {
+  for (const [kind, href] of Object.entries(maps)) {
     const fig = el('figure', 'seed-map');
     const link = el('a'); link.href = href; link.target = '_blank';
     link.title = SEED_MAP_HINTS[kind] || kind;
-    const img = el('img'); img.src = href; img.alt = kind; img.loading = 'lazy';
+    const img = el('img'); img.src = href + '?t=' + Date.now(); img.alt = kind; img.loading = 'lazy';
     link.append(img);
     fig.append(link, el('figcaption', null, kind));
     box.append(fig);
@@ -473,10 +491,10 @@ async function acceptUpload(file) {
   uploadFile = file;
   sampleSelect.value = '';
   renderPromptOptions(null);
-  // An uploaded mesh has no prompts, so this necessarily runs the automatic
-  // mode — which is not the mode the paper evaluates. Say so rather than let
-  // the part count look like a verdict on GeoSAM2.
-  setStatus(`${file.name} — no prompts ship with an upload, so this runs automatic mode (not the paper's).`);
+  const mode = $('vlm-cb').checked
+    ? 'the VLM will describe it and paint a seed mask (~30–60 s)'
+    : 'this runs automatic mode (not the paper\'s)';
+  setStatus(`${file.name} — no prompt ships with an upload, so ${mode}.`);
   $('segment-btn').disabled = false;
 
   const form = new FormData(); form.append('file', file);
@@ -527,11 +545,14 @@ $('segment-btn').onclick = async () => {
     postprocess_pa: parseFloat(paNum.value),
     enable_postprocess: $('postprocess-cb').checked,
     opposite_auto_segmentation: $('opposite-cb').checked,
+    vlm_mask: $('vlm-cb').checked,
     prompt: promptSelect.value || null,
   };
 
-  if (!settings.prompt && !settings.opposite_auto_segmentation) {
-    setStatus('With no seed prompt, opposite auto-seg must stay on — GeoSAM2 would produce nothing.', true);
+  // With a prompt the server ignores vlm_mask; without one, the VLM mask or
+  // opposite auto-seg is what produces any labels at all.
+  if (!settings.prompt && !settings.vlm_mask && !settings.opposite_auto_segmentation) {
+    setStatus('With no seed prompt and no VLM mask, opposite auto-seg must stay on — GeoSAM2 would produce nothing.', true);
     return;
   }
 
@@ -567,6 +588,9 @@ $('segment-btn').onclick = async () => {
     $('download-btn').classList.add('visible');
 
     renderParts(meta.structure);
+    // The triplet GeoSAM2 actually read at the seed view -- for an uploaded mesh
+    // the data-root is gone, so the server copied these out for us.
+    renderSeedMaps(meta.seed_view, meta.seed_maps);
     const elapsed = ((performance.now() - started) / 1000).toFixed(1);
     $('stat-parts').textContent = meta.n_parts ?? '—';
     $('stat-unlabeled').textContent = meta.unlabeled_faces ?? '—';

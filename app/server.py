@@ -56,6 +56,8 @@ _segment_lock = asyncio.Lock()
 # being served or they would vanish underneath the response.
 APP_TEMP = Path(tempfile.mkdtemp(prefix="geosam2_app_"))
 atexit.register(lambda: shutil.rmtree(APP_TEMP, ignore_errors=True))
+# Served so a run's seed maps survive the data-root cleanup for the UI panel.
+app.mount("/runs", StaticFiles(directory=APP_TEMP), name="runs")
 
 _run_counter = 0
 
@@ -67,6 +69,7 @@ _ALLOWED_SETTINGS = frozenset({
     "opposite_auto_segmentation",
     "mask_threshold",
     "render_samples",
+    "vlm_mask",
 })
 
 
@@ -217,10 +220,15 @@ async def segment(
             raise HTTPException(status_code=500, detail=result["status"])
 
         _run_counter += 1
-        run_dir = APP_TEMP / f"run_{_run_counter:04d}"
+        run_id = f"run_{_run_counter:04d}"
+        run_dir = APP_TEMP / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         served = run_dir / "segmented.glb"
         shutil.copy2(result["glb_path"], served)
+
+        # The three maps GeoSAM2 read at the seed view -- copied out of the
+        # data-root before it is deleted, so the UI can show what was fed in.
+        seed_maps = _copy_seed_maps(result.get("data_root"), result["seed_view"], run_id, run_dir)
         _release(result["temp_dir"])
 
         payload = {
@@ -228,6 +236,8 @@ async def segment(
             "n_parts": result["n_parts"],
             "unlabeled_faces": result["unlabeled_faces"],
             "seed_view": result["seed_view"],
+            "vlm_scene": result.get("vlm_scene"),
+            "seed_maps": seed_maps,
             "status": result["status"],
         }
         headers = {"X-Hierarchy": base64.b64encode(json.dumps(payload).encode()).decode()}
@@ -284,6 +294,10 @@ def _prepare_params(params: Dict[str, Any], sample_dir: Optional[Path]) -> Dict[
 
     if not prompt:
         return params
+
+    # An explicit prompt wins over auto VLM masking: the two are mutually
+    # exclusive, and choosing a prompt is a deliberate override.
+    params.pop("vlm_mask", None)
     if sample_dir is None:
         raise HTTPException(status_code=400,
                             detail="Prompts are only available for bundled samples.")
@@ -308,6 +322,35 @@ def _view_index(mask_name: str) -> int:
         raise HTTPException(status_code=400,
                             detail=f"Cannot infer the view index from '{mask_name}'")
     return int(digits)
+
+
+def _copy_seed_maps(
+    data_root: Optional[str], seed_view: Optional[int], run_id: str, run_dir: Path
+) -> Optional[Dict[str, str]]:
+    """Copy the seed view's color/normal/depth out to the served run dir.
+
+    Returns ``{color, normal, depth}`` URLs, or ``None`` for automatic runs that
+    have no single seed view. Depth is an OpenEXR float buffer no browser
+    decodes, so it is baked to greyscale here.
+    """
+    if data_root is None or seed_view is None:
+        return None
+    root = Path(data_root)
+    urls: Dict[str, str] = {}
+
+    for kind in ("color", "normal"):
+        src = root / f"{kind}_{seed_view:04d}.webp"
+        if src.is_file():
+            shutil.copy2(src, run_dir / f"{kind}.webp")
+            urls[kind] = f"/runs/{run_id}/{kind}.webp"
+
+    depth_src = root / f"depth_{seed_view:04d}.exr"
+    if depth_src.is_file():
+        from utils.render import _colorize_depth, _load_depth
+        Image.fromarray(_colorize_depth(_load_depth(depth_src))).save(run_dir / "depth.png")
+        urls["depth"] = f"/runs/{run_id}/depth.png"
+
+    return urls or None
 
 
 def _release(temp_dir: Optional[str]) -> None:

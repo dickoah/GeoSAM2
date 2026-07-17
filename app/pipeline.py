@@ -117,6 +117,7 @@ class GeoSAM2Segmenter:
         point_prompt_file: Optional[Union[str, Path]] = None,
         seed_view: Optional[int] = None,
         mask_threshold: float = 0.0,
+        vlm_mask: bool = False,
     ) -> Dict[str, Any]:
         """Segment ``source`` and return a result dict.
 
@@ -148,6 +149,23 @@ class GeoSAM2Segmenter:
             result["log"] += render_log
             result["data_root"] = str(data_root)
 
+            if vlm_mask:
+                # Auto-generate the seed mask with the VLM: describe the object
+                # from a grid, paint a part map on the most detailed 3/4 view, and
+                # seed GeoSAM2 from it. No prompt file, no manual mask.
+                if mask_path is not None or point_prompt_file is not None:
+                    raise ValueError("vlm_mask cannot combine with a mask or prompt file")
+                from utils.mask_agent import generate_seed_mask
+
+                target, assembly, palette = generate_seed_mask(data_root)
+                mask_path = data_root / f"mask_{target:04d}.png"
+                mask_view = target
+                result["seed_mask_path"] = str(mask_path)
+                result["seed_view"] = target
+                result["vlm_scene"] = assembly.scene_description
+                result["log"] += (f"VLM seed mask on view {target}: "
+                                  f"{assembly.scene_description}, {len(palette)} parts\n")
+
             if point_prompt_file is not None:
                 mask_path, mask_view, prompt_log = self._run_point_prompts(
                     data_root=data_root,
@@ -158,6 +176,11 @@ class GeoSAM2Segmenter:
                 )
                 result["log"] += prompt_log
                 result["seed_mask_path"] = str(mask_path)
+                result["seed_view"] = mask_view
+
+            # A mask given directly (not via prompt/VLM) still has a seed view;
+            # record it so the UI shows that view's maps.
+            if mask_view is not None and result["seed_view"] is None:
                 result["seed_view"] = mask_view
 
             output_dir = work_dir / "seg"
