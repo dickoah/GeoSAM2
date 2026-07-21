@@ -438,6 +438,7 @@ const SEED_MAP_HINTS = {
   color: 'color — alpha is the visibility mask; the model ignores the RGB. Click to open full size.',
   normal: 'normal — world-space normals encoded (n + 1) / 2. Click to open full size.',
   depth: 'depth — EXR rendered to greyscale, scaled to the object. Click to open full size.',
+  segmentation: 'segmentation — the seed part map GeoSAM2 was told to focus on (VLM or hand-authored). Click to open full size.',
 };
 
 async function refreshSeedMaps() {
@@ -466,6 +467,9 @@ function renderSeedMaps(view, maps) {
   header.hidden = false;
   box.hidden = false;
   box.innerHTML = '';
+  // One column per map: the triplet stays a row of 3, the VLM run adds a 4th
+  // (its part map) without squeezing into a fixed 3-wide grid.
+  box.style.gridTemplateColumns = `repeat(${Object.keys(maps).length}, 1fr)`;
   for (const [kind, href] of Object.entries(maps)) {
     const fig = el('figure', 'seed-map');
     const link = el('a'); link.href = href; link.target = '_blank';

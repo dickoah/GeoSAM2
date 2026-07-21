@@ -12,6 +12,10 @@ are used.
 The segmentation itself is driven by running ``inference.py`` as a subprocess.
 That is deliberate for this placeholder -- swapping it for direct imports is the
 next step, and it only touches ``_run_inference``.
+
+Every stage logs at INFO, and the subprocesses' own output is relayed line by
+line as it arrives rather than captured and shown only on failure: a run takes
+minutes, and silence for that long is indistinguishable from a hang.
 """
 
 from __future__ import annotations
@@ -24,13 +28,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import trimesh
 
+from utils.logs import DEV, get_logger
 from utils.render import render_views
+
+logger = get_logger("geosam2.pipeline")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -130,18 +138,28 @@ class GeoSAM2Segmenter:
         neither, GeoSAM2 falls back to automatic mask generation, which the paper
         does not measure.
 
-        Never raises: failures come back as a dict with the same shape and a
-        ``status`` starting with ``"Error"``, so the caller has one code path.
+        Failures come back as a dict with the same shape and a ``status``
+        starting with ``"Error"``, so the caller has one code path -- except
+        under ``utils.logs.DEV`` (the default), where the exception is logged
+        with its traceback and re-raised at the point it happened. A bench that
+        turns a stack trace into a string, three stages after the fact, cannot
+        be debugged; set ``GEOSAM2_DEV=0`` for the never-raises behaviour.
         """
         result = self._empty_result()
         work_dir = Path(tempfile.mkdtemp(prefix="geosam2_eval_"))
         self.temp_dirs.append(str(work_dir))
         result["temp_dir"] = str(work_dir)
+        started = time.monotonic()
+        logger.info("[segment] === %s (vlm_mask=%s, postprocess=%s, auto=%s) ===",
+                    source if isinstance(source, (str, Path)) else type(source).__name__,
+                    vlm_mask, enable_postprocess, opposite_auto_segmentation)
 
         try:
+            # Raised rather than returned early, so the one handler below decides
+            # what a failure looks like -- a traceback under DEV, an error status
+            # otherwise. A silent early return would bypass both.
             if not self.checkpoint_path.is_file():
-                result["status"] = f"Error: checkpoint not found at {self.checkpoint_path}"
-                return result
+                raise FileNotFoundError(f"checkpoint not found at {self.checkpoint_path}")
             if point_prompt_file is not None and mask_path is not None:
                 raise ValueError("Provide either point_prompt_file or mask_path, not both")
 
@@ -157,14 +175,21 @@ class GeoSAM2Segmenter:
                     raise ValueError("vlm_mask cannot combine with a mask or prompt file")
                 from utils.mask_agent import generate_seed_mask
 
-                target, assembly, palette = generate_seed_mask(data_root)
-                mask_path = data_root / f"mask_{target:04d}.png"
-                mask_view = target
+                seed = generate_seed_mask(data_root)
+                mask_path = seed.path
+                mask_view = seed.view
                 result["seed_mask_path"] = str(mask_path)
-                result["seed_view"] = target
-                result["vlm_scene"] = assembly.scene_description
-                result["log"] += (f"VLM seed mask on view {target}: "
-                                  f"{assembly.scene_description}, {len(palette)} parts\n")
+                result["seed_view"] = seed.view
+                result["vlm_scene"] = seed.assembly.scene_description
+                result["vlm_parts"] = seed.painted
+                result["vlm_coverage"] = seed.coverage
+                # `painted`, not `len(palette)`: the palette is what was asked
+                # for, and a part the VLM never drew cannot seed anything.
+                result["log"] += (f"VLM seed mask on view {seed.view}: "
+                                  f"{seed.assembly.scene_description}, "
+                                  f"{seed.painted}/{len(seed.palette)} parts painted\n")
+            else:
+                logger.info("[segment] no VLM stage (vlm_mask=False)")
 
             if point_prompt_file is not None:
                 mask_path, mask_view, prompt_log = self._run_point_prompts(
@@ -198,6 +223,7 @@ class GeoSAM2Segmenter:
 
             labels_path = self._find_labels(output_dir)
             result["labels_path"] = str(labels_path)
+            logger.info("[labels] %s", labels_path.name)
 
             scene, structure, n_parts, unlabeled_faces = self._build_scene(
                 data_root / "mesh.glb", np.load(labels_path)
@@ -213,9 +239,15 @@ class GeoSAM2Segmenter:
                 n_parts=n_parts,
                 unlabeled_faces=unlabeled_faces,
             )
+            logger.info("[segment] === OK: %d parts, %d unlabeled faces, %.1fs ===",
+                        n_parts, unlabeled_faces, time.monotonic() - started)
             return result
 
-        except Exception as exc:  # the app has a single failure path; see docstring
+        except Exception as exc:
+            logger.exception("[segment] === FAILED after %.1fs: %s ===",
+                             time.monotonic() - started, exc)
+            if DEV:
+                raise
             result["status"] = f"Error: {exc}"
             return result
 
@@ -244,11 +276,14 @@ class GeoSAM2Segmenter:
                         f"{candidate} is not a complete view directory "
                         f"(needs meta.json, mesh.glb and {NUM_VIEWS} color/depth/normal views)"
                     )
+                logger.info("[views] pre-rendered, %s", candidate)
                 return candidate, f"Using pre-rendered views: {candidate}\n"
             mesh_path = candidate
         else:
             mesh_path = work_dir / "input_mesh.glb"
             source.export(mesh_path)
+            logger.info("[views] exported in-memory %s to %s",
+                        type(source).__name__, mesh_path.name)
 
         if not mesh_path.is_file():
             raise FileNotFoundError(f"mesh not found: {mesh_path}")
@@ -261,9 +296,12 @@ class GeoSAM2Segmenter:
         reads geometry buffers, so there is nothing to shade, and the Blender
         script only runs under 4.0/4.1 anyway.
         """
+        logger.info("[render] %d views of %s -> %s", NUM_VIEWS, mesh_path.name, output_dir)
+        started = time.monotonic()
         render_views(mesh_path, output_dir)
         if not is_view_directory(output_dir):
             raise RuntimeError(f"render produced an incomplete view directory at {output_dir}")
+        logger.info("[render] done in %.1fs", time.monotonic() - started)
         return output_dir, f"Rendered 12 views: {output_dir}\n"
 
     def _run_point_prompts(
@@ -294,18 +332,17 @@ class GeoSAM2Segmenter:
             "--model-cfg", self.model_cfg,
             "--mask-threshold", str(mask_threshold),
         ]
-        completed = subprocess.run(
-            command, cwd=str(self.repo_root), capture_output=True, text=True
-        )
-        log = f"$ {' '.join(command)}\n{_tail(completed.stdout)}{_tail(completed.stderr)}\n"
-        if completed.returncode != 0:
+        logger.info("[prompts] %s -> view %d", prompt_path.name, view_idx)
+        code, log = self._run_logged(command, "prompts")
+        if code != 0:
             raise RuntimeError(
-                f"single_view_point_prompt_infer.py failed (exit {completed.returncode}). Log:\n{log}"
+                f"single_view_point_prompt_infer.py failed (exit {code}). Log:\n{log}"
             )
 
         mask_path = out_dir / f"mask_view{view_idx:04d}.npy"
         if not mask_path.is_file():
             raise RuntimeError(f"point-prompt step wrote no mask at {mask_path}. Log:\n{log}")
+        logger.info("[prompts] seed mask %s", mask_path.name)
         return mask_path, view_idx, log
 
     def _run_inference(
@@ -340,15 +377,42 @@ class GeoSAM2Segmenter:
         ]
         if mask_path is not None:
             command += ["--mask-path", str(mask_path), "--mask-view", str(mask_view)]
+            logger.info("[inference] seeding view %s from %s", mask_view, Path(mask_path).name)
+        else:
+            logger.info("[inference] no seed prompt, automatic mask generation")
 
-        # cwd matters: Hydra resolves configs/geosam2.yaml against the package.
-        completed = subprocess.run(
-            command, cwd=str(self.repo_root), capture_output=True, text=True
-        )
-        log = f"$ {' '.join(command)}\n{_tail(completed.stdout)}{_tail(completed.stderr)}\n"
-        if completed.returncode != 0:
-            raise RuntimeError(f"inference.py failed (exit {completed.returncode}). Log:\n{log}")
+        code, log = self._run_logged(command, "inference")
+        if code != 0:
+            raise RuntimeError(f"inference.py failed (exit {code}). Log:\n{log}")
         return log
+
+    def _run_logged(self, command: List[str], tag: str) -> Tuple[int, str]:
+        """Run a stage subprocess, relaying its output as it arrives.
+
+        ``capture_output=True`` hides a hundred seconds of progress and only
+        surfaces it if the stage fails, which is exactly backwards while
+        debugging. Streams are merged so the ordering that reaches the log is
+        the one the subprocess actually produced.
+
+        cwd matters: Hydra resolves configs/geosam2.yaml against the package.
+        """
+        logger.info("[%s] $ %s", tag, " ".join(command))
+        started = time.monotonic()
+        lines: List[str] = []
+        process = subprocess.Popen(
+            command, cwd=str(self.repo_root), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        with process:
+            for line in process.stdout:
+                line = line.rstrip()
+                lines.append(line)
+                logger.info("[%s] %s", tag, line)
+
+        logger.info("[%s] exit %d in %.1fs", tag, process.returncode,
+                    time.monotonic() - started)
+        output = _tail("\n".join(lines))
+        return process.returncode, f"$ {' '.join(command)}\n{output}\n"
 
     def _find_labels(self, output_dir: Path) -> Path:
         matches = sorted(glob.glob(str(output_dir / "*.npy")))
@@ -401,6 +465,9 @@ class GeoSAM2Segmenter:
         # a prompt set that misses whole areas shows up as this growing.
         unassigned = np.isin(face_label, UNASSIGNED_LABELS)
         unlabeled_faces = int(unassigned.sum())
+        logger.info("[lift] %d parts over %d faces, %d unassigned (%.1f%%)",
+                    len(part_labels), len(mesh.faces), unlabeled_faces,
+                    100.0 * unlabeled_faces / max(len(mesh.faces), 1))
         if unlabeled_faces:
             self._add_part(scene, mesh, unassigned, _UNLABELED_RGBA, "unassigned")
             children.append({
@@ -443,6 +510,9 @@ class GeoSAM2Segmenter:
             "labels_path": None,
             "seed_mask_path": None,
             "seed_view": None,
+            "vlm_scene": None,
+            "vlm_parts": 0,
+            "vlm_coverage": {},
             "n_parts": 0,
             "unlabeled_faces": 0,
             "log": "",

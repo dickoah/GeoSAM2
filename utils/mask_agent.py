@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import io
 import os
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -43,11 +44,14 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
-from utils.auto_prompt import prompts_from_color_map
+from utils.auto_prompt import MIN_AREA_PX, prompts_from_color_map
+from utils.logs import get_logger
 from utils.render import (
     RESOLUTION, camera_angle_x, shaded_view,
     _lit_scene, _pose_lit, _downsample, _enhance,
 )
+
+logger = get_logger("geosam2.mask_agent")
 
 # Load the repo-root .env before pydantic-ai resolves a provider. Its Google
 # provider reads GOOGLE_API_KEY or GEMINI_API_KEY, though it only names the
@@ -59,6 +63,22 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 # same as callable, so check by calling. These are the current equivalents.
 DESCRIBE_MODEL = "google:gemini-3.1-pro-preview"
 PAINT_MODEL = "google:gemini-3-pro-image"
+
+# As deterministic as the API lets us be, so a prompt change is the only thing
+# that moves between two runs of the same input. temperature=0 is greedy
+# decoding; the fixed seed pins whatever randomness remains (tie-breaks, and the
+# image model's sampler). Not a hard guarantee -- server-side batching and model
+# updates still drift -- but it removes run-to-run noise from the loop. Override
+# GEOSAM2_SEED to sweep seeds deliberately.
+_SEED = int(os.environ.get("GEOSAM2_SEED", "1234"))
+
+
+def _deterministic_settings():
+    """ModelSettings pinning temperature and seed. Built lazily -- importing
+    pydantic_ai at module load would demand credentials this file must not need."""
+    from pydantic_ai.settings import ModelSettings
+
+    return ModelSettings(temperature=0.0, seed=_SEED)
 
 # Background is white because `shaded_view` renders on white, and the prompt
 # leans on "leave the background alone" being trivially checkable.
@@ -204,7 +224,8 @@ def _agent(model: str, output_type, system: str):
     # palette or the snapping.
     from pydantic_ai import Agent
 
-    return Agent(model, output_type=output_type, system_prompt=system)
+    return Agent(model, output_type=output_type, system_prompt=system,
+                 model_settings=_deterministic_settings())
 
 
 _DESCRIBE_SYSTEM = f"""You identify the separable parts of a 3D object from a render.
@@ -235,13 +256,21 @@ def describe(image: Image.Image, model: str = DESCRIBE_MODEL) -> PartList:
     agent = _agent(model, PartList, _DESCRIBE_SYSTEM)
     from pydantic_ai import BinaryContent
 
+    logger.info("[describe] asking %s about a %dx%d render", model, *image.size)
+    started = time.monotonic()
     result = agent.run_sync([
         "Identify this object and list its separable parts.",
         BinaryContent(data=_png_bytes(image), media_type="image/png"),
     ])
     parts = result.output.parts[:MAX_PARTS]
+    if len(result.output.parts) > MAX_PARTS:
+        logger.warning("[describe] returned %d parts, truncated to the palette's %d",
+                       len(result.output.parts), MAX_PARTS)
     if not parts:
         raise RuntimeError("the model found no parts in the render")
+    logger.info("[describe] '%s', %d parts in %.1fs -- %s",
+                result.output.category, len(parts), time.monotonic() - started,
+                ", ".join(p.name for p in parts))
     return PartList(category=result.output.category, parts=parts)
 
 
@@ -305,16 +334,21 @@ def paint(
     # 2.11 routes provider-native tools through `capabilities=[NativeTool(...)]`.
     # PixMesh's `builtin_tools=` is gone; `tools=` wants plain callables, and
     # `toolsets=` accepts the object then calls it as a factory at run time.
-    agent = Agent(model, output_type=BinaryImage,
+    agent = Agent(model, output_type=BinaryImage, model_settings=_deterministic_settings(),
                   capabilities=[NativeTool(ImageGenerationTool(aspect_ratio="1:1"))])
+    logger.info("[paint] asking %s for a %d-colour part map", model, len(palette))
+    started = time.monotonic()
     result = agent.run_sync([
         _paint_prompt(parts, palette),
         BinaryContent(data=_png_bytes(with_contours(image)), media_type="image/png"),
     ])
     painted = Image.open(io.BytesIO(result.output.data)).convert("RGB")
+    logger.info("[paint] got %dx%d in %.1fs", *painted.size, time.monotonic() - started)
     if painted.size != image.size:
         # NEAREST, never LANCZOS: interpolating a label map manufactures colours
         # that are in no part's palette along every boundary.
+        logger.warning("[paint] returned %dx%d, resizing to the input's %dx%d",
+                       *painted.size, *image.size)
         painted = painted.resize(image.size, Image.NEAREST)
     return painted
 
@@ -358,6 +392,14 @@ class Assembly(BaseModel):
     objects: List[SceneObject] = Field(default_factory=list)
 
 
+def group_leaves(group: Group) -> List[LeafPart]:
+    """Every leaf part under one group, in order, subgroups included."""
+    out = list(group.parts)
+    for sub in group.subgroups:
+        out.extend(group_leaves(sub))
+    return out
+
+
 def leaf_parts(assembly: "Assembly") -> List[LeafPart]:
     """Every leaf part, in order, walking subgroups too.
 
@@ -365,17 +407,9 @@ def leaf_parts(assembly: "Assembly") -> List[LeafPart]:
     nested under one silently got no colour and vanished. Walking the whole tree
     is that bug fixed.
     """
-    out: List[LeafPart] = []
-
-    def walk(group: Group) -> None:
-        out.extend(group.parts)
-        for sub in group.subgroups:
-            walk(sub)
-
-    for obj in assembly.objects:
-        for group in obj.assembly_tree:
-            walk(group)
-    return out
+    return [part for obj in assembly.objects
+            for group in obj.assembly_tree
+            for part in group_leaves(group)]
 
 
 # The palette caps how many parts a mask can carry, and the VLM cannot reliably
@@ -403,12 +437,22 @@ def describe_assembly(grid: Image.Image, model: str = DESCRIBE_MODEL) -> Assembl
     agent = _agent(model, Assembly, _DESCRIBE_SYSTEM_STRUCT)
     from pydantic_ai import BinaryContent
 
+    logger.info("[describe_assembly] asking %s about a %dx%d 4-view grid", model, *grid.size)
+    started = time.monotonic()
     result = agent.run_sync([
         _DESCRIBE_USER_STRUCT + _PART_CAP,
         BinaryContent(data=_png_bytes(grid), media_type="image/png"),
     ])
-    if not leaf_parts(result.output):
+    parts = leaf_parts(result.output)
+    if not parts:
         raise RuntimeError("describe found no parts")
+    logger.info("[describe_assembly] '%s', %d object(s), %d leaf parts in %.1fs",
+                result.output.scene_description, len(result.output.objects),
+                len(parts), time.monotonic() - started)
+    for obj in result.output.objects:
+        for group in obj.assembly_tree:
+            logger.info("[describe_assembly]   %s / %s: %s", obj.category, group.group_name,
+                        ", ".join(p.name for p in group_leaves(group)) or "(empty)")
     return result.output
 
 
@@ -422,10 +466,15 @@ def assign_palette_tree(assembly: "Assembly") -> Dict[str, Tuple[int, int, int]]
     """
     parts = leaf_parts(assembly)
     names = list(dict.fromkeys(p.name for p in parts))  # de-dup, keep order
+    if len(names) < len(parts):
+        logger.warning("[assign_palette_tree] %d of %d part names are duplicates, merged",
+                       len(parts) - len(names), len(parts))
     if len(names) > len(PALETTE):
-        print(f"[assign_palette] {len(names)} parts over {len(PALETTE)} colours; "
-              f"dropping the {len(names) - len(PALETTE)} least prominent")
+        logger.warning("[assign_palette_tree] %d parts over %d colours, dropping the "
+                       "%d least prominent: %s", len(names), len(PALETTE),
+                       len(names) - len(PALETTE), ", ".join(names[len(PALETTE):]))
         names = names[:len(PALETTE)]
+    logger.info("[assign_palette_tree] %d parts coloured", len(names))
     return {name: PALETTE[i] for i, name in enumerate(names)}
 
 
@@ -434,52 +483,59 @@ _CONTOUR_HEX = "#FF00FF"
 
 
 def _generation_prompt(palette: Dict[str, Tuple[int, int, int]], size: Tuple[int, int]) -> str:
-    """PixMesh's flat-label-map generation prompt, verbatim, minus the multi-view
+    """PixMesh's flat-label-map generation prompt, minus the multi-view
     POV/visibility machinery (heuristic on part names, which PixMesh itself flagged
-    as inert). Every listed part may appear; the model decides what is visible."""
+    as inert). Every listed part may appear; the model decides what is visible.
+
+    Departs from PixMesh's verbatim on RULE 4, hardened against the thin line the
+    model draws between adjacent regions -- often a third part's colour (an orange
+    seam between a yellow body and a purple collar) that no downstream snap can
+    tell from a real thin part. The only place to kill it is here, so the rule is
+    emphatic and carries the failure as a worked negative example."""
     w, h = size
     n = len(palette)
     bg = _hex(BACKGROUND)
     color_table = "\n".join(f"  {i + 1:2d}. {_hex(rgb)}  {name}"
                             for i, (name, rgb) in enumerate(palette.items()))
     return (
-        "You are an expert 3D Segmentation Colorist producing a FLAT LABEL MAP.\n\n"
-        "## MASTER COLOR PALETTE (ordered)\n"
-        "All part colors are drawn exclusively from this palette. "
-        "You MUST NOT use any color outside this list:\n\n"
+        "You are an expert 3D Segmentation Colorist. Your ONLY task: convert the input "
+        "into a FLAT LABEL MAP where each part region is filled with one solid color.\n\n"
+        "## MASTER COLOR PALETTE (ordered \u2014 use ONLY these hex codes)\n"
         f"{color_table}\n\n"
-        f"You will receive a single {w}×{h} image showing a 3/4 view of a 3D object.\n"
-        "A thin magenta contour line has been drawn on it to mark part boundaries "
-        "and the object silhouette.\n\n"
-        "## STRICT EXECUTION RULES\n\n"
-        "### RULE 1: RESOLUTION & ASPECT RATIO PRESERVATION\n"
-        f"- The output image MUST have the exact same {w}×{h} resolution and aspect ratio as the input.\n"
-        "- No cropping, padding, upscaling, or downscaling. Every pixel maps 1-to-1 with the input.\n\n"
-        "### RULE 2: SHAPE, INTERNAL GEOMETRY & FLAT FILL\n"
-        "- The silhouette and shapes act as a STRICT MASK. Respect the outer silhouette AND the internal boundaries.\n"
-        "- DO NOT HALLUCINATE OR INVENT NEW BOUNDARIES. Do not draw concentric rings, split flat areas, or make up geometry.\n"
-        "- ONE REGION = ONE ASSIGNED COLOR. A continuous part region is filled with its assigned hex color.\n"
-        "- FLAT FILL, NO SHADING: Discard the render's lighting, shadows, highlights and surface detail. "
-        "Every pixel of a region carries the exact same RGB value — no gradients, no ramps, no darkening at edges, no texture.\n"
-        "- The object silhouette in the output MUST be pixel-accurate to the input.\n\n"
-        f"### RULE 3: BACKGROUND IS SACRED\n"
-        f"- The background ({bg}) is NOT a part. Every background pixel in the input MUST remain background in the output.\n"
-        "- NEVER paint, fill, or recolor any background pixel with a part color.\n"
-        f"- The magenta contour ({_CONTOUR_HEX}) marks the object edge; paint over it with the part color if it "
-        f"falls on the object, or with the background ({bg}) if outside. It must NOT appear in the output.\n\n"
-        "### RULE 4: NO CONTOUR LINES IN OUTPUT\n"
-        "- No visible contour lines or outlines between parts. Parts flow into each other at their boundaries.\n"
-        "- STRICTLY FORBIDDEN: adding any text, labels, legends, or color keys inside the image.\n\n"
-        f"### RULE 5: COLOR COUNT\n"
-        f"- Use AT MOST {n} distinct part colors, only from the table above. Use FEWER if fewer regions are visible.\n"
-        "- A part with even a small visible sliver MUST be painted. Fully invisible parts (zero pixels) stay background.\n"
-        "- DO NOT invent geometry to fit more colors.\n\n"
-        "### RULE 6: COLOR MAP COMPLIANCE\n"
-        "- The Color Table is ABSOLUTE TRUTH. Use EXACTLY these hex codes — do not invent, swap, or change any color.\n"
-        "- Every entry has a unique hex code; never use the same color for two different parts.\n\n"
+        f"## INPUT\n"
+        f"A single {w}\u00d7{h} image of a 3D object. A thin magenta line ({_CONTOUR_HEX}) "
+        "marks part boundaries and the object silhouette. It is a GUIDE to paint over and "
+        "delete \u2014 never to trace or keep.\n\n"
+        "## RULES\n\n"
+        "### 1. Geometry (identical to input)\n"
+        f"- Output MUST be exactly {w}\u00d7{h}, same aspect ratio. No crop, pad, or scale \u2014 1:1 pixel mapping.\n"
+        "- The silhouette and internal boundaries are a STRICT MASK \u2014 reproduce them pixel-accurate to the input.\n"
+        "- Do NOT invent boundaries, rings, splits, or geometry. One continuous region = one color.\n\n"
+        "### 2. Flat fill (no shading)\n"
+        "- Discard all lighting, shadows, highlights, texture, and surface detail.\n"
+        "- Every pixel of a region = the exact same RGB. No gradients, ramps, edge-darkening, or aliasing.\n\n"
+        "### 3. Background is sacred\n"
+        f"- Every background pixel ({bg}) in the input stays background. Never recolor it with a part color.\n"
+        f"- Where the magenta line falls on the object, paint it with the part color; outside, paint it {bg}. "
+        "It must NOT appear in the output.\n\n"
+        "### 4. Hard edges \u2014 NO lines of any kind (most common failure)\n"
+        "- Two adjacent parts meet at a HARD EDGE: color A's last pixel sits directly against color B's first pixel. "
+        "Nothing between them \u2014 no transition, no third color, not one pixel.\n"
+        "- Along an A\u2194B boundary, ONLY colors A and B may appear. Never run a third part's color as a seam there.\n"
+        "  Example: at a yellow\u2194purple boundary, go straight yellow\u2192purple. An orange line along that seam is WRONG, "
+        "even if orange is a real part elsewhere. A color appears ONLY where its part actually is.\n"
+        "- FORBIDDEN between regions: any line, stroke, outline, border, seam, halo, or darkened edge, in ANY color "
+        f"(including the magenta guide {_CONTOUR_HEX}).\n"
+        "- If you catch yourself drawing along a boundary, stop: fill each side flat until the two fills touch.\n\n"
+        "### 5. Color count & compliance\n"
+        f"- Use AT MOST {n} distinct part colors, all from the table. Use fewer if fewer regions are visible.\n"
+        "- Paint any part with even a small visible sliver. Fully invisible parts (0 pixels) stay background.\n"
+        "- Use the table's hex codes EXACTLY. Never invent, swap, or reuse a color for two parts.\n"
+        "- No text, labels, legends, or color keys anywhere in the image.\n\n"
         "## OUTPUT\n"
-        "Return exactly ONE image: the flat segmented result, same size, no text or borders.\n"
+        f"Return exactly ONE {w}\u00d7{h} image: the flat segmented result. No text, no borders.\n"
     )
+
 
 
 def generate_part_map(
@@ -498,14 +554,22 @@ def generate_part_map(
     from pydantic_ai.native_tools import ImageGenerationTool
 
     sent = with_contours(target) if contours else target
-    agent = Agent(model, output_type=BinaryImage,
+    agent = Agent(model, output_type=BinaryImage, model_settings=_deterministic_settings(),
                   capabilities=[NativeTool(ImageGenerationTool(aspect_ratio="1:1"))])
+    logger.info("[generate_part_map] asking %s for a %d-colour map on a %dx%d view "
+                "(contours %s)", model, len(palette), *target.size,
+                "on" if contours else "off")
+    started = time.monotonic()
     result = agent.run_sync([
         _generation_prompt(palette, target.size),
         BinaryContent(data=_png_bytes(sent), media_type="image/png"),
     ])
     painted = Image.open(io.BytesIO(result.output.data)).convert("RGB")
+    logger.info("[generate_part_map] got %dx%d in %.1fs", *painted.size,
+                time.monotonic() - started)
     if painted.size != target.size:
+        logger.warning("[generate_part_map] returned %dx%d, resizing to the target's "
+                       "%dx%d", *painted.size, *target.size)
         painted = painted.resize(target.size, Image.NEAREST)
     return painted
 
@@ -554,7 +618,11 @@ def best_target_view(data_root: Union[str, Path], candidates: Sequence[int] = _H
     needed. The most-detailed view is the one the VLM can tell the most parts
     apart on, and the one worth seeding.
     """
-    return max(candidates, key=lambda v: _detail_score(data_root, v))
+    scores = {v: _detail_score(data_root, v) for v in candidates}
+    best = max(scores, key=scores.get)
+    logger.info("[best_target_view] view %d (edge density %s)", best,
+                ", ".join(f"view {v}: {s:.4f}" for v, s in scores.items()))
+    return best
 
 
 def _canonical_grid(data_root: Union[str, Path], views: Sequence[int], tile: int = 512) -> Image.Image:
@@ -571,25 +639,54 @@ def _canonical_grid(data_root: Union[str, Path], views: Sequence[int], tile: int
     return grid
 
 
+# Mirrors MASK_MIN_AREA_PX in inference.py: a colour region smaller than this is
+# dropped when the mask is read, so a part painted below it is a part that will
+# not reach GeoSAM2 however clearly the VLM drew it.
+MIN_PART_PX = 64
+
+
+class SeedMask(NamedTuple):
+    """What :func:`generate_seed_mask` produced, and what survived.
+
+    ``coverage`` is not decoration: a part the model listed but never painted
+    lands at zero, which is the difference between "GeoSAM2 missed it" and "it
+    was never asked about". ``painted`` counts the parts that cleared
+    :data:`MIN_PART_PX`, i.e. the ones the mask can actually seed.
+    """
+
+    view: int
+    assembly: "Assembly"
+    palette: Dict[str, Tuple[int, int, int]]
+    coverage: Dict[str, int]
+    path: Path
+
+    @property
+    def painted(self) -> int:
+        return sum(1 for px in self.coverage.values() if px >= MIN_PART_PX)
+
+
 def generate_seed_mask(
     data_root: Union[str, Path],
     target_view_idx: Optional[int] = None,
-) -> Tuple[int, "Assembly", Dict[str, Tuple[int, int, int]]]:
+) -> SeedMask:
     """Describe the object and paint a seed mask on one canonical view.
 
     Renders happen upstream (render_views wrote the data-root). Here: pick the
     target view, describe from a 4-view grid, assign a palette, have the VLM paint
     the target's color map, snap it to the exact palette, and write it as
     ``mask_{target:04d}.png`` in the data-root -- ready for GeoSAM2 to seed from.
-
-    Returns ``(target_view_idx, assembly, palette)``.
     """
     data_root = Path(data_root)
+    started = time.monotonic()
+    logger.info("[generate_seed_mask] === %s ===", data_root)
     target = best_target_view(data_root) if target_view_idx is None else target_view_idx
+    if target_view_idx is not None:
+        logger.info("[generate_seed_mask] target view %d (given, not chosen)", target)
 
     # Describe from the target plus three views a quarter-turn apart: front,
     # sides, back, so parts hidden in the target are still seen somewhere.
     describe_views = [(target + k) % 12 for k in (0, 3, 6, 9)]
+    logger.info("[generate_seed_mask] describe grid from views %s", describe_views)
     grid = _canonical_grid(data_root, describe_views)
     assembly = describe_assembly(grid)
     palette = assign_palette_tree(assembly)
@@ -598,8 +695,36 @@ def generate_seed_mask(
     # Snap to the exact palette so the mask carries N clean colours, not the
     # VLM's noise cloud -- GeoSAM2's extract_mask_segments keys on exact colours.
     snapped = snap_to_palette(part_map, palette, _object_mask(data_root, target))
-    Image.fromarray(snapped).save(data_root / f"mask_{target:04d}.png")
-    return target, assembly, palette
+    path = data_root / f"mask_{target:04d}.png"
+    Image.fromarray(snapped).save(path)
+
+    painted = coverage(snapped, palette)
+    _log_coverage(painted)
+    logger.info("[generate_seed_mask] === %s: %d/%d parts painted in %.1fs ===",
+                path.name, sum(1 for px in painted.values() if px >= MIN_PART_PX),
+                len(palette), time.monotonic() - started)
+    return SeedMask(target, assembly, palette, painted, path)
+
+
+def _log_coverage(painted: Dict[str, int], floor: int = MIN_PART_PX) -> None:
+    """Report what each part actually got, and name the ones that got nothing.
+
+    A part below ``floor`` is silently dropped downstream, so it is logged at
+    WARNING here -- otherwise the only trace of it is a part count that is one
+    lower than the describe promised. ``floor`` differs per consumer: the mask
+    path is read at :data:`MIN_PART_PX`, the point-prompt path drops regions
+    under ``auto_prompt.MIN_AREA_PX``, so callers pass their own.
+    """
+    for name, px in sorted(painted.items(), key=lambda kv: -kv[1]):
+        logger.debug("[coverage]   %-28s %7d px", name, px)
+    missing = [name for name, px in painted.items() if px == 0]
+    thin = [f"{name} ({px}px)" for name, px in painted.items() if 0 < px < floor]
+    if missing:
+        logger.warning("[coverage] %d part(s) never painted: %s",
+                       len(missing), ", ".join(missing))
+    if thin:
+        logger.warning("[coverage] %d part(s) under the %d px floor, dropped when the "
+                       "mask is read: %s", len(thin), floor, ", ".join(thin))
 
 
 def paint_freeform(
@@ -621,16 +746,28 @@ def paint_freeform(
     from pydantic_ai.native_tools import ImageGenerationTool
 
     sent = with_contours(image) if contours else image
-    agent = Agent(model, output_type=BinaryImage,
+    agent = Agent(model, output_type=BinaryImage, model_settings=_deterministic_settings(),
                   capabilities=[NativeTool(ImageGenerationTool(aspect_ratio="1:1"))])
+    logger.info("[paint_freeform] asking %s (contours %s, %d-char prompt)",
+                model, "on" if contours else "off", len(prompt))
+    started = time.monotonic()
     result = agent.run_sync([
         prompt,
         BinaryContent(data=_png_bytes(sent), media_type="image/png"),
     ])
     painted = Image.open(io.BytesIO(result.output.data)).convert("RGB")
+    logger.info("[paint_freeform] got %dx%d in %.1fs", *painted.size,
+                time.monotonic() - started)
     if painted.size != image.size:
+        logger.warning("[paint_freeform] returned %dx%d, resizing to the input's %dx%d",
+                       *painted.size, *image.size)
         painted = painted.resize(image.size, Image.NEAREST)
     return painted
+
+
+# Roughly the LAB distance at which two colours stop being a blend of each other
+# and start being different colours. Only used to report, never to reject.
+_OFF_PALETTE_LAB = 25.0
 
 
 def snap_to_palette(
@@ -657,10 +794,31 @@ def snap_to_palette(
     lab_entries = cv2.cvtColor(entries.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).astype(np.float32)[0]
 
     distance = np.linalg.norm(lab_image[:, :, None, :] - lab_entries[None, None, :, :], axis=-1)
-    snapped = entries[np.argmin(distance, axis=-1)]
+    nearest = np.argmin(distance, axis=-1)
+    snapped = entries[nearest]
 
+    # How far the model's colours were from the ones it was given. A large share
+    # over the threshold means it invented colours rather than blending between
+    # palette entries, and every one of those pixels has just been forced onto a
+    # part it may not belong to.
+    off = np.take_along_axis(distance, nearest[..., None], axis=-1)[..., 0] > _OFF_PALETTE_LAB
     if object_mask is not None:
+        off &= object_mask
         snapped[~object_mask] = background
+        # Over the object only: dividing by the whole frame would dilute the
+        # rate by however much background is in view, so the 5% threshold below
+        # would mean something different for a tight crop than a loose one.
+        denom = int(object_mask.sum())
+    else:
+        denom = off.size
+    share = float(off.sum()) / denom if denom else 0.0
+    if share > 0.05:
+        logger.warning("[snap_to_palette] %.1f%% of object pixels were over %d LAB from "
+                       "any palette colour -- the model painted off-palette",
+                       share * 100, _OFF_PALETTE_LAB)
+    else:
+        logger.info("[snap_to_palette] %d colours, %.1f%% off-palette pixels",
+                    len(palette), share * 100)
     return snapped
 
 
@@ -688,6 +846,8 @@ def generate_prompts(
     if mesh.is_dir():
         mesh = mesh / "mesh.glb"
 
+    logger.info("[generate_prompts] === %s, view %d ===", mesh, view_idx)
+    started = time.monotonic()
     render = shaded_view(mesh, view=view_idx, resolution=resolution)
     parts = describe(render)
     palette = assign_palette(parts.parts)
@@ -697,6 +857,10 @@ def generate_prompts(
     snapped = snap_to_palette(painted, palette, object_mask)
 
     prompts = prompts_from_color_map(snapped, view_idx=view_idx, background=BACKGROUND)
+    painted_px = coverage(snapped, palette)
+    _log_coverage(painted_px, floor=MIN_AREA_PX)
+    logger.info("[generate_prompts] === %d prompts from %d parts in %.1fs ===",
+                len(prompts), len(palette), time.monotonic() - started)
 
     if debug_dir is not None:
         debug = Path(debug_dir)
@@ -705,8 +869,9 @@ def generate_prompts(
         with_contours(render).save(debug / f"view{view_idx:04d}_contours.png")
         painted.save(debug / f"view{view_idx:04d}_painted.png")
         Image.fromarray(snapped).save(debug / f"view{view_idx:04d}_snapped.png")
+        logger.info("[generate_prompts] debug images -> %s", debug)
 
-    return prompts, parts, coverage(snapped, palette)
+    return prompts, parts, painted_px
 
 
 def _hex(rgb: Sequence[int]) -> str:

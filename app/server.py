@@ -18,7 +18,6 @@ import atexit
 import base64
 import io
 import json
-import logging
 import os
 import shutil
 import tempfile
@@ -35,9 +34,9 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
 from app.pipeline import REPO_ROOT, GeoSAM2Segmenter, _prompt_frames, list_samples
+from utils.logs import DEV, get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger("geosam2_app")
+logger = get_logger("geosam2.app")
 
 app = FastAPI(title="GeoSAM2 Evaluation")
 
@@ -185,7 +184,8 @@ async def convert_to_glb(file: UploadFile = File(...)) -> Response:
         scene.export(buffer, file_type="glb")
         return Response(content=buffer.getvalue(), media_type="model/gltf-binary")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        logger.exception("[convert_to_glb] failed on %s", file.filename)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -209,14 +209,23 @@ async def segment(
 
     try:
         params = _prepare_params(json.loads(settings), sample_dir)
-        logger.info("Segmenting %s with %s", source, params)
+        logger.info("[segment] request: %s with %s", source, params)
         # GeoSAM2 takes ~100 s. Run it off the event loop, or every other
         # request — including the UI's own polling — stalls until it finishes.
-        async with _segment_lock:
-            result = await asyncio.to_thread(SEGMENTER.process, source, **params)
+        try:
+            async with _segment_lock:
+                result = await asyncio.to_thread(SEGMENTER.process, source, **params)
+        except Exception as exc:
+            # Under DEV the pipeline re-raises instead of returning an error
+            # dict, having already logged the traceback. Caught here only so the
+            # exception type reaches the UI instead of a bare "Internal Server
+            # Error"; re-logging it would print the same traceback twice.
+            logger.error("[segment] crashed: %s: %s", type(exc).__name__, exc)
+            raise HTTPException(status_code=500,
+                                detail=f"{type(exc).__name__}: {exc}") from exc
 
         if result["status"].startswith("Error"):
-            logger.error("Segmentation failed: %s", result["status"])
+            logger.error("[segment] failed: %s", result["status"])
             raise HTTPException(status_code=500, detail=result["status"])
 
         _run_counter += 1
@@ -228,7 +237,8 @@ async def segment(
 
         # The three maps GeoSAM2 read at the seed view -- copied out of the
         # data-root before it is deleted, so the UI can show what was fed in.
-        seed_maps = _copy_seed_maps(result.get("data_root"), result["seed_view"], run_id, run_dir)
+        seed_maps = _copy_seed_maps(result.get("data_root"), result["seed_view"],
+                                    run_id, run_dir, result.get("seed_mask_path"))
         _release(result["temp_dir"])
 
         payload = {
@@ -237,6 +247,7 @@ async def segment(
             "unlabeled_faces": result["unlabeled_faces"],
             "seed_view": result["seed_view"],
             "vlm_scene": result.get("vlm_scene"),
+            "vlm_parts": result.get("vlm_parts"),
             "seed_maps": seed_maps,
             "status": result["status"],
         }
@@ -325,13 +336,19 @@ def _view_index(mask_name: str) -> int:
 
 
 def _copy_seed_maps(
-    data_root: Optional[str], seed_view: Optional[int], run_id: str, run_dir: Path
+    data_root: Optional[str], seed_view: Optional[int], run_id: str, run_dir: Path,
+    seed_mask_path: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
-    """Copy the seed view's color/normal/depth out to the served run dir.
+    """Copy the seed view's color/normal/depth (and the seed mask) to the run dir.
 
-    Returns ``{color, normal, depth}`` URLs, or ``None`` for automatic runs that
-    have no single seed view. Depth is an OpenEXR float buffer no browser
-    decodes, so it is baked to greyscale here.
+    Returns ``{color, normal, depth[, segmentation]}`` URLs, or ``None`` for
+    automatic runs that have no single seed view. Depth is an OpenEXR float
+    buffer no browser decodes, so it is baked to greyscale here.
+
+    ``segmentation`` is the colour part map the seed came from -- the VLM's
+    output, or a hand-authored mask -- shown beside the three maps GeoSAM2 read
+    so you can see what it was told to focus on. Only image masks qualify: the
+    point-prompt path seeds from a ``.npy`` label array, which is not a picture.
     """
     if data_root is None or seed_view is None:
         return None
@@ -349,6 +366,13 @@ def _copy_seed_maps(
         from utils.render import _colorize_depth, _load_depth
         Image.fromarray(_colorize_depth(_load_depth(depth_src))).save(run_dir / "depth.png")
         urls["depth"] = f"/runs/{run_id}/depth.png"
+
+    if seed_mask_path is not None:
+        mask = Path(seed_mask_path)
+        if mask.is_file() and mask.suffix.lower() in (".png", ".webp", ".jpg", ".jpeg"):
+            served = run_dir / f"segmentation{mask.suffix.lower()}"
+            shutil.copy2(mask, served)
+            urls["segmentation"] = f"/runs/{run_id}/{served.name}"
 
     return urls or None
 
@@ -377,4 +401,6 @@ if __name__ == "__main__":
     host = os.environ.get("GEOSAM2_APP_HOST", "127.0.0.1")
     port = int(os.environ.get("GEOSAM2_APP_PORT", "7861"))
     print(f"GeoSAM2 evaluation app -> http://{host}:{port}")
+    logger.info("[startup] DEV=%s -- a failing stage %s", DEV,
+                "raises with its traceback" if DEV else "returns an error status")
     uvicorn.run(app, host=host, port=port)

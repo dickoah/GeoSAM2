@@ -15,6 +15,8 @@ h1{font-size:15px;margin-bottom:2px}
 button{background:var(--accent);color:#0b1626;border:0;border-radius:6px;padding:8px 16px;
        font-weight:600;font-size:13px;cursor:pointer}
 button:disabled{opacity:.45;cursor:default}
+button.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button.secondary:disabled{color:var(--ink4);border-color:var(--border)}
 #status{color:var(--ink2);font-size:12px;margin-left:auto}
 .warn{color:#ffb454}
 #grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
@@ -36,11 +38,13 @@ button:disabled{opacity:.45;cursor:default}
 <body>
 <h1>Mask Lab — GLB → part map (flux PixMesh)</h1>
 <div class="sub">Grille 4 vues → describe hiérarchique (Gemini) → palette Kelly → part map sur la vue 3/4.
-Deux appels VLM par run, compter ~30–60 s.</div>
+<b>Segmenter</b> = flux complet (2 appels VLM, ~30–60 s). <b>Régénérer la map</b> = repeint
+seulement la part map depuis le dernier describe (1 appel, même palette/vue) — pour itérer sur le prompt.</div>
 
 <div id="bar">
-  <input type="file" id="file" accept=".glb,.gltf"/>
-  <button id="run-btn" disabled>Segmenter</button>
+  <input type="file" id="file" accept=".glb,.gltf" title="Charge un fichier GLB ou glTF"/>
+  <button type="button" id="run-btn" disabled>Segmenter</button>
+  <button type="button" id="map-btn" class="secondary" disabled title="Repeint uniquement la part map à partir du dernier describe (même palette, même vue). Pour itérer sur le prompt de génération.">Régénérer la map</button>
   <span id="status"></span>
 </div>
 
@@ -60,7 +64,14 @@ Deux appels VLM par run, compter ~30–60 s.</div>
 <script>
 const $ = id => document.getElementById(id);
 let fileSel = null;
+let currentRun = null;   // last run id, so "Régénérer la map" can reuse its describe
 function setStatus(m, warn) { $("status").textContent = m; $("status").className = warn ? "warn" : ""; }
+function setLegend(scene, parts) {
+  $("legend-title").textContent = `Parties — ${scene} (${parts.length})`;
+  $("chips").innerHTML = parts.map(p =>
+    `<span class="chip"><i style="background:${p.color}"></i>${p.name}</span>`).join("");
+  $("legend").style.display = "block";
+}
 function show(imgId, emptyId, url) {
   const img = $(imgId), empty = $(emptyId);
   if (url) { img.src = url + "?t=" + Date.now(); img.hidden = false; empty.hidden = true; }
@@ -75,7 +86,8 @@ $("file").addEventListener("change", e => { fileSel = e.target.files[0] || null;
 
 $("run-btn").addEventListener("click", async () => {
   if (!fileSel) return;
-  $("run-btn").disabled = true; setStatus("Rendu + VLM en cours… (~30–60 s)");
+  $("run-btn").disabled = true; $("map-btn").disabled = true;
+  setStatus("Rendu + VLM en cours… (~30–60 s)");
   for (const [i, e] of [["img-grid","e-grid"],["img-target","e-target"],["img-contours","e-contours"],["img-partmap","e-partmap"]]) show(i, e, null);
   $("legend").style.display = "none";
   try {
@@ -83,17 +95,36 @@ $("run-btn").addEventListener("click", async () => {
     const r = await fetch("/api/segment", { method: "POST", body: fd });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const j = await r.json();
+    currentRun = j.run;
     show("img-grid","e-grid", j.grid);
     show("img-target","e-target", j.target);
     show("img-contours","e-contours", j.contours);
     show("img-partmap","e-partmap", j.partmap);
-    $("legend-title").textContent = `Parties — ${j.scene} (${j.parts.length})`;
-    $("chips").innerHTML = j.parts.map(p =>
-      `<span class="chip"><i style="background:${p.color}"></i>${p.name}</span>`).join("");
-    $("legend").style.display = "block";
+    setLegend(j.scene, j.parts);
+    $("map-btn").disabled = false;
     setStatus("✓ Terminé");
   } catch (err) { setStatus("❌ " + err.message, true); }
   finally { $("run-btn").disabled = false; }
+});
+
+// Dedicated map button: repaint only panel 4 from the run's stored describe.
+// Grille / cible / contours are untouched -- the only thing that moved is the
+// generation prompt, so the comparison is apples-to-apples.
+$("map-btn").addEventListener("click", async () => {
+  if (!currentRun) return;
+  $("run-btn").disabled = true; $("map-btn").disabled = true;
+  setStatus("Génération de la map… (~15–30 s)");
+  show("img-partmap", "e-partmap", null);
+  try {
+    const fd = new FormData(); fd.append("run", currentRun);
+    const r = await fetch("/api/generate_map", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const j = await r.json();
+    show("img-partmap", "e-partmap", j.partmap);
+    setLegend(j.scene, j.parts);
+    setStatus("✓ Map régénérée");
+  } catch (err) { setStatus("❌ " + err.message, true); }
+  finally { $("run-btn").disabled = false; $("map-btn").disabled = false; }
 });
 </script>
 </body>
