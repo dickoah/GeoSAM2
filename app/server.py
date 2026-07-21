@@ -69,7 +69,33 @@ _ALLOWED_SETTINGS = frozenset({
     "mask_threshold",
     "render_samples",
     "vlm_mask",
+    "seed_view",
 })
+
+
+def _view_options() -> list:
+    """The 12 canonical views with a short human label, for the seed-view combo.
+
+    Elevation is object-independent (a +25 view looks down at every object); the
+    +25 views are the 3/4-high ones. Azimuth is shown as raw degrees -- which side
+    is "front" depends on the mesh's own orientation, which we cannot assume.
+    """
+    from utils.render import AZIMUTHS_REFERENCE, ELEVATIONS, NUM_VIEWS
+
+    def height(el: float) -> str:
+        return "3/4 haute" if el > 0 else "vue basse" if el < 0 else "de niveau"
+
+    return [{"view": i, "elev": ELEVATIONS[i], "azim": AZIMUTHS_REFERENCE[i],
+             "label": f"V{i} · el{ELEVATIONS[i]:+.0f}° az{AZIMUTHS_REFERENCE[i]:.0f}° "
+                      f"— {height(ELEVATIONS[i])}"}
+            for i in range(NUM_VIEWS)]
+
+
+def _default_seed_view() -> int:
+    """The VLM seed view the UI preselects -- mask_agent's own default."""
+    from utils.mask_agent import SEED_VIEW
+
+    return SEED_VIEW
 
 
 @app.get("/")
@@ -94,6 +120,8 @@ async def status() -> dict:
             "available": torch.cuda.is_available(),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
+        "views": _view_options(),
+        "default_seed_view": _default_seed_view(),
     }
 
 
@@ -307,8 +335,10 @@ def _prepare_params(params: Dict[str, Any], sample_dir: Optional[Path]) -> Dict[
         return params
 
     # An explicit prompt wins over auto VLM masking: the two are mutually
-    # exclusive, and choosing a prompt is a deliberate override.
+    # exclusive, and choosing a prompt is a deliberate override. The seed view is
+    # then the prompt's own (its frame_idx), not the VLM combo's choice.
     params.pop("vlm_mask", None)
+    params.pop("seed_view", None)
     if sample_dir is None:
         raise HTTPException(status_code=400,
                             detail="Prompts are only available for bundled samples.")

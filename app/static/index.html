@@ -185,9 +185,13 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
             <label for="vlm-cb">VLM seed mask</label>
             <input type="checkbox" id="vlm-cb" checked/>
           </div>
+          <div class="row">
+            <label for="seed-view-select">VLM seed view</label>
+            <select id="seed-view-select" title="Which of the 12 canonical views the VLM paints on and GeoSAM2 seeds from."></select>
+          </div>
           <div class="hint">
-            VLM seed mask: describe the object, paint a part map on the most
-            detailed 3/4 view, and seed from it. Used when no prompt is picked;
+            VLM seed mask: describe the object, paint a part map on the chosen
+            canonical view, and seed from it. Used when no prompt is picked;
             ignored otherwise. Two Gemini calls, ~30–60 s.
           </div>
           <div class="hint">
@@ -373,6 +377,19 @@ async function boot() {
   } else {
     samples.forEach(s => { const o = el('option', null, s.name); o.value = s.name; sampleSelect.append(o); });
   }
+  // The VLM seed-view combo: the 12 canonical views, preselected on the server's
+  // default. One source of truth (render.py) via /api/status.
+  const seedSel = $('seed-view-select');
+  seedSel.innerHTML = '';
+  if (!(env.views || []).length) {
+    seedSel.append(el('option', null, 'views unavailable — restart the server'));
+    seedSel.disabled = true;
+  } else {
+    env.views.forEach(v => { const o = el('option', null, v.label); o.value = v.view; seedSel.append(o); });
+    seedSel.disabled = false;
+    if (env.default_seed_view != null) seedSel.value = env.default_seed_view;
+  }
+
   sampleSelect.onchange = onSampleChange;
   promptSelect.onchange = refreshSeedMaps;
   await onSampleChange();
@@ -550,6 +567,7 @@ $('segment-btn').onclick = async () => {
     enable_postprocess: $('postprocess-cb').checked,
     opposite_auto_segmentation: $('opposite-cb').checked,
     vlm_mask: $('vlm-cb').checked,
+    seed_view: parseInt($('seed-view-select').value, 10),
     prompt: promptSelect.value || null,
   };
 

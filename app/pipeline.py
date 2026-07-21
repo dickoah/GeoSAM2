@@ -169,13 +169,14 @@ class GeoSAM2Segmenter:
 
             if vlm_mask:
                 # Auto-generate the seed mask with the VLM: describe the object
-                # from a grid, paint a part map on the most detailed 3/4 view, and
+                # from a grid, paint a part map on the chosen canonical view, and
                 # seed GeoSAM2 from it. No prompt file, no manual mask.
                 if mask_path is not None or point_prompt_file is not None:
                     raise ValueError("vlm_mask cannot combine with a mask or prompt file")
-                from utils.mask_agent import generate_seed_mask
+                from utils.mask_agent import SEED_VIEW, generate_seed_mask
 
-                seed = generate_seed_mask(data_root)
+                seed = generate_seed_mask(
+                    data_root, seed_view if seed_view is not None else SEED_VIEW)
                 mask_path = seed.path
                 mask_view = seed.view
                 result["seed_mask_path"] = str(mask_path)

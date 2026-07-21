@@ -27,9 +27,10 @@ from PIL import Image
 
 from utils.logs import DEV, get_logger
 from utils.mask_agent import (
-    Assembly, assign_palette_tree, describe_assembly, describe_grid,
-    generate_part_map, leaf_parts, target_view, with_contours, _hex,
+    SEED_VIEW, Assembly, assign_palette_tree, describe_assembly,
+    generate_part_map, seed_view_inputs, with_contours,
 )
+from utils.render import AZIMUTHS_REFERENCE, ELEVATIONS, NUM_VIEWS, render_views, shaded_view
 
 logger = get_logger("geosam2.mask_lab")
 
@@ -69,8 +70,12 @@ def config() -> dict:
 
 def _legend(assembly: Assembly, palette: dict) -> list:
     """Flat colour legend for the UI: one entry per coloured leaf part, in order."""
+
+    def _hex(rgb) -> str:
+        return "#{:02X}{:02X}{:02X}".format(*rgb)
+
     seen, legend = set(), []
-    for part in leaf_parts(assembly):
+    for part in assembly.leaf_parts():
         if part.name in palette and part.name not in seen:
             seen.add(part.name)
             legend.append({"name": part.name, "color": _hex(palette[part.name])})
@@ -79,8 +84,9 @@ def _legend(assembly: Assembly, palette: dict) -> list:
 
 @app.post("/api/segment")
 def segment(file: UploadFile = File(...)) -> dict:
-    """Full VLM flow on the PixMesh 3/4 rig: render -> describe -> palette ->
-    part map.
+    """Full VLM flow on canonical SEED_VIEW -- identical to the server's seed, so
+    a prompt tuned here transfers 1:1: render the 12 canonical views, describe +
+    paint on the seed view (``seed_view_inputs``).
 
     Persists the run's target view and assembly to disk so ``/api/generate_map``
     can re-paint the map from the same describe, without a second describe call.
@@ -90,14 +96,14 @@ def segment(file: UploadFile = File(...)) -> dict:
     run_dir = LAB_ROOT / run_id
     run_dir.mkdir(parents=True)
 
-    logger.info("[mask_lab] === run %s: %s ===", run_id, file.filename)
+    logger.info("[mask_lab] === run %s: %s (seed view %d) ===", run_id, file.filename, SEED_VIEW)
     try:
-        grid = describe_grid(scene)
-        target = target_view(scene)
+        render_views(scene, run_dir)
+        grid, target = seed_view_inputs(run_dir)
         grid.save(run_dir / "grid.png")
         target.save(run_dir / "target.png")
         with_contours(target).save(run_dir / "contours.png")
-        logger.info("[mask_lab] rendered grid + target -> %s", run_dir)
+        logger.info("[mask_lab] rendered 12 canonical views -> %s", run_dir)
 
         assembly = describe_assembly(grid)
         palette = assign_palette_tree(assembly)
@@ -125,6 +131,34 @@ def segment(file: UploadFile = File(...)) -> dict:
         "partmap": f"/runs/{run_id}/partmap.png",
         "parts": legend,
     }
+
+
+@app.post("/api/views")
+def views(file: UploadFile = File(...)) -> dict:
+    """Render the 12 canonical GeoSAM2 views of the upload, so you can eyeball
+    which reads the object best. No VLM -- cheap, ~a few s.
+
+    Each view is labelled with its (elevation, azimuth) so the winner can be named
+    as an angle; the current seed view is flagged.
+    """
+    scene = _load_glb(file)
+    run_id = f"{Path(file.filename or 'mesh').stem}_{uuid.uuid4().hex[:8]}"
+    run_dir = LAB_ROOT / run_id
+    run_dir.mkdir(parents=True)
+
+    logger.info("[mask_lab] === views %s: %s ===", run_id, file.filename)
+    try:
+        canonical = []
+        for v in range(NUM_VIEWS):
+            shaded_view(scene, view=v, resolution=384).save(run_dir / f"canon_{v:02d}.png")
+            canonical.append({"view": v, "elev": ELEVATIONS[v], "azim": AZIMUTHS_REFERENCE[v],
+                              "seed": v == SEED_VIEW, "url": f"/runs/{run_id}/canon_{v:02d}.png"})
+    except Exception as exc:
+        logger.exception("[mask_lab] views %s failed", run_id)
+        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+    logger.info("[mask_lab] === views %s: 12 canonical rendered ===", run_id)
+    return {"run": run_id, "canonical": canonical}
 
 
 @app.post("/api/generate_map")

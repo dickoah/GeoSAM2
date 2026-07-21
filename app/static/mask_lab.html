@@ -33,25 +33,34 @@ button.secondary:disabled{color:var(--ink4);border-color:var(--border)}
 .chip{display:inline-flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);
   border-radius:12px;padding:2px 10px;font-size:12px}
 .chip i{width:12px;height:12px;border-radius:3px;border:1px solid var(--border)}
+#views{margin-top:12px;display:none}
+#views h2{font-size:12px;color:var(--ink2);margin-bottom:8px}
+#views-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px}
+.vtile{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;text-align:center}
+.vtile.main{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.vtile img{width:100%;display:block;background:#fff}
+.vtile .cap{font-size:10px;color:var(--ink2);padding:3px 2px;font-family:ui-monospace,monospace}
 </style>
 </head>
 <body>
 <h1>Mask Lab — GLB → part map (flux PixMesh)</h1>
-<div class="sub">Grille 4 vues → describe hiérarchique (Gemini) → palette Kelly → part map sur la vue 3/4.
+<div class="sub">Grille 4 vues → describe hiérarchique (Gemini) → palette Kelly → part map sur la vue 1 (canonique, alignée au server).
 <b>Segmenter</b> = flux complet (2 appels VLM, ~30–60 s). <b>Régénérer la map</b> = repeint
-seulement la part map depuis le dernier describe (1 appel, même palette/vue) — pour itérer sur le prompt.</div>
+seulement la part map depuis le dernier describe (1 appel, même palette/vue) — pour itérer sur le prompt.
+<b>12 vues</b> = rend les 12 vues canoniques (sans VLM, ~5 s) pour choisir la meilleure vue d'entrée.</div>
 
 <div id="bar">
   <input type="file" id="file" accept=".glb,.gltf" title="Charge un fichier GLB ou glTF"/>
   <button type="button" id="run-btn" disabled>Segmenter</button>
   <button type="button" id="map-btn" class="secondary" disabled title="Repeint uniquement la part map à partir du dernier describe (même palette, même vue). Pour itérer sur le prompt de génération.">Régénérer la map</button>
+  <button type="button" id="views-btn" class="secondary" disabled title="Rend les 12 vues canoniques GeoSAM2 (sans VLM), pour choisir la meilleure vue à donner au VLM.">12 vues</button>
   <span id="status"></span>
 </div>
 
 <div id="grid">
   <div class="panel"><h2>1 · Grille (describe)</h2>
     <div class="body"><span class="empty" id="e-grid">Charge un GLB</span><img id="img-grid" hidden/></div></div>
-  <div class="panel"><h2>2 · Vue 3/4 (cible)</h2>
+  <div class="panel"><h2>2 · Vue 1 (cible)</h2>
     <div class="body"><span class="empty" id="e-target">—</span><img id="img-target" hidden/></div></div>
   <div class="panel"><h2>3 · Envoyé au VLM (contours)</h2>
     <div class="body"><span class="empty" id="e-contours">—</span><img id="img-contours" hidden/></div></div>
@@ -60,6 +69,8 @@ seulement la part map depuis le dernier describe (1 appel, même palette/vue) �
 </div>
 
 <div id="legend"><h2 id="legend-title">Parties</h2><div id="chips"></div></div>
+
+<div id="views"><h2 id="views-title">12 vues canoniques (seed ✓)</h2><div id="views-grid"></div></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -82,7 +93,38 @@ fetch("/api/config").then(r => r.json()).then(c => {
   if (!c.has_key) setStatus("⚠ GEMINI_API_KEY absente — le flux VLM ne marchera pas", true);
 });
 
-$("file").addEventListener("change", e => { fileSel = e.target.files[0] || null; $("run-btn").disabled = !fileSel; });
+$("file").addEventListener("change", e => {
+  fileSel = e.target.files[0] || null;
+  $("run-btn").disabled = !fileSel;
+  $("views-btn").disabled = !fileSel;
+});
+
+function vtile(cap, url, main) {
+  const d = document.createElement("div"); d.className = "vtile" + (main ? " main" : "");
+  const img = document.createElement("img"); img.src = url + "?t=" + Date.now(); img.loading = "lazy"; img.alt = cap;
+  const c = document.createElement("div"); c.className = "cap"; c.textContent = cap;
+  d.append(img, c); return d;
+}
+
+// Render the 12 canonical views (+ the PixMesh 3/4) of the selected object, no
+// VLM, so a good input view can be picked by eye across many objects.
+$("views-btn").addEventListener("click", async () => {
+  if (!fileSel) return;
+  $("views-btn").disabled = true;
+  setStatus("Rendu des 12 vues… (~5 s)");
+  try {
+    const fd = new FormData(); fd.append("file", fileSel);
+    const r = await fetch("/api/views", { method: "POST", body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const j = await r.json();
+    const g = $("views-grid"); g.innerHTML = "";
+    for (const v of j.canonical)
+      g.appendChild(vtile(`V${v.view} · el${Math.round(v.elev)}° az${Math.round(v.azim)}°${v.seed ? " ✓ seed" : ""}`, v.url, v.seed));
+    $("views").style.display = "block";
+    setStatus("✓ 12 vues rendues — choisis la meilleure");
+  } catch (err) { setStatus("❌ " + err.message, true); }
+  finally { $("views-btn").disabled = false; }
+});
 
 $("run-btn").addEventListener("click", async () => {
   if (!fileSel) return;
