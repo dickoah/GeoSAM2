@@ -189,6 +189,22 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
             <label for="seed-view-select">VLM seed view</label>
             <select id="seed-view-select" title="Which of the 12 canonical views the VLM paints on and GeoSAM2 seeds from."></select>
           </div>
+          <div class="row">
+            <label for="gtmv-cb">GT multiview (ideal)</label>
+            <input type="checkbox" id="gtmv-cb" title="Samples only: the 12 bundled GT masks vote directly on the faces, arbitrated by an alpha-expansion graph-cut. No SAM2, no seed view — the ideal-seed benchmark."/>
+          </div>
+          <div class="row">
+            <label for="smoothing-select">Smoothing</label>
+            <select id="smoothing-select" title="Graph-cut seam smoothing on the SAM2 result. Soft votes: each of the 12 propagated masks votes per face, the graph-cut arbitrates (best measured). Hard labels: smooths the final labels only. Ignored with GT multiview (already a graph-cut).">
+              <option value="">Baseline (none)</option>
+              <option value="soft_alpha" selected>Graph-cut — soft votes</option>
+              <option value="alpha_exp">Graph-cut — hard labels</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="gclam-num">Graph-cut λ</label>
+            <input type="number" id="gclam-num" min="0" max="10" step="0.5" value="3" style="width:66px;text-align:right" title="Smoothness strength of the graph-cut (GT multiview or Smoothing). 1 = conservative, 3 = strong (straightest seams)."/>
+          </div>
           <div class="hint">
             VLM seed mask: describe the object, paint a part map on the chosen
             canonical view, and seed from it. Used when no prompt is picked;
@@ -568,12 +584,25 @@ $('segment-btn').onclick = async () => {
     opposite_auto_segmentation: $('opposite-cb').checked,
     vlm_mask: $('vlm-cb').checked,
     seed_view: parseInt($('seed-view-select').value, 10),
+    gt_multiview: $('gtmv-cb').checked,
+    gc_lam: parseFloat($('gclam-num').value),
+    smoothing: $('smoothing-select').value || null,
     prompt: promptSelect.value || null,
   };
 
+  // GT multiview replaces the whole seed/propagation chain and only bundled
+  // samples carry the 12 GT masks it votes with.
+  if (settings.gt_multiview) {
+    if (uploadFile) {
+      setStatus('GT multiview needs a bundled sample — uploads have no GT masks.', true);
+      return;
+    }
+    settings.prompt = null;
+  }
+
   // With a prompt the server ignores vlm_mask; without one, the VLM mask or
   // opposite auto-seg is what produces any labels at all.
-  if (!settings.prompt && !settings.vlm_mask && !settings.opposite_auto_segmentation) {
+  if (!settings.gt_multiview && !settings.prompt && !settings.vlm_mask && !settings.opposite_auto_segmentation) {
     setStatus('With no seed prompt and no VLM mask, opposite auto-seg must stay on — GeoSAM2 would produce nothing.', true);
     return;
   }
@@ -585,9 +614,11 @@ $('segment-btn').onclick = async () => {
 
   $('segment-btn').disabled = true;
   $('spinner-overlay').classList.add('visible');
-  $('spinner-note').textContent = settings.prompt?.endsWith('.json')
-    ? 'clicks → 2D mask → 3D propagation…'
-    : 'segmenting…';
+  $('spinner-note').textContent = settings.gt_multiview
+    ? '12 GT masks → votes → graph-cut… (~15 s)'
+    : settings.prompt?.endsWith('.json')
+      ? 'clicks → 2D mask → 3D propagation…'
+      : 'segmenting…';
   setStatus('running…');
   const started = performance.now();
 

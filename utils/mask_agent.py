@@ -29,6 +29,7 @@ from pydantic_ai.native_tools import ImageGenerationTool
 from pydantic_ai.settings import ModelSettings
 
 from utils import prompts
+from utils.auto_prompt import prompts_from_color_map, write_prompts
 from utils.logs import get_logger
 
 logger = get_logger("geosam2.mask_agent")
@@ -298,46 +299,6 @@ def generate_part_map(
     return painted
 
 
-def snap_to_palette(
-    image: Image.Image,
-    palette: Dict[str, Tuple[int, int, int]],
-    object_mask: Optional[np.ndarray] = None,
-    background: Tuple[int, int, int] = BACKGROUND,
-) -> np.ndarray:
-    """Force every pixel onto the nearest palette entry (LAB, not RGB), returning RGB.
-
-    ``object_mask`` sends everything outside the silhouette to background, so a
-    model that painted over the edge cannot invent geometry.
-    """
-    rgb = np.asarray(image.convert("RGB"))
-    entries = np.array([background] + list(palette.values()), dtype=np.uint8)
-
-    lab_image = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab_entries = cv2.cvtColor(entries.reshape(1, -1, 3), cv2.COLOR_RGB2LAB).astype(np.float32)[0]
-
-    distance = np.linalg.norm(lab_image[:, :, None, :] - lab_entries[None, None, :, :], axis=-1)
-    nearest = np.argmin(distance, axis=-1)
-    snapped = entries[nearest]
-
-    # Pixels far from any palette colour = the model painted off-palette (report only).
-    off = np.take_along_axis(distance, nearest[..., None], axis=-1)[..., 0] > _OFF_PALETTE_LAB
-    if object_mask is not None:
-        off &= object_mask
-        snapped[~object_mask] = background
-        denom = int(object_mask.sum())  # over the object, so the threshold is crop-independent
-    else:
-        denom = off.size
-    share = float(off.sum()) / denom if denom else 0.0
-    if share > 0.05:
-        logger.warning("[snap_to_palette] %.1f%% of object pixels were over %d LAB from "
-                       "any palette colour -- the model painted off-palette",
-                       share * 100, _OFF_PALETTE_LAB)
-    else:
-        logger.info("[snap_to_palette] %d colours, %.1f%% off-palette pixels",
-                    len(palette), share * 100)
-    return snapped
-
-
 # Canonical view the VLM paints on and GeoSAM2 seeds from (el +25, az 300 -- a 3/4-high read), picked in the mask lab.
 SEED_VIEW = 1
 
@@ -364,12 +325,17 @@ def generate_seed_mask(
     data_root: Union[str, Path], 
     seed_view: int = SEED_VIEW
 ) -> SeedMask:
-    """Describe, paint a part map on canonical ``seed_view``, and write it as the
-    GeoSAM2 seed mask.
+    """Describe, paint a part map on canonical ``seed_view``, and write the
+    GeoSAM2 seed as one interior *point* per part.
 
-    Renders happen upstream (render_views wrote the data-root's color views);
-    :func:`seed_view_inputs` builds the grid + target, the VLM paints, and the
-    snapped map is written as ``mask_{seed_view:04d}.png`` -- ready to seed.
+    GeoSAM2 propagates by geometry (the model reads normal + point maps, never
+    colour), so the seed's only job is to drop a prompt inside each part; the
+    paper's evaluated format is point prompts, which sidesteps every boundary
+    artefact a colour mask carries. The VLM paints, the map is snapped to the
+    palette to recover clean part regions, and each region's interior point is
+    written as ``vlm_points_{seed_view:04d}.json`` -- the reference pipeline's
+    point-prompt schema. The snapped map is kept as ``mask_{seed_view:04d}.png``
+    for the UI preview only; it does not seed.
     """
     data_root = Path(data_root)
     started = time.monotonic()
@@ -380,14 +346,19 @@ def generate_seed_mask(
     palette = assign_palette_tree(assembly)
 
     part_map = generate_part_map(target, palette)
-    mask = np.asarray(part_map.convert("RGB"))  # raw VLM output, no snapping
-    path = data_root / f"mask_{seed_view:04d}.png"
-    Image.fromarray(mask).save(path)
+    object_mask = np.asarray(
+        Image.open(data_root / f"color_{seed_view:04d}.webp").getchannel("A")) > 0
+    part_map_array =  np.asarray(part_map.convert("RGB"))
+    Image.fromarray(part_map_array).save(data_root / f"mask_{seed_view:04d}.png")
 
-    painted = {name: int(np.all(mask == np.array(c, np.uint8), axis=-1).sum())
+    prompts_json = prompts_from_color_map(part_map_array, view_idx=seed_view, background=BACKGROUND)
+    path = data_root / f"vlm_points_{seed_view:04d}.json"
+    write_prompts(prompts_json, path)
+
+    painted = {name: int(np.all(part_map_array == np.array(c, np.uint8), axis=-1).sum())
                for name, c in palette.items()}
     _log_coverage(painted)
-    logger.info("[generate_seed_mask] === %s: %d/%d parts in %.1fs ===",
+    logger.info("[generate_seed_mask] === %s: %d parts, %d points in %.1fs ===",
                 path.name, sum(1 for px in painted.values() if px >= MIN_PART_PX),
-                len(palette), time.monotonic() - started)
+                len(prompts_json), time.monotonic() - started)
     return SeedMask(seed_view, assembly, palette, painted, path)

@@ -789,3 +789,216 @@ def filter_iou(all_seg_result, video_segments, track_id):
     _ = end - start
 
     return video_segments, all_seg_result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Boundary-aware label smoothing (added alongside complete_labels' hole-fill).
+#
+# complete_labels' "adjacent" pass only fills label-0 faces; it never MOVES a
+# boundary, so a staircased seam from the per-face vote stays staircased. These
+# operate on the FINAL per-face labels and export their own GLB, leaving the
+# original pipeline untouched -- they are comparison points, not replacements.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _to_np_int(x) -> np.ndarray:
+    """Face-label tensor/array -> contiguous int64 numpy, detached from device."""
+    if hasattr(x, "cpu"):
+        x = x.cpu().numpy()
+    return np.asarray(x).astype(np.int64)
+
+
+def smooth_labels_icm(face_labels, mesh_vanilla, theta_deg=15.0, lambda_data=0.7,
+                      iters=30, dihedral=True):
+    """Crease-aware label smoothing by ICM on the face-adjacency graph.
+
+    Potts model: each face keeps the label that maximises
+        (sum over neighbours w_fn * [label(n) == L])  +  lambda_data * [L == vote(f)]
+    with ``w_fn = exp(-dihedral / theta)`` -- so cutting across a flat surface is
+    expensive (the boundary straightens into a minimal line) and cutting on a
+    crease is cheap (the boundary snaps to it). ``dihedral=False`` sets every
+    weight to 1 (plain all-face majority) as the ablation baseline. Unlike
+    complete_labels' "adjacent" pass, this relabels EVERY face, so it actually
+    moves boundaries. Runs on ``mesh_vanilla`` (welded topology) -- the exploded
+    ``mesh`` has no shared edges and thus no adjacency.
+
+    Args:
+        face_labels: final per-face integer labels (tensor or array).
+        mesh_vanilla: source mesh with welded vertices (real face adjacency).
+        theta_deg: dihedral scale; smaller = only very sharp creases stay cheap.
+        lambda_data: pull toward the original vote; 0 = pure smoothing.
+        iters: max ICM sweeps (stops early once nothing changes).
+        dihedral: weight cuts by crease angle; False = uniform majority.
+    """
+    lab = _to_np_int(face_labels).copy()
+    vote = lab.copy()
+    adj = np.asarray(mesh_vanilla.face_adjacency)
+    ang = np.abs(np.asarray(mesh_vanilla.face_adjacency_angles))
+    if len(adj) == 0:
+        return torch.from_numpy(lab)
+    w = np.exp(-ang / np.radians(theta_deg)) if dihedral else np.ones(len(ang))
+    e0, e1 = adj[:, 0], adj[:, 1]
+
+    uniq = np.unique(vote)
+    K = len(uniq)
+    lut = np.zeros(int(vote.max()) + 1, dtype=np.int64)
+    lut[uniq] = np.arange(K)          # label id -> dense column; labels stay in `uniq`
+    vote_col = lut[vote]
+
+    for _ in range(iters):
+        agree = np.zeros((len(lab), K), dtype=np.float64)
+        np.add.at(agree, (e0, lut[lab[e1]]), w)   # neighbour across each edge votes its label
+        np.add.at(agree, (e1, lut[lab[e0]]), w)
+        agree[np.arange(len(lab)), vote_col] += lambda_data
+        new = uniq[agree.argmax(1)]
+        if np.array_equal(new, lab):
+            break
+        lab = new
+    return torch.from_numpy(lab)
+
+
+def face_vote_histogram(imgs_mask, depth_imgs, c2ws, fovy_deg, coord, video_segments,
+                        sample_num, prior_keys=None):
+    """Per-face label histogram across all views -- the soft version of
+    lift_2dmask_3d's double ``mode()``.
+
+    Same projection (cal_link + grid_sample on the aggregated label maps), but
+    instead of collapsing samples x views to one hard label per face, every
+    sample's every view keeps its vote. Near seams the views disagree; the
+    histogram keeps that uncertainty for a graph-cut to arbitrate, where mode()
+    freezes a noisy winner per face.
+
+    Returns:
+        (hist [n_faces, K] float tensor, label_ids list) -- column j counts
+        votes for label_ids[j]; invisible samples and background vote nowhere.
+    """
+    all_masks = mask_aggregation(video_segments, prior_keys=prior_keys)
+    n_views = all_masks.shape[0]
+    link = torch.ones([coord.shape[0], 3, n_views], dtype=torch.int)
+    link[:, 0:3, :] = cal_link(imgs_mask, depth_imgs, c2ws, fovy_deg, coord).permute(1, 2, 0)
+    grid = (link[:, :-1, :].permute(2, 0, 1).unsqueeze(-2).to(torch.float32) / (1024 - 1)) * 2 - 1
+    pc = F.grid_sample(torch.from_numpy(all_masks), grid, mode="nearest").squeeze(1)
+    pc[~link.permute(2, 0, 1)[:, :, -1:].to(torch.bool)] = 0
+    pc = pc.squeeze().permute(1, 0).to(torch.int64)                  # [n_points, n_views]
+
+    label_ids = sorted(int(i) for i in np.unique(all_masks) if i not in (0, 999))
+    lut = torch.zeros(max(label_ids) + 1 if label_ids else 1, dtype=torch.int64)
+    for j, i in enumerate(label_ids):
+        lut[i] = j + 1                                               # 0 stays "no vote"
+    pc = torch.where(pc == 999, torch.zeros_like(pc), pc)
+    votes = lut[pc.clamp(max=lut.shape[0] - 1)]
+    n_faces = coord.shape[0] // sample_num
+    votes = votes.reshape(n_faces, sample_num * n_views)
+    hist = torch.zeros(n_faces, len(label_ids) + 1, dtype=torch.float32)
+    hist.scatter_add_(1, votes, torch.ones_like(votes, dtype=torch.float32))
+    return hist[:, 1:], label_ids
+
+
+def smooth_labels_graphcut(face_labels, mesh_vanilla, unary=None, label_ids=None,
+                           theta_deg=20.0, lam=1.0, sweeps=4):
+    """Alpha-expansion Potts graph-cut on the face-adjacency graph (PyMaxflow).
+
+    Same energy family as smooth_labels_icm but optimised globally per expansion
+    move instead of greedily per face -- on the ideal-mask benchmark it removes
+    ~2-4x more staircase (boundary edges 606->226 on sample_05, 1281->516 on
+    sample_04) at unchanged agreement with the 2D masks. Cut cost is edge length
+    x exp(-dihedral/theta): boundaries straighten on flat surfaces and snap to
+    creases.
+
+    Args:
+        face_labels: current per-face labels (data term when ``unary`` is None).
+        unary: optional [n_faces, K] cost matrix aligned with ``label_ids``
+            (e.g. -log of face_vote_histogram probabilities). None = hard unary
+            of ``lam`` for leaving the current label; 0/999 faces get a free
+            choice and are absorbed into a neighbouring part.
+        label_ids: the labels unary's columns refer to; None = unique current
+            labels minus {0, 999}.
+    """
+    import maxflow  # optional dependency, only this smoother needs it
+
+    lab_in = _to_np_int(face_labels)
+    if label_ids is None:
+        label_ids = sorted(int(i) for i in np.unique(lab_in) if i not in (0, 999))
+    K = len(label_ids)
+    n = len(lab_in)
+    col = {i: j for j, i in enumerate(label_ids)}
+
+    if unary is None:
+        unary_np = np.full((n, K), lam, dtype=np.float64)
+        for f, l in enumerate(lab_in):
+            if l in col:
+                unary_np[f, col[l]] = 0.0
+            else:
+                unary_np[f, :] = 0.0                                 # unknown: smoothing decides
+    else:
+        unary_np = np.asarray(unary, dtype=np.float64)
+
+    adj = np.asarray(mesh_vanilla.face_adjacency)
+    ang = np.degrees(np.abs(np.asarray(mesh_vanilla.face_adjacency_angles)))
+    elen = np.linalg.norm(mesh_vanilla.vertices[mesh_vanilla.face_adjacency_edges[:, 0]]
+                          - mesh_vanilla.vertices[mesh_vanilla.face_adjacency_edges[:, 1]], axis=1)
+    w = lam * (elen / max(np.median(elen), 1e-12)) * np.exp(-ang / theta_deg)
+    e0, e1 = adj[:, 0], adj[:, 1]
+
+    # start from the best hard assignment the unary allows
+    lab = np.array([label_ids[j] for j in unary_np.argmin(1)], dtype=np.int64)
+
+    def energy(l):
+        u = sum(unary_np[f, col[l[f]]] for f in range(n))
+        return u + (w * (l[e0] != l[e1])).sum()
+
+    E = energy(lab)
+    for _ in range(sweeps):
+        changed = False
+        for a in label_ids:
+            g = maxflow.Graph[float]()
+            nodes = g.add_nodes(n)
+            keep = unary_np[np.arange(n), [col[l] for l in lab]]
+            take = unary_np[:, col[a]]
+            for f in range(n):                                       # source=keep, sink=take alpha
+                g.add_tedge(nodes[f], take[f], keep[f])
+            same = lab[e0] == lab[e1]
+            for i in np.nonzero(same)[0]:
+                g.add_edge(nodes[e0[i]], nodes[e1[i]], w[i], w[i])
+            for i in np.nonzero(~same)[0]:                           # BVZ auxiliary node
+                aux = g.add_nodes(1)[0]
+                wa = w[i] if lab[e0[i]] != a else 0.0
+                wb = w[i] if lab[e1[i]] != a else 0.0
+                g.add_edge(nodes[e0[i]], aux, wa, wa)
+                g.add_edge(aux, nodes[e1[i]], wb, wb)
+                g.add_tedge(aux, 0, w[i])
+            g.maxflow()
+            seg = np.array([g.get_segment(nodes[f]) for f in range(n)])
+            new = lab.copy()
+            new[seg == 1] = a
+            En = energy(new)
+            if En < E - 1e-9:
+                lab, E, changed = new, En, True
+        if not changed:
+            break
+    return torch.from_numpy(lab)
+
+
+def export_labelled_mesh(mesh_exploded, face_labels, glb_path, color_seed=0):
+    """Write a per-face-labelled mesh to ``glb_path`` (+ a sibling ``.npy``).
+
+    Colours are deterministic per label id (seeded RNG), so different smoothing
+    methods paint the same part the same colour and are visually comparable --
+    unlike lift_2dmask_3d's per-run random palette. Colours the exploded
+    ``mesh`` (unique verts per face) so labels don't bleed at shared vertices.
+    """
+    lab = _to_np_int(face_labels)
+    ids = np.unique(lab)
+    rng = np.random.default_rng(color_seed)
+    cmap = {int(i): rng.random(3) * 255 for i in ids}
+    cmap[0] = np.zeros(3)
+    colors = np.ones((len(mesh_exploded.vertices), 3)) * 255
+    for i in ids:
+        colors[mesh_exploded.faces[lab == i].flatten()] = cmap[int(i)][None, :]
+    m = mesh_exploded.copy()
+    colors = np.hstack((colors, np.full((colors.shape[0], 1), 255, dtype=np.uint8)))
+    m.visual.vertex_colors = np.uint8(colors)
+    os.makedirs(os.path.dirname(glb_path) or ".", exist_ok=True)
+    np.save(glb_path.replace(".glb", ".npy"), lab)
+    m.export(glb_path)
+    print(f"Exported labelled mesh to {glb_path}")

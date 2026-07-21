@@ -70,6 +70,9 @@ _ALLOWED_SETTINGS = frozenset({
     "render_samples",
     "vlm_mask",
     "seed_view",
+    "gt_multiview",
+    "gc_lam",
+    "smoothing",
 })
 
 
@@ -330,6 +333,23 @@ def _prepare_params(params: Dict[str, Any], sample_dir: Optional[Path]) -> Dict[
             detail=f"Unknown settings: {', '.join(unknown)}. "
                    f"Expected any of: {', '.join(sorted(_ALLOWED_SETTINGS))}.",
         )
+
+    # GT multiview reads the sample's own 12 masks -- an upload has none, and a
+    # prompt/VLM seed would contradict it. Its combo choice overrides both.
+    if params.get("gt_multiview"):
+        if sample_dir is None:
+            raise HTTPException(status_code=400,
+                                detail="GT multiview needs a bundled sample (its 12 GT masks).")
+        if prompt:
+            raise HTTPException(status_code=400,
+                                detail="GT multiview cannot combine with a prompt.")
+        params.pop("vlm_mask", None)
+        params.pop("seed_view", None)
+        params.pop("smoothing", None)  # gt_multiview is already the graph-cut
+        return params
+    if not params.get("smoothing"):
+        params.pop("smoothing", None)   # null/"" from the UI select
+        params.pop("gc_lam", None)      # lam only drives a graph-cut
 
     if not prompt:
         return params

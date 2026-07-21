@@ -21,7 +21,9 @@ from sam2.automatic_mask_generator_geosam2 import SAM2AutomaticMaskGenerator
 from utils.inference_utils import (
     show_anns, show_mask, filter_mask_area, filter_mask_stability,
     lift_2dmask_3d, load_mesh_with_faces, sample_points_on_faces_parallel,
-    trans2bool, shrink_mask, filter_iou, complete_labels, gen_pcd
+    trans2bool, shrink_mask, filter_iou, complete_labels, gen_pcd,
+    smooth_labels_icm, smooth_labels_graphcut, face_vote_histogram,
+    export_labelled_mesh
 )
 
 
@@ -498,6 +500,11 @@ def segment_with_mask_prompts(
     save_pointcloud_vis: bool = False,
     start_frames: Optional[List[int]] = None,
     start_to_seed_views: Optional[Dict[int, List[int]]] = None,
+    extra_smoothing: Optional[List[str]] = None,
+    icm_theta: float = 15.0,
+    icm_lambda: float = 0.7,
+    icm_iters: int = 30,
+    gc_lam: float = 1.0,
 ) -> Dict:
     """
     Perform segmentation using mask prompts or automatic mask generation.
@@ -680,6 +687,45 @@ def segment_with_mask_prompts(
                         export_root=output_dir,
                     )
 
+                    # Extra boundary-aware smoothing passes, each exporting its
+                    # own GLB next to the baseline so the seam quality can be
+                    # compared side by side. The baseline above is untouched.
+                    for method in (extra_smoothing or []):
+                        if method in ("dihedral_icm", "majority_all"):
+                            smoothed = smooth_labels_icm(
+                                face_label, mesh_vanilla,
+                                theta_deg=icm_theta, lambda_data=icm_lambda,
+                                iters=icm_iters, dihedral=(method == "dihedral_icm"),
+                            )
+                        elif method == "alpha_exp":
+                            smoothed = smooth_labels_graphcut(
+                                face_label, mesh_vanilla,
+                                theta_deg=icm_theta, lam=gc_lam,
+                            )
+                        elif method == "soft_alpha":
+                            # Soft 12-view votes instead of the final hard labels:
+                            # the histogram keeps per-view disagreement near seams
+                            # and the graph-cut arbitrates it geometrically.
+                            hist, ids = face_vote_histogram(
+                                torch.stack([torch.from_numpy(m) for m in all_img_masks], dim=0),
+                                torch.stack([torch.from_numpy(d).unsqueeze(-1) for d in all_depth_maps], dim=0),
+                                torch.stack(c2ws, dim=0), fovy_deg, point_cloud,
+                                all_seg_result, SAMPLE_NUM, prior_keys=prior_keys,
+                            )
+                            prob = (hist + 0.5) / (hist.sum(1, keepdim=True) + 0.5 * hist.shape[1])
+                            smoothed = smooth_labels_graphcut(
+                                face_label, mesh_vanilla,
+                                unary=-torch.log(prob).numpy(), label_ids=ids,
+                                theta_deg=icm_theta, lam=gc_lam,
+                            )
+                        else:
+                            raise ValueError(f"unknown extra smoothing '{method}'")
+                        moved = int((smoothed.cpu().numpy() != face_label.cpu().numpy()).sum())
+                        print(f"[{method}] relabelled {moved} faces")
+                        tag = f"segmentation_{method}_{run_tag}_pa{postprocess_pa:g}"
+                        export_labelled_mesh(
+                            mesh, smoothed, os.path.join(output_dir, f"{tag}.glb"))
+
                 if save_pointcloud_vis:
                     pc_save_dir = os.path.join(output_dir, obj_name, "pointcloud_vis")
                     pc_save_path = os.path.join(pc_save_dir, f"labeled_pc_{run_tag}.ply")
@@ -743,6 +789,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--save-input-maps", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-frame-vis", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-pointcloud-vis", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--extra-smoothing", nargs="*", default=[],
+        choices=["dihedral_icm", "majority_all", "alpha_exp", "soft_alpha"],
+        help="Extra boundary-smoothing passes on the final labels, each exporting "
+             "its own GLB alongside the baseline. 'dihedral_icm' snaps seams to "
+             "creases and straightens them on flat surfaces; 'majority_all' is the "
+             "no-crease-weight ablation; 'alpha_exp' is the same energy optimised "
+             "globally by graph-cut; 'soft_alpha' feeds the graph-cut per-view "
+             "vote histograms instead of the final hard labels (best measured).",
+    )
+    parser.add_argument("--gc-lam", type=float, default=1.0,
+                        help="Graph-cut smoothness strength for alpha_exp/soft_alpha.")
+    parser.add_argument("--icm-theta", type=float, default=15.0,
+                        help="Dihedral scale (deg) for crease weighting.")
+    parser.add_argument("--icm-lambda", type=float, default=0.7,
+                        help="Pull toward the original vote; 0 = pure smoothing.")
+    parser.add_argument("--icm-iters", type=int, default=30,
+                        help="Max ICM sweeps (stops early on convergence).")
     parser.add_argument(
         "--mask-path",
         type=str,
@@ -831,6 +895,11 @@ def main():
         save_pointcloud_vis=args.save_pointcloud_vis,
         start_frames=start_frames,
         start_to_seed_views=start_to_seed_views,
+        extra_smoothing=args.extra_smoothing,
+        icm_theta=args.icm_theta,
+        icm_lambda=args.icm_lambda,
+        icm_iters=args.icm_iters,
+        gc_lam=args.gc_lam,
     )
 
     print(f"Found {len(results['all_seg_result'][0])} objects")

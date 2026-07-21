@@ -126,6 +126,9 @@ class GeoSAM2Segmenter:
         seed_view: Optional[int] = None,
         mask_threshold: float = 0.0,
         vlm_mask: bool = False,
+        gt_multiview: bool = False,
+        gc_lam: float = 3.0,
+        smoothing: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Segment ``source`` and return a result dict.
 
@@ -162,31 +165,77 @@ class GeoSAM2Segmenter:
                 raise FileNotFoundError(f"checkpoint not found at {self.checkpoint_path}")
             if point_prompt_file is not None and mask_path is not None:
                 raise ValueError("Provide either point_prompt_file or mask_path, not both")
+            if smoothing and smoothing not in ("soft_alpha", "alpha_exp"):
+                raise ValueError(f"Unknown smoothing '{smoothing}' "
+                                 "(expected soft_alpha or alpha_exp)")
+            if smoothing and not enable_postprocess:
+                # inference.py runs the extra smoothers inside its postprocess
+                # block; without it the requested labels are silently never made.
+                raise ValueError("Graph-cut smoothing requires post-process to stay enabled")
 
             data_root, render_log = self._resolve_views(source, work_dir)
             result["log"] += render_log
             result["data_root"] = str(data_root)
 
+            if gt_multiview:
+                # Ideal-seed benchmark: the sample's 12 GT masks vote directly on
+                # the faces and an alpha-expansion graph-cut arbitrates -- no
+                # SAM2, no seed view. Only bundled samples carry those masks.
+                if vlm_mask or mask_path is not None or point_prompt_file is not None:
+                    raise ValueError("gt_multiview cannot combine with a prompt or the VLM")
+                n_masks = len(list(Path(data_root).glob("mask_*.png")))
+                if n_masks != NUM_VIEWS:
+                    raise ValueError(
+                        f"{data_root} has {n_masks} GT masks, gt_multiview needs {NUM_VIEWS}")
+                output_dir = work_dir / "seg"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                code, log = self._run_logged([
+                    sys.executable, str(self.repo_root / "multiview_mask_infer.py"),
+                    "--data-root", str(data_root),
+                    "--output-dir", str(output_dir),
+                    "--gc-lam", str(gc_lam),
+                ], tag="gt_multiview")
+                result["log"] += log
+                if code != 0:
+                    raise RuntimeError(f"multiview_mask_infer.py failed with exit code {code}")
+
+                labels_path = self._find_labels(output_dir)
+                result["labels_path"] = str(labels_path)
+                scene, structure, n_parts, unlabeled_faces = self._build_scene(
+                    data_root / "mesh.glb", np.load(labels_path))
+                glb_path = work_dir / "segmented.glb"
+                scene.export(glb_path)
+                result.update(
+                    status=f"OK - {n_parts} parts (GT multiview, lam={gc_lam:g})",
+                    glb_path=str(glb_path), scene=scene, structure=structure,
+                    n_parts=n_parts, unlabeled_faces=unlabeled_faces,
+                )
+                logger.info("[segment] === OK (gt_multiview): %d parts, %.1fs ===",
+                            n_parts, time.monotonic() - started)
+                return result
+
+            vlm_preview = None
             if vlm_mask:
-                # Auto-generate the seed mask with the VLM: describe the object
-                # from a grid, paint a part map on the chosen canonical view, and
-                # seed GeoSAM2 from it. No prompt file, no manual mask.
+                # Auto-seed with the VLM: describe the object from a grid, paint a
+                # part map on the chosen canonical view, and emit one interior
+                # point per part -- the paper's point-prompt format, so boundary
+                # noise in the map never reaches GeoSAM2. No manual mask/prompt.
                 if mask_path is not None or point_prompt_file is not None:
                     raise ValueError("vlm_mask cannot combine with a mask or prompt file")
                 from utils.mask_agent import SEED_VIEW, generate_seed_mask
 
                 seed = generate_seed_mask(
                     data_root, seed_view if seed_view is not None else SEED_VIEW)
-                mask_path = seed.path
-                mask_view = seed.view
-                result["seed_mask_path"] = str(mask_path)
+                point_prompt_file = seed.path  # the points JSON -> reference pipeline
+                seed_view = seed.view
+                vlm_preview = data_root / f"mask_{seed.view:04d}.png"  # snapped map, UI only
                 result["seed_view"] = seed.view
                 result["vlm_scene"] = seed.assembly.scene_description
                 result["vlm_parts"] = seed.painted
                 result["vlm_coverage"] = seed.coverage
                 # `painted`, not `len(palette)`: the palette is what was asked
                 # for, and a part the VLM never drew cannot seed anything.
-                result["log"] += (f"VLM seed mask on view {seed.view}: "
+                result["log"] += (f"VLM seed on view {seed.view}: "
                                   f"{seed.assembly.scene_description}, "
                                   f"{seed.painted}/{len(seed.palette)} parts painted\n")
             else:
@@ -204,6 +253,11 @@ class GeoSAM2Segmenter:
                 result["seed_mask_path"] = str(mask_path)
                 result["seed_view"] = mask_view
 
+            # For a VLM run, the UI's "segmentation" tile is the VLM part map, not
+            # the SAM2 mask the points expanded into -- show what the VLM decided.
+            if vlm_preview is not None:
+                result["seed_mask_path"] = str(vlm_preview)
+
             # A mask given directly (not via prompt/VLM) still has a seed view;
             # record it so the UI shows that view's maps.
             if mask_view is not None and result["seed_view"] is None:
@@ -220,9 +274,11 @@ class GeoSAM2Segmenter:
                 opposite_auto_segmentation=opposite_auto_segmentation,
                 mask_path=mask_path,
                 mask_view=mask_view,
+                smoothing=smoothing,
+                gc_lam=gc_lam,
             )
 
-            labels_path = self._find_labels(output_dir)
+            labels_path = self._find_labels(output_dir, prefer=smoothing)
             result["labels_path"] = str(labels_path)
             logger.info("[labels] %s", labels_path.name)
 
@@ -355,6 +411,8 @@ class GeoSAM2Segmenter:
         opposite_auto_segmentation: bool,
         mask_path: Optional[Union[str, Path]],
         mask_view: Optional[int],
+        smoothing: Optional[str] = None,
+        gc_lam: float = 3.0,
     ) -> str:
         if mask_path is not None and mask_view is None:
             raise ValueError("mask_view is required when mask_path is provided")
@@ -376,6 +434,9 @@ class GeoSAM2Segmenter:
             "--opposite-auto-segmentation" if opposite_auto_segmentation
             else "--no-opposite-auto-segmentation",
         ]
+        if smoothing:
+            command += ["--extra-smoothing", smoothing, "--gc-lam", str(gc_lam)]
+            logger.info("[inference] graph-cut smoothing: %s (lam=%g)", smoothing, gc_lam)
         if mask_path is not None:
             command += ["--mask-path", str(mask_path), "--mask-view", str(mask_view)]
             logger.info("[inference] seeding view %s from %s", mask_view, Path(mask_path).name)
@@ -415,13 +476,22 @@ class GeoSAM2Segmenter:
         output = _tail("\n".join(lines))
         return process.returncode, f"$ {' '.join(command)}\n{output}\n"
 
-    def _find_labels(self, output_dir: Path) -> Path:
+    def _find_labels(self, output_dir: Path, prefer: Optional[str] = None) -> Path:
         matches = sorted(glob.glob(str(output_dir / "*.npy")))
         if not matches:
             raise RuntimeError(
                 f"inference.py wrote no label file to {output_dir}. It exits successfully "
                 "in that case, so this usually means no masks were produced."
             )
+        if prefer:
+            # A requested smoothing method writes its own file; not finding it is
+            # a failure, not a reason to silently fall back to the baseline.
+            wanted = [m for m in matches if f"segmentation_{prefer}_" in Path(m).name]
+            if not wanted:
+                raise RuntimeError(
+                    f"smoothing '{prefer}' produced no label file in {output_dir} "
+                    f"(found: {', '.join(Path(m).name for m in matches)})")
+            return Path(wanted[-1])
         # Post-processing writes a second, better file; prefer it when present.
         postprocessed = [m for m in matches if "postprocessed" in Path(m).name]
         return Path(postprocessed[-1] if postprocessed else matches[-1])
