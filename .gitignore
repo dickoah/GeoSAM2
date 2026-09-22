@@ -19,9 +19,11 @@ env/
 venv/
 ENV/
 
-# Editor / IDE
+# Editor / IDE, and the coding agents' own instructions: local-only, never
+# pushed. AGENTS.md and CLAUDE.md live in .claude/ so agents still read them.
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 .DS_Store

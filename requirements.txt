@@ -14,3 +14,29 @@ tqdm
 trimesh
 pandas
 ninja
+
+# ── Step-by-step app (app.py) ────────────────────────────────────────────
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9   # required by FastAPI for the multipart upload endpoints
+
+# Rasterises the 12 canonical views in-process (utils/render.py), replacing the
+# Blender stage. Needs a GL context; it is driven headless through EGL.
+pyrender>=0.1.45
+
+# pyrender pins PyOpenGL==3.1.0, which predates numpy 2 by nine years: under it
+# glGenTextures raises a ctypes ArgumentError, so *any* textured mesh fails to
+# render. Overriding the pin is deliberate -- pip will warn about the conflict.
+PyOpenGL>=3.1.7
+
+# VLM describe/paint of the seed view (utils/guidance.py, via SegviGen's code).
+# >=2.11 moved ImageGenerationTool and BinaryImage to the package root.
+pydantic-ai>=2.11
+
+# Loads GEMINI_API_KEY from .env. pydantic-ai's Google provider reads either
+# GOOGLE_API_KEY or GEMINI_API_KEY, despite only naming the first when it fails.
+python-dotenv>=1.0
+
+# Connected components and distance transforms for the point prompts
+# (utils/auto_prompt.py). Also pulled in by pyrender.
+scipy>=1.10

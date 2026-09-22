@@ -21,11 +21,17 @@ from sam2.automatic_mask_generator_geosam2 import SAM2AutomaticMaskGenerator
 from utils.inference_utils import (
     show_anns, show_mask, filter_mask_area, filter_mask_stability,
     lift_2dmask_3d, load_mesh_with_faces, sample_points_on_faces_parallel,
-    trans2bool, shrink_mask, filter_iou, complete_labels, gen_pcd
+    trans2bool, shrink_mask, filter_iou, complete_labels, gen_pcd,
+    clean_label_fragments,
+    export_labelled_mesh
 )
 
 
 SAMPLE_NUM = 5
+
+# The mesh as loaded is Z-up; the cameras in meta.json are Y-up.
+_CAMERA_FRAME_ROTATION = np.array([[1, 0, 0, 0], [0, 0, -1, 0],
+                                   [0, 1, 0, 0], [0, 0, 0, 1]])
 NUM_VIEWS = 12
 MASK_MIN_AREA_PX = 64
 MASK_COLOR_QUANT_STEP = 8
@@ -456,7 +462,8 @@ def read_data(
 def prepare_mesh_and_point_cloud(mesh: trimesh.Trimesh, 
                                   scaling_factor: float,
                                   translation: np.ndarray,
-                                  sample_num: int = SAMPLE_NUM) -> Tuple[trimesh.Trimesh, torch.Tensor]:
+                                  sample_num: int = SAMPLE_NUM
+                                  ) -> Tuple[trimesh.Trimesh, torch.Tensor, np.ndarray]:
     """
     Transform mesh and generate point cloud for lifting 2D masks to 3D.
     
@@ -467,23 +474,24 @@ def prepare_mesh_and_point_cloud(mesh: trimesh.Trimesh,
         sample_num: Number of points to sample per face
         
     Returns:
-        Tuple of (transformed_mesh, point_cloud)
+        Tuple of (transformed_mesh, point_cloud, matrix back to the input frame)
     """
-    rotation_matrix = np.array([
-        [1, 0, 0, 0],
-        [0, 0, -1, 0],
-        [0, 1, 0, 0],
-        [0, 0, 0, 1]
-    ])
-    mesh.apply_transform(rotation_matrix)
+    mesh.apply_transform(_CAMERA_FRAME_ROTATION)
     mesh.apply_translation(translation)
     mesh.apply_scale(scaling_factor)
 
     face_to_vertex = mesh.vertices[mesh.faces]
     object_org_coord = sample_points_on_faces_parallel(face_to_vertex, num_points=sample_num)
     point_cloud = torch.from_numpy(object_org_coord).float().reshape(-1, 3)
-    
-    return mesh, point_cloud
+
+    # The inverse, so every export can be put back in the input's own frame
+    # (same orientation, position and scale as the mesh the caller handed in).
+    # Built from the same three steps rather than recomposed by hand.
+    to_source = np.linalg.inv(
+        trimesh.transformations.scale_matrix(scaling_factor)
+        @ trimesh.transformations.translation_matrix(translation)
+        @ _CAMERA_FRAME_ROTATION)
+    return mesh, point_cloud, to_source
 
 
 def segment_with_mask_prompts(
@@ -498,6 +506,7 @@ def segment_with_mask_prompts(
     save_pointcloud_vis: bool = False,
     start_frames: Optional[List[int]] = None,
     start_to_seed_views: Optional[Dict[int, List[int]]] = None,
+    clean_fragments: bool = False,
 ) -> Dict:
     """
     Perform segmentation using mask prompts or automatic mask generation.
@@ -529,7 +538,7 @@ def segment_with_mask_prompts(
     obj_name = data["obj_name"]
     video_dir = data["data_root"]
 
-    mesh, point_cloud = prepare_mesh_and_point_cloud(
+    mesh, point_cloud, to_source = prepare_mesh_and_point_cloud(
         mesh, scaling_factor.item() if torch.is_tensor(scaling_factor) else scaling_factor,
         translation.numpy() if torch.is_tensor(translation) else translation
     )
@@ -650,8 +659,12 @@ def segment_with_mask_prompts(
                     view_id=f"segmentation_result_{run_tag}",
                     uuid=obj_name,
                     prior_keys=prior_keys,
-                    export_mesh=not enable_postprocess,
+                    # Always exported, even when post-processing follows: this
+                    # is GeoSAM2's own result, the one the paper shows, and the
+                    # app offers it as its own stage next to what we add on top.
+                    export_mesh=True,
                     export_root=output_dir,
+                    to_source_frame=to_source,
                 )
 
                 if enable_postprocess:
@@ -678,7 +691,16 @@ def segment_with_mask_prompts(
                         prior_keys=prior_keys,
                         export_mesh=True,
                         export_root=output_dir,
+                        to_source_frame=to_source,
                     )
+
+                    if clean_fragments:
+                        # clean/: a sibling *.npy would win the app's sorted glob.
+                        export_labelled_mesh(
+                            mesh, clean_label_fragments(face_label, mesh_vanilla),
+                            os.path.join(output_dir, "clean",
+                                         f"segmentation_{run_tag}_pa{postprocess_pa:g}.glb"),
+                            to_source_frame=to_source)
 
                 if save_pointcloud_vis:
                     pc_save_dir = os.path.join(output_dir, obj_name, "pointcloud_vis")
@@ -743,6 +765,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--save-input-maps", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-frame-vis", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-pointcloud-vis", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--clean-fragments", action="store_true",
+        help="On the post-processed labels, reassign stranded speckle components to "
+             "the label they touch (only the unambiguous tail moves; nothing is "
+             "deleted). Written under <output-dir>/clean/.")
     parser.add_argument(
         "--mask-path",
         type=str,
@@ -831,6 +858,7 @@ def main():
         save_pointcloud_vis=args.save_pointcloud_vis,
         start_frames=start_frames,
         start_to_seed_views=start_to_seed_views,
+        clean_fragments=args.clean_fragments,
     )
 
     print(f"Found {len(results['all_seg_result'][0])} objects")

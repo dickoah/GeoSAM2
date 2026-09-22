@@ -29,8 +29,8 @@ dataset. Training/fine-tuning code is intentionally not included.
 GeoSAM2/
 ├── inference.py                       # Multi-view 3D segmentation entry point
 ├── single_view_point_prompt_infer.py  # 2D mask from interactive point prompts
-├── geosam2_render.py                  # Blender script to render multi-view data
 ├── scripts/
+│   ├── geosam2_render.py              # Blender script to render multi-view data
 │   └── run_example.sh                 # End-to-end demo on the bundled example
 ├── sam2/                              # SAM2 backbone + GeoSAM2 modifications
 │   ├── configs/geosam2.yaml           # Hydra config used at inference time
@@ -85,12 +85,12 @@ Hydra at runtime.
 
 ### 1) Multi-view rendering (run once per mesh)
 
-`geosam2_render.py` is a headless Blender script. It takes a mesh and writes 12
+`scripts/geosam2_render.py` is a headless Blender script. It takes a mesh and writes 12
 views of color, depth, and normal maps plus a `meta.json` with camera
 information.
 
 ```bash
-blender -b -P geosam2_render.py /abs/path/to/mesh.glb glb /abs/path/to/output_dir
+blender -b -P scripts/geosam2_render.py /abs/path/to/mesh.glb glb /abs/path/to/output_dir
 ```
 
 The bundled directories under `example/` were produced this way and can be used
