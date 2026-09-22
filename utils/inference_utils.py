@@ -6,9 +6,16 @@ import math
 import torch.nn.functional as F
 import trimesh
 from collections import defaultdict, Counter
+from typing import Dict, List, Tuple
 import cv2
 from sam2.utils.amg import calculate_stability_score
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+from utils.logs import get_logger
 from utils.mode_ext import mode_except_negative_one
+
+logger = get_logger("geosam2.inference_utils")
 
 
 def get_ray_directions(W, H, fx, fy, cx, cy, use_pixel_centers=True):
@@ -454,7 +461,7 @@ def find_most_frequent(tensor):
     
     return values
 
-def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, selected_frames, video_segments, mesh, sample_num_per_face, view_id, uuid, ckpt_name=None, face_label=None, prior_keys=None, export_mesh=True, export_root="outputs"):
+def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, selected_frames, video_segments, mesh, sample_num_per_face, view_id, uuid, ckpt_name=None, face_label=None, prior_keys=None, export_mesh=True, export_root="outputs", to_source_frame=None):
     """Lift 2D segmentation masks to per-face 3D labels.
 
     Args:
@@ -474,6 +481,7 @@ def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, sele
         face_label: Optional precomputed face labels for postprocess overwrite.
         prior_keys: Optional object ids with prompt-priority in aggregation.
         export_mesh: Whether to export `.glb` and `.npy` files.
+        to_source_frame: Matrix putting the export back in the input mesh's frame.
         export_root: Output root directory for mesh export.
     """
     if face_label is None:
@@ -495,11 +503,15 @@ def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, sele
         pc_label = pc_label.reshape(-1, sample_num_per_face)
         face_label = mode_except_negative_one(pc_label.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
 
+    # The one palette every stage uses (utils.split), keyed by label id: this
+    # GLB, the post-processed one, the app's own and the baked texture all
+    # paint a part the same colour.
+    from utils.split import label_palette, to_linear_u8   # split imports nothing from here
     colors = np.ones((len(mesh.vertices), 3)) * 255
-    color_map = {id: np.random.rand(3) * 255 for id in np.unique(face_label)}
-    color_map[0] = np.zeros((3)) * 255
+    color_map = {i: to_linear_u8(c).astype(np.float64)   # COLOR_0 is linear in glTF
+                 for i, c in label_palette(face_label).items()}
     for obj_id in np.unique(face_label):
-        colors[mesh.faces[face_label==obj_id].flatten()] = color_map[obj_id][None,:]
+        colors[mesh.faces[face_label==obj_id].flatten()] = color_map[int(obj_id)][None,:]
 
     mesh_ = mesh
     fill_rgb = np.full((colors.shape[0], 1), 255, dtype=np.uint8)
@@ -512,6 +524,10 @@ def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, sele
         os.makedirs(export_dir, exist_ok=True)
         glb_path = os.path.join(export_dir, f"{view_id}.glb")
         np.save(glb_path.replace(".glb",".npy"), face_label.cpu().numpy())
+        if to_source_frame is not None:
+            # Back to the input mesh's frame -- see export_labelled_mesh.
+            mesh_ = mesh_.copy()
+            mesh_.apply_transform(to_source_frame)
         mesh_.export(glb_path)
         print(f"Exported labelled mesh to {glb_path}")
     return face_label
@@ -789,3 +805,160 @@ def filter_iou(all_seg_result, video_segments, track_id):
     _ = end - start
 
     return video_segments, all_seg_result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Label export and fragment cleanup on the FINAL per-face labels.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _to_np_int(x) -> np.ndarray:
+    """Face-label tensor/array -> contiguous int64 numpy, detached from device."""
+    if hasattr(x, "cpu"):
+        x = x.cpu().numpy()
+    return np.asarray(x).astype(np.int64)
+
+
+def export_labelled_mesh(mesh_exploded, face_labels, glb_path,
+                         to_source_frame=None):
+    """Write a per-face-labelled mesh to ``glb_path`` (+ a sibling ``.npy``).
+
+    Colours come from the one palette every stage uses (utils.split), keyed by
+    label id, so this GLB, the app's own and the baked texture paint a part the
+    same. Colours the exploded ``mesh`` (unique verts per face) so labels don't
+    bleed at shared vertices.
+    """
+    from utils.split import label_palette, to_linear_u8   # split imports nothing from here
+    lab = _to_np_int(face_labels)
+    ids = np.unique(lab)
+    cmap = {i: to_linear_u8(c).astype(np.float64)   # COLOR_0 is linear in glTF
+            for i, c in label_palette(lab).items()}
+    colors = np.ones((len(mesh_exploded.vertices), 3)) * 255
+    for i in ids:
+        colors[mesh_exploded.faces[lab == i].flatten()] = cmap[int(i)][None, :]
+    m = mesh_exploded.copy()
+    if to_source_frame is not None:
+        # Back to the input mesh's own frame. The pipeline works on a mesh
+        # prepare_mesh_and_point_cloud rotated Z-up -> Y-up, translated and
+        # scaled to match the cameras; exporting that as-is hands the caller a
+        # result that does not sit on its own input (bbox Y and Z swapped).
+        m.apply_transform(to_source_frame)
+    colors = np.hstack((colors, np.full((colors.shape[0], 1), 255, dtype=np.uint8)))
+    m.visual.vertex_colors = np.uint8(colors)
+    os.makedirs(os.path.dirname(glb_path) or ".", exist_ok=True)
+    np.save(glb_path.replace(".glb", ".npy"), lab)
+    m.export(glb_path)
+    print(f"Exported labelled mesh to {glb_path}")
+
+
+# Fragment cleanup thresholds, measured on furniture assets in the PixMesh
+# splitter this is ported from. Relative to the largest component OF THE SAME
+# LABEL: a part is small next to the object all the time; what makes it speckle
+# is being small next to the rest of its own label (mesh-relative collapsed 12
+# parts into 3 on sample_05).
+FRAG_MAX_REL = 0.02      # below: speckle, may move
+HOST_MIN_REL = 0.20      # above: a host that can receive it; between: grey zone
+CONTACT_MAX_FRAC = 0.03  # fragment-to-host reach, fraction of the bbox diagonal
+VOTE_K = 9
+
+
+def _contact_reach(mesh_vanilla) -> float:
+    bounds = np.asarray(mesh_vanilla.bounds, dtype=np.float64)
+    return CONTACT_MAX_FRAC * (float(np.linalg.norm(bounds[1] - bounds[0])) or 1.0)
+
+
+def _proximity_components(mesh_vanilla, labels: np.ndarray) -> np.ndarray:
+    """Connected components of same-label faces, neighbours by 3D proximity.
+
+    Edge adjacency is useless on a generated mesh: TRELLIS output is triangle
+    soup (~2400 topological components on one object), so a part that is
+    visibly one piece fragments into hundreds of edge-connected components and
+    every size threshold below then fires on real geometry. Two faces of one
+    label are neighbours when one is among the other's nearest same-label faces
+    within the contact reach -- a scale-derived radius, as upstream welds. A
+    data-derived one (3x the median gap) isolated every large triangle on a
+    mesh whose density varies 160x (sample_04: 1952 components for 9 labels).
+    """
+    centroids = np.asarray(mesh_vanilla.triangles_center, dtype=np.float64)
+    reach = _contact_reach(mesh_vanilla)
+    rows, cols = [], []
+    for value in np.unique(labels):
+        faces = np.nonzero(labels == value)[0]
+        k = min(VOTE_K + 1, len(faces))
+        if k < 2:
+            continue
+        dist, idx = cKDTree(centroids[faces]).query(centroids[faces], k=k, workers=-1)
+        ok = dist[:, 1:] <= reach
+        rows.append(np.repeat(faces, k - 1)[ok.ravel()])
+        cols.append(faces[idx[:, 1:]][ok])
+    n = len(centroids)
+    if not rows:
+        return np.arange(n)
+    r, c = np.concatenate(rows), np.concatenate(cols)
+    graph = coo_matrix((np.ones(len(r)), (r, c)), shape=(n, n))
+    return connected_components(graph, directed=False)[1]
+
+
+def clean_label_fragments(face_labels, mesh_vanilla) -> torch.Tensor:
+    """Reassign per-label speckle fragments to the label they actually touch.
+
+    Smoothing moves boundaries; it does not remove a patch of the seat's label
+    stranded in the middle of a leg, because locally that patch is consistent.
+    This does, and only for the unambiguous tail: a component under
+    ``FRAG_MAX_REL`` of its own label's largest component may move onto a host
+    over ``HOST_MIN_REL``. The grey zone between never moves on size alone --
+    except an orphan touching no surface of its own label while sitting on
+    another's, which is mislabelled whatever its size.
+
+    Holes are never filled (a hole is the interface with a neighbouring part)
+    and nothing is ever deleted: a fragment with no host within reach keeps its
+    label. One pass only, as upstream: a second pass re-judges components the
+    first chose to keep, in a host landscape its own moves degraded (measured
+    10.3% of a drawer repainted).
+    """
+    lab = _to_np_int(face_labels).copy()
+    centroids = np.asarray(mesh_vanilla.triangles_center, dtype=np.float64)
+    area = np.asarray(mesh_vanilla.area_faces, dtype=np.float64)
+    reach = _contact_reach(mesh_vanilla)
+
+    comp = _proximity_components(mesh_vanilla, lab)
+    comp_area = np.bincount(comp, weights=area)
+    comp_label = np.zeros(len(comp_area), dtype=np.int64)
+    comp_label[comp] = lab
+    largest = np.zeros(int(comp_label.max()) + 1, dtype=np.float64)
+    np.maximum.at(largest, comp_label, comp_area)
+    rel = comp_area / np.maximum(largest[comp_label], 1e-12)
+
+    is_host = (rel >= HOST_MIN_REL)[comp]
+    if not is_host.any():
+        return torch.from_numpy(lab)
+    tree = cKDTree(centroids[is_host])
+    host_label = lab[is_host]
+    k = min(VOTE_K, int(is_host.sum()))
+
+    moved = 0
+    for cid in np.nonzero(rel < HOST_MIN_REL)[0]:
+        faces = np.nonzero(comp == cid)[0]
+        dist, idx = tree.query(centroids[faces], k=k, workers=-1)
+        near = np.atleast_2d(dist) <= reach
+        if not near.any():
+            continue                                # out of reach: keep, never delete
+        # Only neighbours within reach vote (upstream lets all k vote once the
+        # nearest is in reach) -- a far neighbour says nothing about contact.
+        votes = host_label[np.atleast_2d(idx)[near]]
+        if rel[cid] >= FRAG_MAX_REL:
+            # Grey zone: size cannot make the call, contact does. Attached to
+            # its own label -> keep; otherwise only other labels may claim it.
+            own = np.nonzero(is_host & (lab == comp_label[cid]))[0]
+            if len(own) and cKDTree(centroids[own]).query(
+                    centroids[faces], workers=-1)[0].min() <= reach:
+                continue
+            votes = votes[votes != comp_label[cid]]
+            if not len(votes):
+                continue
+        dest = int(np.bincount(votes).argmax())
+        if dest != comp_label[cid]:
+            lab[faces] = dest
+            moved += len(faces)
+    logger.info("[fragments] %d faces relabelled", moved)
+    return torch.from_numpy(lab)

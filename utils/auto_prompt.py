@@ -13,7 +13,7 @@ trustworthy -- its boundaries -- stop mattering. It is also the format the
 reference pipeline uses, which is the one validated end to end.
 
 Deterministic and VLM-free: everything here runs on an image. The stage that
-*generates* that image lives in :mod:`utils.mask_agent`.
+*generates* that image lives in :mod:`utils.guidance`.
 """
 
 from __future__ import annotations
@@ -62,6 +62,32 @@ def interior_point(mask: np.ndarray) -> Tuple[int, int]:
     return int(x), int(y)
 
 
+def interior_points(mask: np.ndarray, count: int) -> List[Tuple[int, int]]:
+    """``count`` landmarks spread inside ``mask``, the first being its deepest point.
+
+    One click per part lets SAM2's image predictor decide the extent on its
+    own, and on a flat door panel it takes the whole front. Several clicks
+    spread across the region pin it down. Farthest-point over the interior
+    (pixels at least a third as deep as the deepest), so the landmarks cover
+    the region instead of clustering at its centre.
+    """
+    distance = ndimage.distance_transform_edt(mask)
+    ys, xs = np.nonzero(distance >= max(1.0, distance.max() / 3.0))
+    if len(xs) == 0:
+        return [interior_point(mask)]
+    cand = np.stack([xs, ys], axis=1).astype(np.float64)
+    first = int(np.argmax(distance[ys, xs]))
+    chosen = [first]
+    d_min = np.linalg.norm(cand - cand[first], axis=1)
+    while len(chosen) < min(count, len(cand)):
+        nxt = int(np.argmax(d_min))
+        if d_min[nxt] <= 0:
+            break
+        chosen.append(nxt)
+        d_min = np.minimum(d_min, np.linalg.norm(cand - cand[nxt], axis=1))
+    return [(int(cand[i, 0]), int(cand[i, 1])) for i in chosen]
+
+
 def segment_colors(
     rgb: np.ndarray, background: Optional[Sequence[int]] = None
 ) -> List[Tuple[Tuple[int, int, int], np.ndarray]]:
@@ -95,6 +121,8 @@ def prompts_from_color_map(
     view_idx: int = 0,
     background: Optional[Sequence[int]] = None,
     negatives: bool = False,
+    obj_ids: Optional[Dict[Tuple[int, int, int], int]] = None,
+    points_per_part: int = 1,
 ) -> List[Dict]:
     """Point prompts seeding ``view_idx``, one object per colour.
 
@@ -103,6 +131,14 @@ def prompts_from_color_map(
     excludes. Coordinates are pixels of the view they were read from -- the
     caller must pass the view the map was rendered on, or the clicks land on
     another part of the object.
+
+    ``obj_ids`` maps colour -> object id. Required for multi-view seeding: the
+    per-view fallback (area order) numbers each view independently, so the same
+    part would get different ids on different views and SAM2 would treat them as
+    different objects. Colours not in the mapping are skipped.
+
+    ``points_per_part`` spreads that many landmarks over each region instead
+    of one (see :func:`interior_points`); the first is always the deepest point.
 
     ``negatives`` adds one exclusion click per part, at its nearest neighbour's
     anchor, to push a mask off the part it is most likely to bleed into.
@@ -123,17 +159,22 @@ def prompts_from_color_map(
     anchors: List[Tuple[int, Tuple[int, int]]] = []
     prompts: List[Dict] = []
 
-    for index, (_, mask) in enumerate(segments):
-        obj_id = index + 1
+    for index, (color, mask) in enumerate(segments):
+        if obj_ids is not None:
+            if color not in obj_ids:
+                continue
+            obj_id = obj_ids[color]
+        else:
+            obj_id = index + 1
         labelled, count = ndimage.label(mask)
         for component in range(1, count + 1):
             blob = labelled == component
             if int(blob.sum()) < MIN_COMPONENT_PX:
                 continue
-            x, y = interior_point(blob)
-            prompts.append({"frame_idx": view_idx, "obj_id": obj_id,
-                            "point": [float(x), float(y)], "label": 1})
-            anchors.append((obj_id, (x, y)))
+            for x, y in interior_points(blob, points_per_part):
+                prompts.append({"frame_idx": view_idx, "obj_id": obj_id,
+                                "point": [float(x), float(y)], "label": 1})
+            anchors.append((obj_id, interior_point(blob)))
 
     if negatives:
         for obj_id, (x, y) in anchors:

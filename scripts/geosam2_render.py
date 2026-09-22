@@ -792,9 +792,9 @@ if __name__ == "__main__":
     # arguments start at sys.argv[4] (script path is at sys.argv[3]).
     if len(sys.argv) < 7:
         print(
-            "Usage: blender -b -P geosam2_render.py "
+            "Usage: blender -b -P scripts/geosam2_render.py "
             "<mesh_path> <mesh_type> <output_dir>\n"
-            "Example: blender -b -P geosam2_render.py /abs/path/to/mesh.glb glb ./example/out"
+            "Example: blender -b -P scripts/geosam2_render.py /abs/path/to/mesh.glb glb ./example/out"
         )
         sys.exit(1)
     mesh_path = sys.argv[4]

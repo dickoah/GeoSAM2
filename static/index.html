@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>GeoSAM2 — Step by step</title>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<style>
+:root{--bg:#fafaf9;--surface:#fff;--s2:#f5f5f4;--s3:#e7e5e4;--border:#e7e5e4;--border2:#d6d3d1;
+--ink:#292524;--ink2:#57534e;--ink3:#78716c;--ink4:#a8a29e;--accent:#44403c;
+--green:#16a34a;--yellow:#ca8a04;--red:#dc2626;--r:12px;
+--sans:'Inter',system-ui,-apple-system,Arial,sans-serif;--mono:'JetBrains Mono','Fira Code',monospace;}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--bg);color:var(--ink)}
+#app{display:flex;height:100vh;overflow:hidden}
+#left{width:440px;flex-shrink:0;display:flex;flex-direction:column;background:var(--surface);
+border-right:1px solid var(--border2);overflow-y:auto}
+#right{flex:1;position:relative;background:var(--s2);display:flex;flex-direction:column}
+header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:10px}
+header h1{font-size:15px;font-weight:600;letter-spacing:-.01em}
+header span{font-size:12px;color:var(--ink3)}
+.step{border-bottom:1px solid var(--border);padding:14px 18px}
+.step-head{display:flex;align-items:center;gap:9px;margin-bottom:10px}
+.num{width:21px;height:21px;border-radius:50%;background:var(--s3);color:var(--ink2);
+font-size:11px;font-weight:600;display:grid;place-items:center;flex-shrink:0}
+.step.done .num{background:var(--green);color:#fff}
+.step.run .num{background:var(--yellow);color:#fff}
+.step.err .num{background:var(--red);color:#fff}
+.step h2{font-size:13px;font-weight:600;flex:1}
+.step .t{font-size:11px;color:var(--ink4);font-family:var(--mono)}
+.row{display:flex;align-items:center;gap:8px;margin:7px 0;font-size:12px;color:var(--ink2)}
+.row label{flex:1}
+select,input[type=number],input[type=text]{font:inherit;font-size:12px;padding:5px 7px;
+border:1px solid var(--border2);border-radius:7px;background:var(--surface);color:var(--ink)}
+select{flex:1.4}input[type=number]{width:74px;text-align:right}
+button{font:inherit;font-size:12px;font-weight:550;padding:7px 13px;border:none;border-radius:8px;
+background:var(--accent);color:#fff;cursor:pointer;transition:opacity .15s}
+button:hover:not(:disabled){opacity:.85}
+button:disabled{background:var(--s3);color:var(--ink4);cursor:not-allowed}
+button.ghost{background:var(--s2);color:var(--ink2);border:1px solid var(--border2)}
+.out{margin-top:9px;font-size:11px;color:var(--ink3);font-family:var(--mono);
+word-break:break-all;line-height:1.5}
+.out.error{color:var(--red)}
+.thumbs{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
+.thumbs img{width:60px;height:60px;object-fit:cover;border-radius:6px;border:1px solid var(--border2);
+background:#000;cursor:pointer}
+.thumbs img.sel{outline:2px solid var(--green);outline-offset:1px}
+.pair{display:flex;gap:7px;margin-top:9px}
+.pair figure{flex:1}
+.pair img{width:100%;border-radius:8px;border:1px solid var(--border2);background:#000;display:block}
+.pair figcaption{font-size:10px;color:var(--ink4);margin-top:3px;text-align:center}
+.parts{margin-top:9px;display:flex;flex-direction:column;gap:3px;max-height:230px;overflow-y:auto}
+.part{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--ink2)}
+.sw{width:11px;height:11px;border-radius:3px;flex-shrink:0;border:1px solid rgba(0,0,0,.14)}
+.part .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.part .px{font-family:var(--mono);font-size:10px;color:var(--ink4)}
+.part.zero .n{color:var(--red)}
+#viewer{flex:1;position:relative}
+#viewer canvas{display:block;width:100%;height:100%}
+#vinfo{position:absolute;top:12px;left:14px;font-size:11px;font-family:var(--mono);
+color:var(--ink3);background:rgba(255,255,255,.88);padding:5px 9px;border-radius:7px}
+#log{height:190px;border-top:1px solid var(--border2);background:#1c1917;color:#d6d3d1;
+font-family:var(--mono);font-size:10.5px;line-height:1.55;padding:9px 13px;overflow-y:auto;white-space:pre-wrap}
+.hint{font-size:11px;color:var(--ink4);margin-top:7px;line-height:1.5}
+.dropzone{position:relative;display:flex;align-items:center;justify-content:center;gap:8px;
+min-height:54px;padding:10px;border:1px dashed var(--border2);border-radius:8px;background:var(--s2);
+color:var(--ink3);font-size:11px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s}
+.dropzone:hover,.dropzone.over{border-color:var(--green);background:#f0fdf4;color:var(--ink2)}
+.dropzone input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+.param-hint{font-size:10px;color:var(--ink4);line-height:1.4;margin:-3px 0 7px}
+/* Dropping onto a 54px strip in the sidebar is a game of darts; the whole
+   window is the target instead, and this only shows while a file is over it. */
+#drop-overlay{position:fixed;inset:0;z-index:99;display:none;place-items:center;
+background:rgba(240,253,244,.92);border:3px dashed var(--green);
+font-size:17px;font-weight:600;color:var(--ink2)}
+#drop-overlay.on{display:grid}
+</style>
+</head>
+<body>
+<div id="drop-overlay">Drop the mesh anywhere (.glb, .gltf, .obj, .ply, .stl)</div>
+<div id="app">
+  <div id="left">
+    <header><h1>GeoSAM2</h1><span>step by step</span></header>
+
+    <div class="step" id="s0">
+      <div class="step-head"><span class="num">0</span><h2>Input mesh</h2></div>
+      <div class="row"><label>Bundled sample</label><select id="sample"></select></div>
+      <label class="dropzone" id="dropzone">
+        <span>Drop a mesh anywhere on this page, or click to choose (.glb, .gltf, .obj, .ply, .stl)</span>
+        <input type="file" id="file" accept=".glb,.gltf,.obj,.ply,.stl"/>
+      </label>
+      <div class="out" id="o0">no mesh selected</div>
+    </div>
+
+    <div class="step" id="s1">
+      <div class="step-head"><span class="num">1</span><h2>Render 12 views</h2><span class="t" id="t1"></span></div>
+      <button id="b1">Render</button>
+      <div class="hint">Skipped automatically when a bundled sample is chosen — those ship pre-rendered.</div>
+      <div class="out" id="o1"></div>
+      <div class="thumbs" id="th1"></div>
+    </div>
+
+    <div class="step" id="s2">
+      <div class="step-head"><span class="num">2</span><h2>Pick the seed view</h2><span class="t" id="t2"></span></div>
+      <button id="b2" disabled>Ask the VLM</button>
+      <button class="ghost" id="b2m" disabled>Choose manually</button>
+      <div class="hint">A part the seed view hides gets no prompt and is lost on the mesh.</div>
+      <div class="out" id="o2"></div>
+    </div>
+
+    <div class="step" id="s3">
+      <div class="step-head"><span class="num">3</span><h2>Guidance map + points</h2><span class="t" id="t3"></span></div>
+      <div class="row"><label>Describe from</label>
+        <select id="gmode">
+          <option value="single" selected>single — the seed view</option>
+          <option value="grid">grid — front/back/left/right, painter told what the seed view hides</option>
+        </select></div>
+      <div class="row"><label>Analyze model</label>
+        <select id="amodel">
+          <option value="gemini-3.1-pro-preview" selected>gemini-3.1-pro</option>
+          <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+          <option value="gemini-3.7-flash">gemini-3.7-flash — faster</option>
+          <option value="gemini-3-flash-preview">gemini-3-flash</option>
+          <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+          <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+          <option value="anthropic:claude-sonnet-4-6">claude-sonnet-4-6</option>
+          <option value="anthropic:claude-opus-4-6">claude-opus-4-6</option>
+          <option value="openai:gpt-5-mini">gpt-5-mini</option>
+        </select></div>
+      <div class="row"><label>Generate model</label>
+        <select id="pmodel">
+          <option value="gemini-3.1-flash-image" selected>gemini-3.1-flash-image</option>
+          <option value="gemini-3-pro-image">gemini-3-pro-image</option>
+          <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
+        </select></div>
+      <div class="row"><label>Resolution (px)</label>
+        <select id="gres">
+          <option value="512">512</option>
+          <option value="1024" selected>1024 — the views' own size</option>
+        </select></div>
+      <button id="b3" disabled>Describe &amp; paint</button>
+      <div class="hint">SegviGen's guidance, unchanged: describe the assembly tree, assign one colour
+      per part, paint the seed view. Then one interior point per part — the format GeoSAM2 seeds from.</div>
+      <div class="out" id="o3"></div>
+      <div class="pair" id="p3"></div>
+      <div class="parts" id="pl3"></div>
+    </div>
+
+    <div class="step" id="s4">
+      <div class="step-head"><span class="num">4</span><h2>GeoSAM2</h2><span class="t" id="t4"></span></div>
+      <div class="row"><label>Seed from</label>
+        <select id="seedmode" title="How the painted map reaches GeoSAM2. Points: interior clicks, SAM2 re-derives the 2D mask (the paper's protocol). Painted map: the map itself is the seed mask, pixel-exact.">
+          <option value="map" selected>painted map, pixel-exact (default)</option>
+          <option value="points">points, 1 per part (paper)</option>
+          <option value="points4">points, 4 landmarks per part</option>
+        </select></div>
+      <button id="b4" disabled>Segment</button>
+      <div class="hint">GeoSAM2 as the paper runs it: propagate the seed across the 12 views,
+      lift onto the faces, run its own post-process. Nothing of ours yet.</div>
+      <div class="out" id="o4"></div>
+      <div class="parts" id="pl4"></div>
+    </div>
+
+    <div class="step" id="s5">
+      <div class="step-head"><span class="num">5</span><h2>Bake to texture</h2><span class="t" id="t5"></span></div>
+      <div class="row"><label>Input</label><select id="in5"></select></div>
+      <div class="row"><label title="Resolution of the flat-colour atlas the labels are painted into">Texture size</label>
+        <select id="texsize">
+          <option value="1024">1024</option>
+          <option value="2048" selected>2048</option>
+          <option value="4096">4096 — thin parts</option>
+        </select></div>
+      <button id="b5" disabled>Bake</button>
+      <div class="hint">The split reads a textured mesh, not a label list: each triangle is
+      painted its label's colour in the UV atlas. Any label file can go in — GeoSAM2's raw lift,
+      its post-process, or its post-process — so GeoSAM2's own post-process can be weighed.</div>
+      <div class="out" id="o5"></div>
+    </div>
+
+    <div class="step" id="s6">
+      <div class="step-head"><span class="num">6</span><h2>Split</h2><span class="t" id="t6"></span></div>
+      <div class="row"><label>Input</label><select id="in6"></select></div>
+      <div class="row" id="pbar"><label>Preset</label></div>
+      <div class="row"><label title="Blur radius in atlas pixels before detecting boundaries">Smooth (px sigma)</label><input type="number" id="p-smooth" value="1.5" min="0" max="5" step="0.25"/></div>
+      <div class="row"><label title="RGB quantisation step: larger values merge nearby texture colours">Color quant step</label><input type="number" id="p-color_quant_step" value="16" min="1" max="64"/></div>
+      <div class="row"><label title="Minimum fraction of UV-owned texels needed to keep a colour as a part">Palette min frac</label><input type="number" id="p-palette_min_frac" value="0.0005" min="0" max="1" step="0.0001"/></div>
+      <div class="row"><label title="Maximum number of candidate colours in the palette">Palette max colors</label><input type="number" id="p-palette_max_colors" value="256" min="1"/></div>
+      <div class="row"><label title="RGB distance below which two palette colours are merged">Palette merge dist</label><input type="number" id="p-palette_merge_dist" value="32" min="0"/></div>
+      <div class="row"><label title="Remove parts smaller than this many faces after palette labelling">Min faces / part</label><input type="number" id="p-min_faces_per_part" value="1" min="0"/></div>
+      <div class="row"><label title="Force each authored UV chart to remain a separate part">One UV island = one part</label><input type="checkbox" id="p-island_majority"/></div>
+      <div class="row"><label title="Reassign tiny disconnected pieces after the SDF cut">Cleanup fragments (post-cut)</label><input type="checkbox" id="p-cleanup_fragments"/></div>
+      <div class="row"><label>Output mode</label>
+        <select id="p-output_mode">
+          <option value="vertex_colors" selected>vertex_colors — flat colour per part</option>
+          <option value="clean_texture">clean_texture — flat texture from labels</option>
+          <option value="texture">texture — the baked label atlas</option>
+        </select></div>
+      <button id="b6" disabled>Split</button>
+      <div class="hint">Palette on the covered texels, smoothing, graph-cut +
+      re-placement on real creases, distance-field cut in the atlas. The only stage that creates
+      new vertices.</div>
+      <div class="out" id="o6"></div>
+      <div class="row" style="margin-top:9px"><label>Compare</label><select id="which"></select></div>
+    </div>
+
+  </div>
+
+  <div id="right">
+    <div id="viewer"><div id="vinfo">no result yet</div></div>
+    <div id="log">ready.</div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+const $ = id => document.getElementById(id);
+// Exposed as window.S: with each stage runnable on its own, resuming a run
+// half-way means setting the paths a skipped stage would have written.
+const S = {mesh:null, dataRoot:null, seedView:null, points:null};
+window.S = S;
+
+function log(msg){const l=$('log');l.textContent+='\n'+msg;l.scrollTop=l.scrollHeight;}
+function mark(step,state){const e=$(step);e.classList.remove('done','run','err');if(state)e.classList.add(state);}
+
+async function post(url,body){
+  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify(body)});
+  if(!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  return (await r.json()).job_id;
+}
+
+async function poll(jobId,stepEl,timeEl){
+  const t0=Date.now();
+  const tick=setInterval(()=>{if(timeEl)$(timeEl).textContent=((Date.now()-t0)/1000).toFixed(0)+'s';},500);
+  try{
+    for(;;){
+      await new Promise(r=>setTimeout(r,1000));
+      const j = await (await fetch('/api/jobs/'+jobId)).json();
+      if(j.status==='done'){mark(stepEl,'done');return j.result;}
+      if(j.status==='error'){mark(stepEl,'err');throw new Error(j.error);}
+    }
+  } finally { clearInterval(tick); }
+}
+
+async function step(stepEl,timeEl,outEl,url,body,render){
+  mark(stepEl,'run'); $(outEl).classList.remove('error'); $(outEl).textContent='running…';
+  log('▶ '+url);
+  try{
+    const res = await poll(await post(url,body),stepEl,timeEl);
+    render(res); log('✔ '+url);
+    return res;
+  }catch(e){
+    $(outEl).classList.add('error'); $(outEl).textContent=e.message;
+    log('✘ '+url+' — '+e.message); throw e;
+  }
+}
+
+// ── three.js viewer ──────────────────────────────────────────────────────
+const wrap=$('viewer');
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(devicePixelRatio);
+wrap.appendChild(renderer.domElement);
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0xf5f5f4);
+const cam=new THREE.PerspectiveCamera(45,1,.01,100); cam.position.set(1.6,1.2,1.6);
+const ctl=new OrbitControls(cam,renderer.domElement); ctl.enableDamping=true;
+scene.add(new THREE.HemisphereLight(0xffffff,0x9a9a9a,2.4));
+const dir=new THREE.DirectionalLight(0xffffff,2.0); dir.position.set(3,5,2); scene.add(dir);
+const fill=new THREE.DirectionalLight(0xffffff,0.8); fill.position.set(-3,2,-2); scene.add(fill);
+const grid=new THREE.GridHelper(4,16,0xd6d3d1,0xe7e5e4); scene.add(grid);
+let current=null;
+function resize(){const w=wrap.clientWidth||1,h=wrap.clientHeight||1;
+  // updateStyle left ON: without it the canvas keeps its default 300x150 CSS
+  // box and the viewer looks empty however big the panel is.
+  renderer.setSize(w,h);cam.aspect=w/h;cam.updateProjectionMatrix();}
+new ResizeObserver(resize).observe(wrap); resize();
+(function loop(){requestAnimationFrame(loop);ctl.update();renderer.render(scene,cam);})();
+
+// The model is never moved, rotated or rescaled: the segmented result has the
+// input's own transform, and normalising it here would hide any drift. The
+// CAMERA is framed instead, once per object -- and kept across a reload of the
+// same object, so switching face-level <-> re-cut does not jump the view.
+let framedFor=null;
+function show(path,info,keepView){
+  new GLTFLoader().load('/api/files?path='+encodeURIComponent(path),g=>{
+    if(current) scene.remove(current);
+    // trimesh exports vertex colours under a PBR material with metallicFactor
+    // 1: without an environment map that renders near-black. The colours ARE
+    // the label -- show them flat. vertexColors has to be switched on
+    // explicitly, or a COLOR_0 attribute is ignored and every part renders
+    // white; the split's "vertex_colors" mode instead carries its colour in
+    // baseColorFactor, which three.js already reads into material.color.
+    g.scene.traverse(o=>{ if(o.isMesh&&o.material){
+      o.material.metalness=0; o.material.roughness=1;
+      if(o.geometry?.attributes?.color) o.material.vertexColors=true;
+      o.material.needsUpdate=true; } });
+    scene.add(g.scene); current=g.scene; $('vinfo').textContent=info;
+    const box=new THREE.Box3().setFromObject(g.scene);
+    const c=box.getCenter(new THREE.Vector3());
+    const size=box.getSize(new THREE.Vector3()).length()||1;
+    grid.position.set(c.x,box.min.y,c.z);
+    grid.scale.setScalar(Math.max(size/3,.01));
+    if(keepView&&framedFor===path) return;
+    framedFor=path;
+    ctl.target.copy(c);
+    cam.near=size/500; cam.far=size*50; cam.updateProjectionMatrix();
+    cam.position.copy(c).add(new THREE.Vector3(.85,.6,.85).multiplyScalar(size));
+    ctl.update();
+  },undefined,e=>log('viewer: '+e.message));
+}
+window.showGlb = show;   // so a result can be re-loaded from the console
+
+// ── Step 0: input ────────────────────────────────────────────────────────
+// The whole window is the drop target: aiming at a 54px strip in the sidebar
+// is a game of darts. dragenter/dragleave fire once per element crossed, so a
+// depth counter is what tells a real exit from moving over a child.
+//
+// Installed HERE, above the first top-level await: nothing further in a module
+// runs until that await settles, and a file dropped during the initial load
+// would be opened by the browser instead of uploaded.
+function installDropTarget(){
+  const overlay=$('drop-overlay');
+  const MESH_EXT=/\.(glb|gltf|obj|ply|stl)$/i;
+  const hasFile=e=>[...(e.dataTransfer?.types||[])].includes('Files');
+  let depth=0;
+  const hide=()=>{ depth=0; overlay.classList.remove('on'); };
+  addEventListener('dragenter',e=>{
+    if(!hasFile(e)) return;
+    e.preventDefault(); if(++depth===1) overlay.classList.add('on');
+  });
+  addEventListener('dragover',e=>{ if(hasFile(e)) e.preventDefault(); });
+  addEventListener('dragleave',e=>{ if(hasFile(e) && --depth<=0) hide(); });
+  addEventListener('drop',async e=>{
+    if(!hasFile(e)) return;
+    e.preventDefault(); hide();
+    const f=e.dataTransfer.files[0]; if(!f) return;
+    if(!MESH_EXT.test(f.name)){
+      $('o0').textContent='not a mesh: '+f.name; $('o0').classList.add('error'); return;
+    }
+    try { await uploadMesh(f); }
+    catch(err){ $('o0').textContent=err.message; $('o0').classList.add('error'); }
+  });
+}
+installDropTarget();
+
+const samples = (await (await fetch('/api/samples')).json()).samples;
+const sel=$('sample'); sel.innerHTML='<option value="">— upload instead —</option>';
+samples.forEach(s=>{const o=document.createElement('option');o.value=s.path;o.textContent=s.name;sel.append(o);});
+
+function useViews(root,msg){
+  S.dataRoot=root; $('o1').textContent=msg;
+  mark('s1','done'); $('b2').disabled=false; $('b2m').disabled=false;
+  const th=$('th1'); th.innerHTML='';
+  for(let v=0;v<12;v++){
+    const img=document.createElement('img'); img.dataset.view=v;
+    img.src='/api/files?path='+encodeURIComponent(root+'/color_'+String(v).padStart(4,'0')+'.webp');
+    img.title='view '+v;
+    img.onclick=()=>setSeed(v,'chosen manually');
+    th.append(img);
+  }
+  show(root+'/mesh.glb','input mesh');
+}
+
+sel.onchange=()=>{
+  if(!sel.value){$('o0').textContent='no mesh selected';return;}
+  S.mesh=sel.value+'/mesh.glb'; $('o0').textContent=sel.value;
+  resetStages(); $('b1').disabled=true;
+  useViews(sel.value,'pre-rendered sample — step 1 skipped');
+  log('sample: '+sel.value);
+};
+
+async function uploadMesh(f){
+  const fd=new FormData(); fd.append('file',f);
+  const response=await fetch('/api/upload',{method:'POST',body:fd});
+  if(!response.ok) throw new Error((await response.json()).detail || response.statusText);
+  const r=await response.json();
+  S.mesh=r.path; S.dataRoot=null; $('sample').value='';
+  $('o0').classList.remove('error'); $('o0').textContent=f.name+' → '+r.path; $('b1').disabled=false;
+  resetStages();
+  log('uploaded: '+f.name);
+}
+// A new mesh invalidates every result: the registry, the selectors, the gates.
+function resetStages(){
+  for(const b of ['b2','b3','b4','b5','b6']) $(b).disabled=true;
+  for(const s of ['s1','s2','s3','s4','s5','s6']) mark(s,null);
+  S.results=[]; for(const w of ['in5','in6','which']) $(w).innerHTML='';
+}
+
+$('file').onchange=async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  try { await uploadMesh(f); } catch(err) { $('o0').textContent=err.message; $('o0').classList.add('error'); }
+};
+
+// ── Step 1: render ───────────────────────────────────────────────────────
+$('b1').onclick=()=>step('s1','t1','o1','/api/jobs/render',{mesh_path:S.mesh},
+  r=>useViews(r.data_root,r.data_root));
+
+// ── Step 2: seed view ────────────────────────────────────────────────────
+function setSeed(v,why){
+  S.seedView=v; mark('s2','done'); $('b3').disabled=false;
+  $('o2').textContent='view '+v+' — '+why;
+  [...$('th1').children].forEach(i=>i.classList.toggle('sel',+i.dataset.view===v));
+  log('seed view = '+v+' ('+why+')');
+}
+$('b2').onclick=()=>step('s2','t2','o2','/api/jobs/pickview',{data_root:S.dataRoot},
+  r=>setSeed(r.seed_view,'VLM pick, '+r.label));
+$('b2m').onclick=()=>{$('o2').textContent='click a thumbnail above to choose the seed view';};
+
+// ── Step 3: guidance ─────────────────────────────────────────────────────
+$('b3').onclick=()=>step('s3','t3','o3','/api/jobs/guidance',
+  {data_root:S.dataRoot,seed_view:S.seedView,mode:$('gmode').value,
+   describe_model:$('amodel').value,paint_model:$('pmodel').value,
+   resolution:+$('gres').value},r=>{
+    S.points=r.points_path; S.dataRoot=r.data_root;   // a sample is copied, not edited
+    $('o3').textContent=r.scene+' — '+r.painted+'/'+r.parts.length+' parts painted, '+r.n_points+' points';
+    $('p3').innerHTML=
+      '<figure><img src="/api/files?path='+encodeURIComponent(r.source_path)+'"><figcaption>view '+r.seed_view+'</figcaption></figure>'+
+      '<figure><img src="/api/files?path='+encodeURIComponent(r.map_path)+'"><figcaption>part map</figcaption></figure>';
+    $('pl3').innerHTML=r.parts.map(p=>
+      '<div class="part'+(p.pixels?'':' zero')+'"><span class="sw" style="background:'+p.hex+'"></span>'+
+      '<span class="n">'+p.name+'</span><span class="px">'+p.pixels+'px</span></div>').join('');
+    $('b4').disabled=false;
+  });
+
+// ── Step 4: GeoSAM2 ──────────────────────────────────────────────────────
+function listParts(el,parts){
+  $(el).innerHTML=parts.map(p=>'<div class="part"><span class="sw" style="background:'+
+    p.color+'"></span><span class="n">'+p.name+'</span><span class="px">'+p.faces+'</span></div>').join('');
+}
+$('b4').onclick=()=>step('s4','t4','o4','/api/jobs/segment',
+  {data_root:S.dataRoot,points_path:S.points,seed_view:S.seedView,
+   seed_mode:$('seedmode').value==='map'?'map':'points',
+   points_per_part:$('seedmode').value==='points4'?4:1},r=>{
+    S.seedView=r.seed_view;
+    $('o4').textContent=r.n_parts+' parts, '+r.unlabeled_faces+' unassigned faces';
+    listParts('pl4',r.parts);
+    const seed=$('seedmode').value;
+    if(r.raw_labels_path) register('labels','4 raw lift ('+seed+')',
+      {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.raw_labels_path},r.raw_glb);
+    register('labels','4 post-processed ('+seed+')',
+      {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
+  });
+
+// ── Steps 5-6: each runnable on ANY earlier result ───────────────────────
+// Every result is registered with its kind, so a stage's Input selector
+// lists everything of the kind it consumes -- not just the stage before. That
+// is how a method's weight is measured: bake GeoSAM2's raw lift or its
+// post-process, split the same bake with two presets, and compare in the viewer.
+//   labels : a per-face label file (what 5 bakes)  -> in5
+//   baked  : a textured mesh (what 6 splits)       -> in6
+// Each entry has a short id; a result's tag names its input by id, so the
+// lineage of what is on screen reads off the Compare list.
+S.results=[];
+function register(kind,label,data,glb){
+  const id='#'+(S.results.length+1);
+  S.results.push({id,kind,label:id+' '+label,data,glb});
+  for(const [k,sel] of [['labels','in5'],['baked','in6']]){
+    const w=$(sel), items=S.results.filter(r=>r.kind===k);
+    w.innerHTML=items.map(r=>'<option value="'+r.id+'">'+r.label+'</option>').join('');
+    if(items.length){ w.value=items[items.length-1].id; $('b'+sel.slice(2)).disabled=false; }
+  }
+  if(glb){
+    const w=$('which');
+    w.innerHTML=S.results.filter(r=>r.glb).map(r=>'<option value="'+r.glb+'">'+r.label+'</option>').join('');
+    w.value=glb; show(glb,id+' '+label);
+  }
+  return id;
+}
+const picked=sel=>S.results.find(r=>r.id===$(sel).value);
+$('which').onchange=e=>show(e.target.value,e.target.selectedOptions[0].textContent,true);
+window.registerResult=register;   // so an on-disk result can be added from the console
+
+// 5 ── any label file onto the UVs
+$('b5').onclick=()=>{ const inp=picked('in5'); return step('s5','t5','o5','/api/jobs/bake',
+  {...inp.data, texture_size:+$('texsize').value},r=>{
+    $('o5').textContent=r.n_labels+' labels painted into a '+r.texture_size+'² atlas';
+    register('baked','5 '+r.texture_size+' ← '+inp.id,
+      {work_dir:inp.data.work_dir,baked_glb:r.baked_glb},r.baked_glb);
+  }); };
+
+// 6 ── the split on any bake. One input per field, id "p-<field>".
+const SPLIT=['smooth','color_quant_step','palette_min_frac','palette_max_colors',
+  'palette_merge_dist','min_faces_per_part','island_majority','cleanup_fragments','output_mode'];
+const splitVal=k=>{const e=$('p-'+k);return e.type==='checkbox'?e.checked:e.type==='number'?+e.value:e.value;};
+const presets=await (await fetch('/api/presets/split')).json();
+let preset='custom';
+for(const [name,vals] of Object.entries(presets)){
+  const b=document.createElement('button');b.textContent=name.replace('_',' ');b.style.cssText='flex:0;white-space:nowrap';
+  b.onclick=()=>{preset=name;for(const [k,v] of Object.entries(vals)) if($('p-'+k)) $('p-'+k).value=v;};
+  $('pbar').appendChild(b);
+}
+for(const k of SPLIT) $('p-'+k).oninput=()=>{preset='custom';};
+$('b6').onclick=()=>{ const inp=picked('in6'); const opts=Object.fromEntries(SPLIT.map(k=>[k,splitVal(k)]));
+  return step('s6','t6','o6','/api/jobs/split',{...inp.data,...opts},r=>{
+    $('o6').textContent=r.n_split_parts+' parts ('+r.output_mode+')';
+    register('split','6 '+preset+' '+opts.output_mode+' '+r.n_split_parts+'p ← '+inp.id,
+      {},r.segvigen_glb);
+  }); };
+
+// ── Status ───────────────────────────────────────────────────────────────
+const st = await (await fetch('/api/status')).json();
+log('checkpoint '+(st.checkpoint.present?'ok':'MISSING: '+st.checkpoint.path)
+   +' · cuda '+(st.cuda?'ok':'off')+' · gemini key '+(st.gemini_key?'ok':'MISSING'));
+</script>
+</body>
+</html>
