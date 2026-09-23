@@ -151,12 +151,6 @@ font-size:17px;font-weight:600;color:var(--ink2)}
 
     <div class="step" id="s4">
       <div class="step-head"><span class="num">4</span><h2>GeoSAM2</h2><span class="t" id="t4"></span></div>
-      <div class="row"><label>Seed from</label>
-        <select id="seedmode" title="How the painted map reaches GeoSAM2. Points: interior clicks, SAM2 re-derives the 2D mask (the paper's protocol). Painted map: the map itself is the seed mask, pixel-exact.">
-          <option value="map" selected>painted map, pixel-exact (default)</option>
-          <option value="points">points, 1 per part (paper)</option>
-          <option value="points4">points, 4 landmarks per part</option>
-        </select></div>
       <button id="b4" disabled>Segment</button>
       <div class="hint">GeoSAM2 as the paper runs it: propagate the seed across the 12 views,
       lift onto the faces, run its own post-process. Nothing of ours yet.</div>
@@ -416,8 +410,8 @@ $('b3').onclick=()=>step('s3','t3','o3','/api/jobs/guidance',
   {data_root:S.dataRoot,seed_view:S.seedView,mode:$('gmode').value,
    describe_model:$('amodel').value,paint_model:$('pmodel').value,
    resolution:+$('gres').value},r=>{
-    S.points=r.points_path; S.dataRoot=r.data_root;   // a sample is copied, not edited
-    $('o3').textContent=r.scene+' — '+r.painted+'/'+r.parts.length+' parts painted, '+r.n_points+' points';
+    S.dataRoot=r.data_root;   // a sample is copied, not edited
+    $('o3').textContent=r.scene+' — '+r.painted+'/'+r.parts.length+' parts painted';
     $('p3').innerHTML=
       '<figure><img src="/api/files?path='+encodeURIComponent(r.source_path)+'"><figcaption>view '+r.seed_view+'</figcaption></figure>'+
       '<figure><img src="/api/files?path='+encodeURIComponent(r.map_path)+'"><figcaption>part map</figcaption></figure>';
@@ -433,16 +427,13 @@ function listParts(el,parts){
     p.color+'"></span><span class="n">'+p.name+'</span><span class="px">'+p.faces+'</span></div>').join('');
 }
 $('b4').onclick=()=>step('s4','t4','o4','/api/jobs/segment',
-  {data_root:S.dataRoot,points_path:S.points,seed_view:S.seedView,
-   seed_mode:$('seedmode').value==='map'?'map':'points',
-   points_per_part:$('seedmode').value==='points4'?4:1},r=>{
+  {data_root:S.dataRoot,seed_view:S.seedView},r=>{
     S.seedView=r.seed_view;
     $('o4').textContent=r.n_parts+' parts, '+r.unlabeled_faces+' unassigned faces';
     listParts('pl4',r.parts);
-    const seed=$('seedmode').value;
-    if(r.raw_labels_path) register('labels','4 raw lift ('+seed+')',
+    if(r.raw_labels_path) register('labels','4 raw lift',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.raw_labels_path},r.raw_glb);
-    register('labels','4 post-processed ('+seed+')',
+    register('labels','4 post-processed',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
   });
 

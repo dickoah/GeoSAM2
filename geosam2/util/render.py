@@ -3,7 +3,7 @@
     from geosam2.util.render import render_views
     render_views("mesh.glb", "views/")   # 12 views + meta.json + mesh.glb
 
-Replaces the ``scripts/geosam2_render.py`` Blender stage. The network never sees a shaded
+Replaces VAST's Blender script (``geosam2_render.py``, kept in git history at b5de23c). The network never sees a shaded
 image (``sam2/utils/misc.py:506`` rewrites every ``color_*`` path to ``normal_*``,
 and ``sam2_base_geosam2.py:470`` encodes only the normal and point maps -- the
 ``img_batch`` it is handed is never used), so nothing here is rendered for the
@@ -123,7 +123,7 @@ ELEVATIONS: Tuple[float, ...] = (0.0, 25.0, 0.0, -25.0, 0.0, 25.0, 0.0, -25.0, 0
 
 # Azimuths of the bundled example data, which starts at 270 degrees.
 #
-# scripts/geosam2_render.py starts at 180 instead -- the same rig rotated by 90 degrees.
+# VAST's Blender script starts at 180 instead -- the same rig rotated by 90 degrees.
 # The bundled examples were not produced by the shipped renderer (their meta.json
 # carries keys it never writes), and the reference azimuths are the ones the
 # example point prompts were authored against: those prompts are pixel
@@ -134,7 +134,7 @@ AZIMUTHS_BLENDER_SCRIPT: Tuple[float, ...] = (180., 210., 240., 270., 300., 330.
 
 NUM_VIEWS = len(ELEVATIONS)
 
-# Blender defaults scripts/geosam2_render.py bakes in: a 50 mm lens on a 36 mm sensor.
+# The Blender defaults VAST's script baked in: a 50 mm lens on a 36 mm sensor.
 CAMERA_LENS_MM = 50.0
 SENSOR_WIDTH_MM = 36.0
 
@@ -164,7 +164,7 @@ def look_at(eye: np.ndarray, target: np.ndarray = None) -> np.ndarray:
     """Camera-to-world matrix aiming ``-Z`` at ``target`` with ``+Y`` up.
 
     Reproduces Blender's ``to_track_quat('-Z', 'Y')``, which is what
-    scripts/geosam2_render.py uses to orient each camera.
+    VAST's Blender script uses to orient each camera.
     """
     target = np.zeros(3) if target is None else np.asarray(target, dtype=float)
     eye = np.asarray(eye, dtype=float)

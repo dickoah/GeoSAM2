@@ -5,13 +5,12 @@ were tuned; geosam2's own copies had drifted (an older "detail-first" describe
 prompt, a different grid, a different model) and on a sideboard returned two
 parts for a piece with drawers and doors. This module feeds those functions
 (``geosam2.util.segvigen_guidance``, a copy geosam2 owns) geosam2's canonical renders
-and turns the map they paint into the point prompts GeoSAM2 seeds from.
-Nothing of the prompts lives here.
+and snaps the map they paint into the seed mask GeoSAM2 reads. Nothing of the
+prompts lives here.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -19,7 +18,6 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-from geosam2.util.auto_prompt import prompts_from_color_map, write_prompts
 from geosam2.util.logs import get_logger
 from geosam2.util import segvigen_guidance as _sv
 
@@ -34,7 +32,6 @@ VIEW_MAP: Dict[str, int] = {
     "main": 1, "main_high": 5, "front": 4, "back": 10, "left": 0, "right": 6,
 }
 WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
 
 DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL", "google:gemini-3.1-pro-preview")
 PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL", "google:gemini-3.1-flash-image")
@@ -66,7 +63,6 @@ class Seed(NamedTuple):
     scene: str
     parts: Dict[str, str]          # name -> hex, as SegviGen assigned them
     coverage: Dict[str, int]       # name -> painted pixels after snapping
-    points_path: Path
     map_path: Path
 
 
@@ -83,8 +79,7 @@ def generate_seed(data_root: Path, seed_view: int, size: int = 1024,
     which parts the seed view cannot show. The painted map is snapped to the
     exact palette (the VLM lands near its colours, not on them), its white
     background turned black -- the colour geosam2's readers treat as
-    background -- and one interior point per part region is written as
-    ``vlm_points_XXXX.json``.
+    background -- and written as ``mask_XXXX.png``, the seed GeoSAM2 reads.
     """
     g = _guidance()
     data_root = Path(data_root)
@@ -115,16 +110,12 @@ def generate_seed(data_root: Path, seed_view: int, size: int = 1024,
     map_path = data_root / f"mask_{seed_view:04d}.png"
     Image.fromarray(snapped).save(map_path)
 
-    prompts = prompts_from_color_map(snapped, view_idx=seed_view, background=BLACK)
-    points_path = data_root / f"vlm_points_{seed_view:04d}.json"
-    write_prompts(prompts, points_path)
     coverage = {n: int(np.all(snapped == np.array(c, np.uint8), axis=-1).sum())
                 for n, c in palette.items()}
-    logger.info("[segvigen seed] view %d: %d/%d parts painted, %d points",
-                seed_view, sum(1 for v in coverage.values() if v > 0), len(palette),
-                len(prompts))
+    logger.info("[segvigen seed] view %d: %d/%d parts painted",
+                seed_view, sum(1 for v in coverage.values() if v > 0), len(palette))
     return Seed(seed_view, description.get("scene_description", ""), table,
-                coverage, points_path, map_path)
+                coverage, map_path)
 
 
 def _snap(rgb: np.ndarray, colours: List[Tuple[int, int, int]],
