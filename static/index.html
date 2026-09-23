@@ -18,6 +18,8 @@ html,body{height:100%;overflow:hidden;font-family:var(--sans);background:var(--b
 #app{display:flex;height:100vh;overflow:hidden}
 #left{width:440px;flex-shrink:0;display:flex;flex-direction:column;background:var(--surface);
 border-right:1px solid var(--border2);overflow-y:auto}
+#grip{width:6px;flex-shrink:0;cursor:col-resize;background:var(--border);transition:background .15s}
+#grip:hover,#grip.drag{background:var(--ink4)}
 #right{flex:1;position:relative;background:var(--s2);display:flex;flex-direction:column}
 header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:10px}
 header h1{font-size:15px;font-weight:600;letter-spacing:-.01em}
@@ -40,6 +42,8 @@ button{font:inherit;font-size:12px;font-weight:550;padding:7px 13px;border:none;
 background:var(--accent);color:#fff;cursor:pointer;transition:opacity .15s}
 button:hover:not(:disabled){opacity:.85}
 button:disabled{background:var(--s3);color:var(--ink4);cursor:not-allowed}
+.row.changed label{color:#b45309;font-weight:600}
+#gset summary{cursor:pointer;font-size:12px;color:var(--ink2);margin:6px 0}
 button.ghost{background:var(--s2);color:var(--ink2);border:1px solid var(--border2)}
 .out{margin-top:9px;font-size:11px;color:var(--ink3);font-family:var(--mono);
 word-break:break-all;line-height:1.5}
@@ -122,9 +126,9 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         </select></div>
       <div class="row"><label>Analyze model</label>
         <select id="amodel">
-          <option value="gemini-3.1-pro-preview" selected>gemini-3.1-pro</option>
+          <option value="gemini-3.1-pro-preview">gemini-3.1-pro</option>
           <option value="gemini-3.8-flash">gemini-3.8-flash</option>
-          <option value="gemini-3.7-flash">gemini-3.7-flash — faster</option>
+          <option value="gemini-3.7-flash" selected>gemini-3.7-flash — faster</option>
           <option value="gemini-3-flash-preview">gemini-3-flash</option>
           <option value="gemini-2.5-pro">gemini-2.5-pro</option>
           <option value="gemini-2.5-flash">gemini-2.5-flash</option>
@@ -153,11 +157,25 @@ font-size:17px;font-weight:600;color:var(--ink2)}
 
     <div class="step" id="s4">
       <div class="step-head"><span class="num">4</span><h2>GeoSAM2</h2><span class="t" id="t4"></span></div>
+      <div class="row"><label title="GeoSAM2's post-process: components smaller than this share of the object are merged into their neighbours. VAST suggests 0.01, 0.02, 0.035.">postprocess_pa</label><input type="number" id="g-postprocess_pa" value="0.02" step="0.005"/></div>
+      <details id="gset" open><summary>GeoSAM2 settings</summary><div id="gform"></div>
+        <button class="ghost" id="greset" style="margin-top:6px">Defaults</button></details>
       <button id="b4" disabled>Segment</button>
       <div class="hint">GeoSAM2 as the paper runs it: propagate the seed across the 12 views,
       lift onto the faces, run its own post-process. Nothing of ours yet.</div>
       <div class="out" id="o4"></div>
       <div class="parts" id="pl4"></div>
+    </div>
+
+    <div class="step" id="s4b">
+      <div class="step-head"><span class="num">4b</span><h2>Fill unassigned</h2><span class="t" id="t4b"></span></div>
+      <div class="row"><label>Input</label><select id="in4b"></select></div>
+      <div class="row"><label title="Cost of a boundary along the surface: edge length x flatness of the fold. Higher: labels spread further over flat surfaces and stop only at creases.">lam</label><input type="number" id="f-lam" value="1" step="0.25"/></div>
+      <div class="row"><label title="Pull of the closest assigned surface (the other side of a thin panel) on each unassigned face. Higher: the thickness wins over the neighbours.">thickness_weight</label><input type="number" id="f-thickness_weight" value="1" step="0.25"/></div>
+      <div class="row"><label title="Folds sharper than this (degrees) count as creases, where a boundary is cheap.">crease_deg</label><input type="number" id="f-crease_deg" value="15" step="5"/></div>
+      <button id="b4b" disabled>Fill</button>
+      <div class="hint">Grey means no evidence, never a part: every unassigned face takes a label from its neighbours along the surface, or through the thickness where no view saw it. The result is a label file the bake can take.</div>
+      <div class="out" id="o4b"></div>
     </div>
 
     <div class="step" id="s5">
@@ -169,6 +187,8 @@ font-size:17px;font-weight:600;color:var(--ink2)}
           <option value="2048">2048</option>
           <option value="4096" selected>4096 — thin parts</option>
         </select></div>
+      <div class="row"><label title="auto: the mesh's own UVs when every part has at least 4 texels per face in them, an xatlas atlas otherwise (UVs made to tile a pattern give a part a handful of texels). keep: always the mesh's UVs. xatlas: always a new atlas.">Atlas</label>
+        <select id="atlas"><option value="auto" selected>auto</option><option value="keep">keep the mesh's UVs</option><option value="xatlas">xatlas</option></select></div>
       <button id="b5" disabled>Bake</button>
       <div class="hint">The split reads a textured mesh, not a label list: each triangle is
       painted its label's colour in the UV atlas. Any label file can go in — GeoSAM2's raw lift,
@@ -203,6 +223,7 @@ font-size:17px;font-weight:600;color:var(--ink2)}
     </div>
 
   </div>
+  <div id="grip" title="Drag to resize the panel"></div>
 
   <div id="right">
     <div id="viewer"><div id="vinfo">no result yet</div></div>
@@ -382,9 +403,9 @@ async function uploadMesh(f){
 }
 // A new mesh invalidates every result: the registry, the selectors, the gates.
 function resetStages(){
-  for(const b of ['b2','b3','b4','b5','b6']) $(b).disabled=true;
-  for(const s of ['s1','s2','s3','s4','s5','s6']) mark(s,null);
-  S.results=[]; for(const w of ['in5','in6','which']) $(w).innerHTML='';
+  for(const b of ['b2','b3','b4','b4b','b5','b6']) $(b).disabled=true;
+  for(const s of ['s1','s2','s3','s4','s4b','s5','s6']) mark(s,null);
+  S.results=[]; for(const w of ['in4b','in5','in6','which']) $(w).innerHTML='';
 }
 
 $('file').onchange=async e=>{
@@ -429,13 +450,13 @@ function listParts(el,parts){
     p.color+'"></span><span class="n">'+p.name+'</span><span class="px">'+p.faces+'</span></div>').join('');
 }
 $('b4').onclick=()=>step('s4','t4','o4','/api/jobs/segment',
-  {data_root:S.dataRoot,seed_view:S.seedView},r=>{
+  {data_root:S.dataRoot,seed_view:S.seedView,postprocess_pa:+$('g-postprocess_pa').value,settings:gsettings()},r=>{
     S.seedView=r.seed_view;
     $('o4').textContent=r.n_parts+' parts, '+r.unlabeled_faces+' unassigned faces';
     listParts('pl4',r.parts);
     if(r.raw_labels_path) register('labels','4 raw lift',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.raw_labels_path},r.raw_glb);
-    register('labels','4 post-processed',
+    register('labels',gsettings().postprocess===false?'4 raw (post-process off)':'4 post-processed',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
   });
 
@@ -452,7 +473,7 @@ S.results=[];
 function register(kind,label,data,glb){
   const id='#'+(S.results.length+1);
   S.results.push({id,kind,label:id+' '+label,data,glb});
-  for(const [k,sel] of [['labels','in5'],['baked','in6']]){
+  for(const [k,sel] of [['labels','in4b'],['labels','in5'],['baked','in6']]){
     const w=$(sel), items=S.results.filter(r=>r.kind===k);
     w.innerHTML=items.map(r=>'<option value="'+r.id+'">'+r.label+'</option>').join('');
     if(items.length){ w.value=items[items.length-1].id; $('b'+sel.slice(2)).disabled=false; }
@@ -468,9 +489,20 @@ const picked=sel=>S.results.find(r=>r.id===$(sel).value);
 $('which').onchange=e=>show(e.target.value,e.target.selectedOptions[0].textContent,true);
 window.registerResult=register;   // so an on-disk result can be added from the console
 
+// 4b ── fill the unassigned faces of any label file
+$('b4b').onclick=()=>{ const inp=picked('in4b'); return step('s4b','t4b','o4b','/api/jobs/fill',
+  {data_root:inp.data.data_root,work_dir:inp.data.work_dir,labels_path:inp.data.labels_path,
+   lam:+$('f-lam').value,thickness_weight:+$('f-thickness_weight').value,crease_deg:+$('f-crease_deg').value},r=>{
+    const f=r.report;
+    $('o4b').textContent=f.unassigned_before+' unassigned faces → '+f.unassigned_after+' ('+f.from_neighbours
+      +' by their neighbours, '+f.from_thickness+' through the thickness) · '+r.n_parts+' parts';
+    register('labels','4b filled ← '+inp.id,
+      {data_root:inp.data.data_root,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
+  }); };
+
 // 5 ── any label file onto the UVs
 $('b5').onclick=()=>{ const inp=picked('in5'); return step('s5','t5','o5','/api/jobs/bake',
-  {...inp.data, texture_size:+$('texsize').value},r=>{
+  {...inp.data, texture_size:+$('texsize').value, atlas:$('atlas').value},r=>{
     $('o5').textContent=r.n_labels+' labels painted into a '+r.texture_size+'² atlas';
     register('baked','5 '+r.texture_size+' ← '+inp.id,
       {work_dir:inp.data.work_dir,baked_glb:r.baked_glb},r.baked_glb);
@@ -507,12 +539,44 @@ $('ball').onclick=async()=>{
     await $('b2').onclick();
     await $('b3').onclick();
     await $('b4').onclick();
+    await $('b4b').onclick();                      // fill: the bake then takes the filled labels
     await $('b5').onclick();
     await $('b6').onclick();
     log('✔ all steps in '+((Date.now()-t0)/1000).toFixed(0)+' s');
   }catch(e){ log('✘ stopped: '+e.message); }
   finally{ $('ball').disabled=false; }
 };
+
+// ── Resizable panel: drag the grip, the width is kept in localStorage ──
+{
+  const left=$('left'), grip=$('grip');
+  try{const w=+localStorage.getItem('panelWidth'); if(w>=280) left.style.width=w+'px';}catch(e){}
+  grip.addEventListener('pointerdown',e=>{
+    grip.setPointerCapture(e.pointerId); grip.classList.add('drag');
+    const x0=e.clientX, w0=left.getBoundingClientRect().width;
+    const move=ev=>{left.style.width=Math.max(280,Math.min(window.innerWidth-300,w0+ev.clientX-x0))+'px';};
+    const up=()=>{grip.classList.remove('drag');grip.removeEventListener('pointermove',move);
+      grip.removeEventListener('pointerup',up);
+      try{localStorage.setItem('panelWidth',parseInt(left.style.width));}catch(e){}};
+    grip.addEventListener('pointermove',move); grip.addEventListener('pointerup',up);
+  });
+}
+
+// ── GeoSAM2 settings: the form comes from the server, defaults are VAST's ──
+const GSET=await (await fetch('/api/geosam2_settings')).json();
+for(const p of GSET){
+  const row=document.createElement('div');row.className='row';row.title=p.help;
+  const l=document.createElement('label');l.textContent=p.name;l.title=p.help;row.appendChild(l);
+  const i=document.createElement('input');i.id='g-'+p.name;i.title=p.help;
+  if(typeof p.default==='boolean'){i.type='checkbox';i.checked=p.default;}
+  else{i.type='number';i.value=p.default;i.step=Number.isInteger(p.default)?'1':'any';}
+  const changed=()=>row.classList.toggle('changed',(i.type==='checkbox'?i.checked:+i.value)!==p.default);
+  i.addEventListener('input',changed); row.appendChild(i); $('gform').appendChild(row);
+}
+function gsettings(){const o={};for(const p of GSET){const i=$('g-'+p.name);
+  const v=i.type==='checkbox'?i.checked:+i.value; if(v!==p.default) o[p.name]=v;} return o;}
+$('greset').onclick=()=>{for(const p of GSET){const i=$('g-'+p.name);
+  if(i.type==='checkbox')i.checked=p.default;else i.value=p.default; i.parentElement.classList.remove('changed');}};
 
 // ── Status ───────────────────────────────────────────────────────────────
 const st = await (await fetch('/api/status')).json();

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import math
 import torch.nn.functional as F
-from collections import defaultdict, Counter
+from collections import defaultdict
 import cv2
 from geosam2.sam2.utils.amg import calculate_stability_score
 from scipy.sparse import coo_matrix
@@ -37,12 +37,13 @@ def compute_iou(pred, gt):
         return 0
 
 
-def filter_masks(anns):
+def filter_masks(anns, dedup_iou=85):
     """The automatic masks worth keeping: deduplicated by IoU, largest first.
 
     Args:
         anns: SAM mask annotations (each with ``segmentation``, ``predicted_iou``
             and ``area`` keys).
+        dedup_iou: Overlap (%) above which two masks count as one.
     """
     if len(anns) == 0:
         return []
@@ -54,7 +55,7 @@ def filter_masks(anns):
             continue
         accept = True
         for acc_mask in mask_accept_list:
-            if compute_iou(ann['segmentation'], acc_mask['segmentation']) > 85:
+            if compute_iou(ann['segmentation'], acc_mask['segmentation']) > dedup_iou:
                 accept = False
                 break
         if accept:
@@ -148,21 +149,23 @@ def filter_mask_stability(video_segments, track_id, stability_dict, stability_sc
     return video_segments, stability_dict
 
 
-def shrink_mask(video_segments):
+def shrink_mask(video_segments, kernel_size=5, iterations=3):
     """Apply morphology to clean masks and push edge confidence apart.
 
     Args:
         video_segments: Dict[frame_idx, Dict[obj_id, mask/logits]].
+        kernel_size: Side of the square opening kernel, in pixels.
+        iterations: Erosion then dilation passes.
     """
     for frame_id in list(video_segments.keys()):
         for obj_id in list(video_segments[frame_id].keys()):
             vanilla_mask = video_segments[frame_id][obj_id] > 0
 
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
             mask_ = (video_segments[frame_id][obj_id] > 0).squeeze()
             mask_ = mask_.astype(np.uint8) * 255
-            mask_ = cv2.erode(mask_, kernel,iterations=3)
-            mask_ = cv2.dilate(mask_, kernel,iterations=3)
+            mask_ = cv2.erode(mask_, kernel,iterations=iterations)
+            mask_ = cv2.dilate(mask_, kernel,iterations=iterations)
             mask_ = mask_[None,:,:]
             mask_ = mask_ > 128
 
@@ -412,24 +415,22 @@ def complete_labels(face_labels, mesh, PA=0.025, smooth_type="knn"):
     face_label1 = face_labels.clone()
 
     if smooth_type=="adjacent":
-        smooth_iterations = 64
-        iter = 0
-        for iteration in range(smooth_iterations):
-            iter+=1
-            changes = {}
-            for face in range(face_labels.shape[0]):
-                if face_labels[face] != 0: 
-                    continue
-                labels_adj = Counter()
-                for adj in mesh_graph[face]:
-                    if face_labels[adj] != 0:
-                        label = face_labels[adj]
-                        labels_adj[label] += 1
-                if len(labels_adj):
-                    changes[face] = labels_adj.most_common(1)[0][0]
-    
+        # Up to 64 passes; each face still at 0 takes a neighbour's label. VAST's
+        # loop counted the neighbours in a Counter keyed by 0-d tensors, which
+        # hash by identity: every neighbour counted once and most_common() gave
+        # the FIRST non-zero neighbour in adjacency order -- what next() does
+        # here. A pass that changes nothing ends the loop (the next ones would
+        # change nothing either). Read and written through a numpy view of the
+        # tensor: 150k faces x 64 passes of tensor scalar indexing took 26 s.
+        lab = face_labels.numpy()
+        for _ in range(64):
+            changes = {face: nb for face in np.flatnonzero(lab == 0)
+                       for nb in [next((lab[a] for a in mesh_graph[face] if lab[a] != 0), None)]
+                       if nb is not None}
+            if not changes:
+                break
             for face, label in changes.items():
-                face_labels[face] = label
+                lab[face] = label
 
     print("Smoothing labels")
     face_unlable_idx = torch.where(face_labels == 0)[0]
@@ -521,13 +522,14 @@ def find_nearest_three_points(A, B):
 
     return ret
 
-def filter_iou(all_seg_result, video_segments, track_id):
+def filter_iou(all_seg_result, video_segments, track_id, iou_thresh=0.8):
     """Filter highly overlapping objects inside and across passes.
 
     Args:
         all_seg_result: Accumulated segmentation dict by frame/object.
         video_segments: Current pass segmentation dict by frame/object.
         track_id: Anchor frame used for overlap comparison.
+        iou_thresh: Overlap above which two objects are one.
     """
     start = __import__('time').time()
     accept_id = []
@@ -538,7 +540,7 @@ def filter_iou(all_seg_result, video_segments, track_id):
             mask1 = video_segments[track_id][obj_id]
             mask2 = video_segments[track_id][acpt_id]
             iou = np.sum(mask1 & mask2) / (np.sum(mask1 | mask2) + 1e-6)
-            if iou > 0.8:
+            if iou > iou_thresh:
                 accept = False
                 break
         if accept:
@@ -555,7 +557,7 @@ def filter_iou(all_seg_result, video_segments, track_id):
             mask1 = video_segments[track_id][obj_id_1]
             mask2 = all_seg_result[track_id][obj_id_2]
             iou = np.sum(mask1 & mask2) / (np.sum(mask1 | mask2) + 1e-6)
-            if iou > 0.8 and iou <= 1:
+            if iou > iou_thresh and iou <= 1:
                 discard_id.append(obj_id_1)
 
     discard_id = list(set(discard_id))

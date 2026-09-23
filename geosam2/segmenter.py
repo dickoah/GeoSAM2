@@ -21,7 +21,7 @@ import torch
 import trimesh
 
 from geosam2._lift import clean_label_fragments
-from geosam2._propagation import propagate
+from geosam2._propagation import PropagationSettings, propagate
 from geosam2.util.labels import UNASSIGNED_LABELS, export_parts
 from geosam2.util.logs import get_logger
 from geosam2.util.views import NUM_VIEWS, is_view_directory, load_mesh, read_views
@@ -85,6 +85,7 @@ class GeoSAM2Segmenter:
         mask_view: int,
         output_dir: Union[str, Path],
         postprocess_pa: float = 0.02,
+        settings: Optional[PropagationSettings] = None,
     ) -> str:
         """Propagate ``mask`` from ``mask_view`` over the 12 views and lift it to the mesh.
 
@@ -102,6 +103,8 @@ class GeoSAM2Segmenter:
             ``labels_post.npy`` (after its post-process) and the result below.
         postprocess_pa:
             The post-process's ``PA``; see ``POSTPROCESS_PA_CANDIDATES``.
+        settings:
+            GeoSAM2's other knobs (``PropagationSettings``); None = VAST's values.
 
         Returns
         -------
@@ -127,7 +130,9 @@ class GeoSAM2Segmenter:
                     self._to(device)
                     logger.info("[run] %s, seed %s on view %d", views.name, mask.name, mask_view)
                     data = read_views(str(views), str(mask), int(mask_view))
-                    raw, post = propagate(self._predictor, self._mask_generator, data, postprocess_pa)
+                    settings = settings or PropagationSettings()
+                    raw, post = propagate(self._predictor, self._generator_for(settings), data,
+                                          postprocess_pa, settings)
             finally:
                 self.clear_vram()
 
@@ -204,6 +209,15 @@ class GeoSAM2Segmenter:
             sam2 = image_model(checkpoint)
             predictor = video_predictor(checkpoint)
         return predictor, SAM2AutomaticMaskGenerator(model=sam2, **self._MASK_GENERATOR)
+
+    def _generator_for(self, settings: PropagationSettings):
+        """The cached generator, or one built on the same model when its settings differ."""
+        overrides = settings.generator_overrides()
+        if all(self._MASK_GENERATOR[k] == v for k, v in overrides.items()):
+            return self._mask_generator
+        from geosam2.sam2.automatic_mask_generator_geosam2 import SAM2AutomaticMaskGenerator
+        return SAM2AutomaticMaskGenerator(model=self._mask_generator.predictor.model,
+                                          **{**self._MASK_GENERATOR, **overrides})
 
     def _to(self, device: torch.device) -> None:
         if self._predictor is not None:
