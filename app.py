@@ -9,8 +9,8 @@ step.
 
     1. /api/jobs/render    mesh          -> 12 canonical views
     2. /api/jobs/pickview  views         -> the seed view SegviGen's picker chooses
-    3. /api/jobs/guidance  views + view  -> SegviGen's describe/palette/paint -> points
-    4. /api/jobs/segment   views + points-> GeoSAM2, as the paper runs it
+    3. /api/jobs/guidance  views + view  -> SegviGen's describe/palette/paint -> the map
+    4. /api/jobs/segment   views + map   -> GeoSAM2, as the paper runs it
     5. /api/jobs/bake      labels        -> the labels as a texture on the UVs
     6. /api/jobs/split     baked mesh    -> SegviGen's split (its code), one mesh per part
 
@@ -20,7 +20,6 @@ Run with:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -29,7 +28,7 @@ import threading
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 # The UI polls job status once a second; those lines drown the real log.
 logging.getLogger("uvicorn.access").addFilter(
@@ -45,12 +44,17 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from utils.segmenter import REPO_ROOT, GeoSAM2Segmenter, is_view_directory
-from utils.logs import get_logger
+from geosam2.segmenter import REPO_ROOT, GeoSAM2Segmenter
+from geosam2.util.views import is_view_directory
+from geosam2.util.logs import get_logger
 
 # Before /api/status reports on it: utils.guidance loads the same file, but only
 # once it is imported, which happens inside a job rather than at startup.
 load_dotenv(Path(__file__).parent / ".env")
+# SegviGen's guidance reads its models and key from os.environ at call time; its
+# logfire instrumentation is optional and unconfigured here -- silence the
+# warning it prints on every call.
+os.environ.setdefault("LOGFIRE_IGNORE_NO_CONFIG", "1")
 
 logger = get_logger("geosam2.app2")
 
@@ -95,7 +99,7 @@ def _require_dir(path: str) -> Path:
 def _writable_views(path: str) -> Path:
     """A view directory the guidance stage may write its seed into.
 
-    ``generate_seed_mask`` writes ``mask_XXXX.png`` and ``vlm_points_XXXX.json``
+    ``generate_seed`` writes ``mask_XXXX.png``
     next to the views, which is what the rest of the pipeline reads. For a
     bundled ``example/sample_*`` that would edit tracked files, so those are
     copied into the work area first; a directory already under it is used
@@ -175,7 +179,7 @@ def start_render(params: RenderParams) -> dict:
         raise HTTPException(400, f"mesh not found: {mesh_path}")
 
     def _run() -> dict:
-        from utils.render import render_views
+        from geosam2.util.views import render_views
         out = _WORK_ROOT / f"views_{uuid.uuid4().hex[:8]}"
         render_views(str(mesh_path), out)
         return {"data_root": str(out), "mesh_path": str(out / "mesh.glb"),
@@ -195,8 +199,8 @@ def start_pickview(params: PickViewParams) -> dict:
     data_root = _require_dir(params.data_root)
 
     def _run() -> dict:
-        from utils.guidance import VIEW_MAP, pick_seed_view
-        from utils.render import AZIMUTHS_REFERENCE
+        from geosam2.util.guidance import VIEW_MAP, pick_seed_view
+        from geosam2.util.views import AZIMUTHS_REFERENCE
         view = pick_seed_view(data_root)
         compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
                    "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
@@ -227,7 +231,7 @@ def start_guidance(params: GuidanceParams) -> dict:
         raise HTTPException(400, "GEMINI_API_KEY is not set (see .env at the repo root).")
 
     def _run() -> dict:
-        from utils.guidance import generate_seed
+        from geosam2.util.guidance import generate_seed
         kw = dict(size=params.resolution, mode=params.mode)
         if params.describe_model:
             kw["describe_model"] = params.describe_model
@@ -237,14 +241,12 @@ def start_guidance(params: GuidanceParams) -> dict:
         return {
             "seed_view": seed.view,
             "data_root": str(data_root),   # the copy the seed was written into
-            "points_path": str(seed.points_path),
             "map_path": str(seed.map_path),
             "source_path": str(data_root / f"color_{seed.view:04d}.webp"),
             "scene": seed.scene,
             "parts": [{"name": n, "hex": h, "pixels": seed.coverage.get(n, 0)}
                       for n, h in seed.parts.items()],
             "painted": sum(1 for v in seed.coverage.values() if v > 0),
-            "n_points": len(json.loads(seed.points_path.read_text())),
         }
 
     return _start_job(_run)
@@ -254,82 +256,47 @@ def start_guidance(params: GuidanceParams) -> dict:
 
 class SegmentParams(BaseModel):
     data_root: str
-    points_path: str
-    seed_view: Optional[int] = None
-    # How the painted map reaches GeoSAM2. "points": interior clicks, SAM2's
-    # image predictor re-derives the 2D mask (the paper's protocol) --
-    # points_per_part spreads that many landmarks over each region. "map": the
-    # painted map itself is the 2D seed mask, pixel-exact, no re-derivation.
-    # "map" by default: measured on two sideboards, it is the only route that
-    # keeps every painted part (15/15 vs 11 from one click per part -- doors
-    # merged into the carcass, drawers into each other); several clicks per
-    # part came out worse still.
-    seed_mode: str = "map"
-    points_per_part: int = 1
+    seed_view: int
     postprocess_pa: float = 0.02
-    mask_threshold: float = 0.0
 
 
 def _parts_glb(data_root: Path, labels_path: Path, work: Path, name: str) -> dict:
     """Cut the source mesh into one geometry per label and write it out."""
-    scene, structure, n_parts, unlabeled = _segmenter._build_scene(
-        data_root / "mesh.glb", np.load(labels_path))
+    scene, structure, _ = _segmenter.parts(data_root / "mesh.glb", np.load(labels_path))
     glb_path = work / f"{name}.glb"
     scene.export(glb_path)
+    parts = [p for p in structure["children"] if p["name"] != "unassigned"]
+    unlabeled = sum(p["faces"] for p in structure["children"] if p["name"] == "unassigned")
     return {"glb_path": str(glb_path), "labels_path": str(labels_path),
-            "n_parts": n_parts, "unlabeled_faces": unlabeled,
-            "parts": structure.get("children", [])}
+            "n_parts": len(parts), "unlabeled_faces": unlabeled,
+            "parts": structure["children"]}
 
 
 @app.post("/api/jobs/segment")
 def start_segment(params: SegmentParams) -> dict:
-    """GeoSAM2 as the paper runs it: propagate the points, lift, post-process.
+    """GeoSAM2 as the paper runs it: propagate the painted map, lift, post-process.
 
     Deliberately stops there. Everything this project adds on top is the next
     stage, so the two can be looked at side by side.
     """
     data_root = _require_dir(params.data_root)
-    if not Path(params.points_path).is_file():
-        raise HTTPException(400, f"point prompts not found: {params.points_path}")
+    mask_path = data_root / f"mask_{params.seed_view:04d}.png"
+    if not mask_path.is_file():
+        raise HTTPException(400, f"no painted map for view {params.seed_view}: {mask_path}")
 
     def _run() -> dict:
         work = _WORK_ROOT / f"seg_{uuid.uuid4().hex[:8]}"
-        work.mkdir(parents=True, exist_ok=True)
-
-        if params.seed_mode == "map":
-            view_idx = params.seed_view
-            mask_path = data_root / f"mask_{view_idx:04d}.png"
-            if not mask_path.is_file():
-                raise FileNotFoundError(f"no painted map for view {view_idx}: {mask_path}")
-        else:
-            points = Path(params.points_path)
-            if params.points_per_part > 1:
-                from PIL import Image
-                from utils.auto_prompt import prompts_from_color_map, write_prompts
-                view_idx = params.seed_view
-                rgb = np.asarray(Image.open(data_root / f"mask_{view_idx:04d}.png").convert("RGB"))
-                points = work / f"points_k{params.points_per_part}.json"
-                write_prompts(prompts_from_color_map(
-                    rgb, view_idx=view_idx, background=(0, 0, 0),
-                    points_per_part=params.points_per_part), points)
-            mask_path, view_idx, _ = _segmenter._run_point_prompts(
-                data_root, points, params.seed_view, work, params.mask_threshold)
         out_dir = work / "3d_seg"
-        _segmenter._run_inference(
-            data_root, out_dir, params.postprocess_pa,
-            enable_postprocess=True, opposite_auto_segmentation=True,
-            mask_path=mask_path, mask_view=view_idx)
-
-        raw = sorted(out_dir.glob("segmentation_result_*.npy"))
-        post = sorted(out_dir.glob("segmentation_postprocessed_*.npy"))
-        out = _parts_glb(data_root, post[-1] if post else raw[-1], work, "geosam2")
+        glb_path = _segmenter.run(data_root, mask_path, params.seed_view, out_dir,
+                                  postprocess_pa=params.postprocess_pa)
         # Both of GeoSAM2's own outputs are handed back: the raw lift and its
         # post-process are two of the methods whose weight the later stages
-        # are there to measure, so either can feed 5b.
-        out.update(work_dir=str(work), out_dir=str(out_dir), seed_view=view_idx,
-                   mask_path=str(mask_path),
-                   raw_labels_path=str(raw[-1]) if raw else None,
-                   raw_glb=str(raw[-1]).replace(".npy", ".glb") if raw else None)
+        # are there to measure, so either can feed the bake.
+        out = _parts_glb(data_root, out_dir / "labels_post.npy", work, "geosam2")
+        raw = _parts_glb(data_root, out_dir / "labels_raw.npy", work, "geosam2_raw")
+        out.update(work_dir=str(work), out_dir=str(out_dir), seed_view=params.seed_view,
+                   mask_path=str(mask_path), glb_path=glb_path,
+                   raw_labels_path=raw["labels_path"], raw_glb=raw["glb_path"])
         return out
 
     return _start_job(_run)
@@ -342,7 +309,7 @@ class BakeParams(BaseModel):
     data_root: str
     work_dir: str
     labels_path: str
-    texture_size: int = 2048
+    texture_size: int = 4096
 
 
 class SplitParams(BaseModel):
@@ -367,8 +334,8 @@ SPLIT_FIELDS = ("color_quant_step", "palette_min_frac", "palette_max_colors",
 
 @app.get("/api/presets/split")
 def split_presets() -> dict:
-    from utils.split import split_presets
-    return split_presets()
+    from geosam2.util.split import SPLIT_PRESETS
+    return SPLIT_PRESETS
 
 
 @app.post("/api/jobs/bake")
@@ -382,7 +349,7 @@ def start_bake(params: BakeParams) -> dict:
         raise HTTPException(400, f"labels not found: {params.labels_path} (re-run stage 4)")
 
     def _run() -> dict:
-        from utils.split import bake_labels_to_glb
+        from geosam2.util.labels import bake_labels_to_glb
         out = work / "segvigen"
         out.mkdir(parents=True, exist_ok=True)
         baked = out / f"baked_{params.texture_size}_{uuid.uuid4().hex[:6]}.glb"
@@ -407,13 +374,13 @@ def start_split(params: SplitParams) -> dict:
     def _run() -> dict:
         import trimesh
 
-        from utils.split import split_with_segvigen
+        from geosam2.util.split import split_glb_by_texture_palette_rgb
         # One file per parameter set: a fixed name would make two runs
         # indistinguishable in the viewer and on disk.
         tag = uuid.uuid4().hex[:6]
         out = work / "segvigen" / f"parts_{params.output_mode}_{tag}.glb"
-        split_with_segvigen(params.baked_glb, str(out),
-                            **{k: getattr(params, k) for k in SPLIT_FIELDS})
+        split_glb_by_texture_palette_rgb(params.baked_glb, str(out), debug_print=True,
+                                         **{k: getattr(params, k) for k in SPLIT_FIELDS})
         scene = trimesh.load(out, force="scene")
         return {"segvigen_glb": str(out), "n_split_parts": len(scene.geometry),
                 "output_mode": params.output_mode}

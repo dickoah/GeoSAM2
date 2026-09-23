@@ -1,51 +1,32 @@
-# Copyright 2025 VAST-AI-Research and the GeoSAM2 authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-"""Build script for GeoSAM2.
+"""Build script for GeoSAM2; the package itself is configured in pyproject.toml.
 
-Most of the project is pure Python and is configured in ``pyproject.toml``.
-This file exists to compile the optional CUDA extension that accelerates
-connected-components labelling. The Python package is still importable and
-usable without the extension (a Python fallback path is taken at runtime).
+This file exists to compile geosam2/ext/mode_ext.cpp, the C++ vote that
+turns sampled point labels into face labels, at install time: ``pip install
+-e . --no-build-isolation`` in an environment that has torch. Without the
+compiled module, geosam2.ext.mode_ext falls back to compiling it on first
+import, which needs a compiler and ninja at runtime.
 """
 
 from __future__ import annotations
 
-import os
-
 from setuptools import setup
 
-BUILD_CUDA_EXT = os.environ.get("GEOSAM2_BUILD_CUDA", "1") not in {"0", "false", "False"}
 
-
-def _maybe_cuda_extensions():
-    """Return the CUDA extension list, or an empty list if Torch/CUDA is unavailable."""
-    if not BUILD_CUDA_EXT:
-        return []
+def _extensions():
     try:
-        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+        from torch.utils.cpp_extension import CppExtension
     except ImportError:
-        # Torch is required to build the extension; skip silently so that a
-        # `pip install` without torch still installs the Python sources.
+        # No torch at build time: install the Python sources, keep the JIT fallback.
         return []
-
-    srcs = ["sam2/csrc/connected_components.cu"]
-    compile_args = {
-        "cxx": ["-O3"],
-        "nvcc": [
-            "-DCUDA_HAS_FP16=1",
-            "-D__CUDA_NO_HALF_OPERATORS__",
-            "-D__CUDA_NO_HALF_CONVERSIONS__",
-            "-D__CUDA_NO_HALF2_OPERATORS__",
-        ],
-    }
-    return [CUDAExtension("sam2._C", srcs, extra_compile_args=compile_args)]
+    return [CppExtension(
+        "geosam2.ext._mode_ext",
+        ["geosam2/ext/mode_ext.cpp"],
+        extra_compile_args=["-fopenmp", "-O3"],
+        extra_link_args=["-fopenmp"],
+    )]
 
 
 def _cmdclass():
-    if not BUILD_CUDA_EXT:
-        return {}
     try:
         from torch.utils.cpp_extension import BuildExtension
     except ImportError:
@@ -53,7 +34,4 @@ def _cmdclass():
     return {"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)}
 
 
-setup(
-    ext_modules=_maybe_cuda_extensions(),
-    cmdclass=_cmdclass(),
-)
+setup(ext_modules=_extensions(), cmdclass=_cmdclass())

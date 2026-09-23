@@ -62,3 +62,6 @@ example/sample_0[4-9]/
 example/sample_1*/
 example/sample_*_our/
 example/multiview_results/
+
+# Working notes, kept locally
+docs/

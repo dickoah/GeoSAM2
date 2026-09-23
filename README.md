@@ -1,153 +1,102 @@
-# GeoSAM2: Unleashing the Power of SAM2 for 3D Part Segmentation
+# geosam2
 
-> **Accepted at CVPR 2026.**
+GeoSAM2 ([Deng et al., CVPR 2026](https://arxiv.org/abs/2508.14036)) as a
+library: a mesh's twelve canonical views and a 2D mask on one of them go in,
+per-face labels and one mesh per part come out. The model lifts SAM2 from
+images to meshes -- it propagates the mask across the views with a video
+predictor and back-projects the result onto the faces.
 
-<div align="center">
+This is [VAST's release](https://github.com/VAST-AI-Research/GeoSAM2) reshaped
+the way `segvigen` is for SegviGen in pixmesh-segmentation: one class that
+keeps the model loaded, the utilities around it, no Hydra, no Blender, no
+sibling checkout. Around the model it adds what the paper leaves to the
+user: the views rendered in-process, the seed map painted by a VLM, the
+labels baked to a texture and split into parts with SegviGen's code.
 
-[![Project Page](https://img.shields.io/badge/%F0%9F%8F%A0-Project%20Page-blue.svg)](https://detailgen3d.github.io/GeoSAM2/)
-[![Paper](https://img.shields.io/badge/arXiv-2508.14036-b31b1b.svg)](https://arxiv.org/abs/2508.14036)
-[![Model](https://img.shields.io/badge/%F0%9F%A4%97-Model-yellow.svg)](https://huggingface.co/VAST-AI/GeoSAM2)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-
-</div>
-
-![teaser](assets/pipeline.png)
-
-GeoSAM2 lifts SAM2 from images to 3D meshes. It takes a multi-view rendering of
-a mesh, accepts an interactive prompt (a single 2D click or a 2D mask) on one
-view, propagates a consistent segmentation across all views, and back-projects
-the result to obtain a per-face 3D part labelling.
-
-This repository contains the **inference** code, configs, and a small demo
-dataset. Training/fine-tuning code is intentionally not included.
-
----
-
-## Repository layout
+## Layout
 
 ```
-GeoSAM2/
-├── inference.py                       # Multi-view 3D segmentation entry point
-├── single_view_point_prompt_infer.py  # 2D mask from interactive point prompts
-├── scripts/
-│   ├── geosam2_render.py              # Blender script to render multi-view data
-│   └── run_example.sh                 # End-to-end demo on the bundled example
-├── sam2/                              # SAM2 backbone + GeoSAM2 modifications
-│   ├── configs/geosam2.yaml           # Hydra config used at inference time
-│   ├── csrc/connected_components.cu   # Optional CUDA op (built via setup.py)
-│   ├── modeling/                      # Model definition
-│   └── ...
-├── utils/                             # Project-specific helpers
-└── example/                           # Bundled multi-view demo assets
+geosam2/                  the package (the only top-level name)
+├── segmenter.py          GeoSAM2Segmenter: ensure_checkpoint, load, run, parts, clear_vram
+├── _model.py             the model built in Python, checkpoint loaded strict
+├── _propagation.py       seed mask -> masks on the 12 views -> labels on the faces
+├── _lift.py              the lift and the post-processes (VAST's inference_utils)
+├── sam2/                 SAM2 as GeoSAM2 modified it
+├── ext/mode_ext.cpp      the label vote, compiled at install time
+└── util/
+    ├── views.py          the 12 canonical views: rendered, validated, read back
+    ├── guidance.py       the seed: view pick, VLM description, palette, painted map
+    ├── labels.py         labels onto the mesh: palette, baked texture, parts
+    ├── split.py          SegviGen's split, a copy this package owns
+    └── logs.py
+server.py + static/       the step-by-step app, port 7862
+tests/                    unit tests, and views_check.py to compare two renders
+example/                  three view directories from VAST, with reference masks
+ckpt/                     geosam2.pt, downloaded from Hugging Face on first use (gitignored)
 ```
-
-## Requirements
-
-- Linux, Python 3.10+ (tested on 3.12)
-- A CUDA-capable GPU with PyTorch 2.3+ (CPU is supported but slow)
-- [Blender](https://www.blender.org/) 4.0+ for rendering your own meshes
 
 ## Installation
 
-```bash
-git clone https://github.com/VAST-AI-Research/GeoSAM2.git
-cd GeoSAM2
-
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-
-# Optional: build the CUDA-accelerated connected-components op.
-# Mask post-processing is skipped automatically (with a warning) if this is
-# not built; results are usually unaffected.
-python -m pip install -e .
-```
-
-If your environment does not have a working CUDA toolchain (`nvcc`), skip the
-extension build with `GEOSAM2_BUILD_CUDA=0 pip install -e .`.
-
-## Pretrained weights
-
-The pretrained checkpoint is hosted on
-[Hugging Face](https://huggingface.co/VAST-AI/GeoSAM2). `app.py` checks for it at
-startup and downloads it to `ckpt/geosam2.pt` when it is missing (615 MB, once).
-For the command-line scripts, download it yourself:
+Linux, Python 3.10+, a CUDA GPU, PyTorch 2.3+ already in the environment.
 
 ```bash
-mkdir -p ckpt
-huggingface-cli download VAST-AI/GeoSAM2 geosam2.pt --local-dir ckpt
+pip install -r requirements.txt
+pip install -e . --no-build-isolation      # compiles geosam2/ext/mode_ext.cpp
+cp .env.dist .env                          # GEMINI_API_KEY for the VLM stage
 ```
 
-The configuration file `sam2/configs/geosam2.yaml` is loaded automatically by
-Hydra at runtime.
-
----
+Without the compiled extension the vote is built on first import instead,
+which needs a C++ compiler and `ninja` on the PATH. The checkpoint
+(`ckpt/geosam2.pt`, 615 MB) is downloaded from
+[VAST-AI/GeoSAM2](https://huggingface.co/VAST-AI/GeoSAM2) the first time it
+is needed.
 
 ## Usage
 
-### 1) Multi-view rendering (run once per mesh)
+```python
+from geosam2.segmenter import GeoSAM2Segmenter
+from geosam2.util import views, guidance, labels, split
 
-`scripts/geosam2_render.py` is a headless Blender script. It takes a mesh and writes 12
-views of color, depth, and normal maps plus a `meta.json` with camera
-information.
+work = "runs/sideboard"
+views.render_views("sideboard.glb", f"{work}/views")            # 12 views + meta.json + mesh.glb
+view = guidance.pick_seed_view(f"{work}/views")                  # VLM picks the seed view
+seed = guidance.generate_seed(f"{work}/views", view)             # VLM describes, paints; mask_XXXX.png
 
-```bash
-blender -b -P scripts/geosam2_render.py /abs/path/to/mesh.glb glb /abs/path/to/output_dir
+seg = GeoSAM2Segmenter()                                         # loads on the first run(), stays loaded
+parts_glb = seg.run(f"{work}/views", seed.map_path, view, f"{work}/out")
+# -> out/parts.glb (one geometry per part, the input's frame), parts.npy, labels_raw.npy, labels_post.npy
+
+baked = labels.bake_labels_to_glb(f"{work}/views/mesh.glb", f"{work}/out/parts.npy", f"{work}/baked.glb")
+split.split_glb_by_texture_palette_rgb(f"{work}/baked.glb", f"{work}/split.glb", **split.SPLIT_PRESETS["balanced"])
+seg.clear_vram()
 ```
 
-The bundled directories under `example/` were produced this way and can be used
-directly without re-rendering.
+`run()` takes any 2D mask on one of the views: a label map (`.npy`, `.exr`)
+or a flat-colour image such as the painted seed. `postprocess_pa` (0.02) is
+the one knob VAST documents; `GeoSAM2Segmenter.POSTPROCESS_PA_CANDIDATES`
+lists the values worth trying.
 
-### 2) Interactive point-prompt segmentation (single view)
+What the process-wide settings of VAST's script did -- bf16 autocast, TF32,
+the seeds -- is scoped to each `run()`, so a host process is left as it was,
+and two consecutive runs give the same labels.
 
-Given a JSON file with point prompts (`{frame_idx, obj_id, point=[x,y], label}`
-entries), produce a 2D label map and a coloured visualisation for the chosen
-view:
-
-```bash
-python single_view_point_prompt_infer.py \
-  --data-root example/sample_00 \
-  --view-idx 0 \
-  --point-prompt-file example/sample_00/point_prompts_scale1.json \
-  --output-dir outputs/sample_00/2d_seg
-```
-
-### 3) 3D part segmentation from a 2D mask
-
-`inference.py` loads the multi-view renders, propagates the seed mask using the
-GeoSAM2 video predictor, fuses 2D segmentations into 3D, and writes per-face
-labels.
-
-End-to-end demo (single view → 3D):
+## The app
 
 ```bash
-bash scripts/run_example.sh
+python app.py        # http://127.0.0.1:7862
 ```
 
-Run the propagation step directly with a pre-computed mask:
+The stages one at a time -- render, pick the view, guidance, GeoSAM2, bake,
+split -- each a job on file paths, so a stage can be re-run on its own and
+its result compared with the previous one in the viewer. The bundled
+`example/sample_*` skip the render.
 
-```bash
-python inference.py \
-  --data-root example/sample_00 \
-  --mask-path outputs/sample_00/2d_seg/mask_view0000.npy \
-  --mask-view 0 \
-  --postprocess-pa 0.02 \
-  --output-dir outputs/sample_00/3d_seg
-```
+## Environment
 
-`--mask-path` accepts `.npy`/`.exr` integer label maps as well as `.png` color
-previews. For different meshes you may need to tune `--postprocess-pa`; useful
-candidates are `0.01`, `0.02`, and `0.035`.
-
-The bundled `example/sample_01`, `example/sample_02`, and `example/sample_03`
-directories also contain reference `mask_xxxx.png` files that can be passed
-straight to `--mask-path` for testing.
-
-## Tips
-
-- Toggle the optional helpers with `--no-opposite-auto-segmentation` and
-  `--no-enable-postprocess` if you only want the bare propagation output.
-- `--save-input-maps`, `--save-frame-vis`, and `--save-pointcloud-vis` are
-  available for debugging and visualisations.
+`.env` at the repository root, read by the app (the library reads
+`os.environ` only): `GEMINI_API_KEY`, and optionally `GEOSAM2_DESCRIBE_MODEL`
+/ `GEOSAM2_PAINT_MODEL` (pydantic-ai model names), `GEOSAM2_LOG_LEVEL`,
+`GEOSAM2_APP_HOST` / `GEOSAM2_APP_PORT`.
 
 ## Acknowledgements
 
@@ -162,10 +111,10 @@ acknowledge:
 ## License
 
 This project is released under the Apache License 2.0; see [LICENSE](LICENSE).
-The `sam2/` package and the connected-components CUDA kernel under
-`sam2/csrc/` are derived from
-[Meta's SAM2](https://github.com/facebookresearch/sam2) under the same license.
-See [NOTICE](NOTICE) for details.
+`geosam2/sam2/` is derived from
+[Meta's SAM2](https://github.com/facebookresearch/sam2) under the same license;
+`geosam2/util/guidance.py` and `geosam2/util/split.py` are copies of pixmesh's
+SegviGen code. See [NOTICE](NOTICE) for details.
 
 ## Citation
 
