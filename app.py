@@ -45,12 +45,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from utils.segmenter import REPO_ROOT, GeoSAM2Segmenter, is_view_directory
-from utils.logs import get_logger
+from geosam2.segmenter import REPO_ROOT, GeoSAM2Segmenter, is_view_directory
+from geosam2.util.logs import get_logger
 
 # Before /api/status reports on it: utils.guidance loads the same file, but only
 # once it is imported, which happens inside a job rather than at startup.
 load_dotenv(Path(__file__).parent / ".env")
+# SegviGen's guidance reads its models and key from os.environ at call time; its
+# logfire instrumentation is optional and unconfigured here -- silence the
+# warning it prints on every call.
+os.environ.setdefault("LOGFIRE_IGNORE_NO_CONFIG", "1")
 
 logger = get_logger("geosam2.app2")
 
@@ -175,7 +179,7 @@ def start_render(params: RenderParams) -> dict:
         raise HTTPException(400, f"mesh not found: {mesh_path}")
 
     def _run() -> dict:
-        from utils.render import render_views
+        from geosam2.util.render import render_views
         out = _WORK_ROOT / f"views_{uuid.uuid4().hex[:8]}"
         render_views(str(mesh_path), out)
         return {"data_root": str(out), "mesh_path": str(out / "mesh.glb"),
@@ -195,8 +199,8 @@ def start_pickview(params: PickViewParams) -> dict:
     data_root = _require_dir(params.data_root)
 
     def _run() -> dict:
-        from utils.guidance import VIEW_MAP, pick_seed_view
-        from utils.render import AZIMUTHS_REFERENCE
+        from geosam2.util.guidance import VIEW_MAP, pick_seed_view
+        from geosam2.util.render import AZIMUTHS_REFERENCE
         view = pick_seed_view(data_root)
         compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
                    "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
@@ -227,7 +231,7 @@ def start_guidance(params: GuidanceParams) -> dict:
         raise HTTPException(400, "GEMINI_API_KEY is not set (see .env at the repo root).")
 
     def _run() -> dict:
-        from utils.guidance import generate_seed
+        from geosam2.util.guidance import generate_seed
         kw = dict(size=params.resolution, mode=params.mode)
         if params.describe_model:
             kw["describe_model"] = params.describe_model
@@ -305,7 +309,7 @@ def start_segment(params: SegmentParams) -> dict:
             points = Path(params.points_path)
             if params.points_per_part > 1:
                 from PIL import Image
-                from utils.auto_prompt import prompts_from_color_map, write_prompts
+                from geosam2.util.auto_prompt import prompts_from_color_map, write_prompts
                 view_idx = params.seed_view
                 rgb = np.asarray(Image.open(data_root / f"mask_{view_idx:04d}.png").convert("RGB"))
                 points = work / f"points_k{params.points_per_part}.json"
@@ -367,7 +371,7 @@ SPLIT_FIELDS = ("color_quant_step", "palette_min_frac", "palette_max_colors",
 
 @app.get("/api/presets/split")
 def split_presets() -> dict:
-    from utils.split import split_presets
+    from geosam2.util.bake import split_presets
     return split_presets()
 
 
@@ -382,7 +386,7 @@ def start_bake(params: BakeParams) -> dict:
         raise HTTPException(400, f"labels not found: {params.labels_path} (re-run stage 4)")
 
     def _run() -> dict:
-        from utils.split import bake_labels_to_glb
+        from geosam2.util.bake import bake_labels_to_glb
         out = work / "segvigen"
         out.mkdir(parents=True, exist_ok=True)
         baked = out / f"baked_{params.texture_size}_{uuid.uuid4().hex[:6]}.glb"
@@ -407,7 +411,7 @@ def start_split(params: SplitParams) -> dict:
     def _run() -> dict:
         import trimesh
 
-        from utils.split import split_with_segvigen
+        from geosam2.util.bake import split_with_segvigen
         # One file per parameter set: a fixed name would make two runs
         # indistinguishable in the viewer and on disk.
         tag = uuid.uuid4().hex[:6]

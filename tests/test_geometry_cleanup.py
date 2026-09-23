@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from utils.inference_utils import clean_label_fragments
+from geosam2._lift import clean_label_fragments
 
 
 def _two_spheres(subdivisions=4):
@@ -50,7 +50,7 @@ def test_small_part_survives():
 def test_doubled_geometry():
     """Coincident triangles (generated soup) must not break the proximity
     graph: a doubled sphere is still one component."""
-    from utils.inference_utils import _proximity_components
+    from geosam2._lift import _proximity_components
     a = trimesh.creation.icosphere(subdivisions=4)
     mesh = trimesh.util.concatenate([a, a.copy()])
     comp = _proximity_components(mesh, np.ones(len(mesh.faces), np.int64))

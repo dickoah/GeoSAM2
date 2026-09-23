@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sam2.build_sam import build_sam2_video_predictor_geosam2
+from geosam2._model import build_sam2_video_predictor_geosam2
 
 
 def init_env() -> torch.device:
