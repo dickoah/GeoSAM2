@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from geosam2.util.bake import UNASSIGNED_RGB, _MIN_SEP, label_palette, to_linear_u8  # noqa: E402
+from geosam2.util.labels import UNASSIGNED_RGB, _MIN_SEP, label_palette, to_linear_u8  # noqa: E402
 
 
 def test_same_id_same_colour_across_label_sets():

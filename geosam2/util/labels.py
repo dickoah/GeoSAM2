@@ -1,19 +1,17 @@
-"""GeoSAM2 labels -> SegviGen's split.
+"""Per-face labels onto the input mesh: the palette, the baked texture, the parts.
 
-SegviGen's ``split_glb_by_texture_palette_rgb`` is the part of that project
-worth keeping: texel-owned palette, chart-scoped smoothing, graph-cut + band
-refine on real creases, then a per-label SDF cut in the UV atlas so boundaries
-stop following triangle edges. It reads a textured GLB. GeoSAM2 produces
-per-face labels. This module bakes those labels into a flat-colour texture on
-the mesh's own UVs and hands the result to the split, which lives here as
-``geosam2.util.split`` -- a copy geosam2 owns, no sibling checkout.
+The palette is keyed by label id and shared by every stage, so a part keeps
+its colour from the raw lift to the split. ``bake_labels_to_glb`` paints the
+labels into a flat-colour texture on the mesh's own UVs, which is what
+SegviGen's split (``geosam2.util.split``) reads. ``export_parts`` cuts the
+mesh into one geometry per label, in the input's own frame.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -21,9 +19,9 @@ import trimesh
 from PIL import Image
 
 from geosam2.util.logs import get_logger
-from geosam2.util.split import SPLIT_PRESETS, split_glb_by_texture_palette_rgb
+from geosam2.util.views import load_mesh
 
-logger = get_logger("geosam2.split")
+logger = get_logger("geosam2.labels")
 
 # THE palette: one colour per label id, the same at every stage (raw lift,
 # post-process, bake, split), so a part keeps its colour from one viewer entry
@@ -63,11 +61,6 @@ def _colour_sequence(n: int) -> list:
     return _sequence[:n]
 
 
-def split_presets() -> Dict[str, dict]:
-    """SegviGen's SPLIT_PRESETS, as the app lists them."""
-    return SPLIT_PRESETS
-
-
 def to_linear_u8(rgb) -> np.ndarray:
     """sRGB palette colour -> the linear value glTF stores in COLOR_0.
 
@@ -90,14 +83,14 @@ def label_palette(labels: np.ndarray) -> Dict[int, Tuple[int, int, int]]:
 
 
 def bake_labels_to_glb(mesh_path: str, face_labels: np.ndarray, out_glb: str,
-                       size: int = 2048) -> Dict[int, Tuple[int, int, int]]:
+                       size: int = 4096) -> Dict[int, Tuple[int, int, int]]:
     """Write ``mesh_path`` with a flat-colour texture carrying ``face_labels``.
 
     The mesh keeps its own UVs; each face's UV triangle is filled with its
-    label's colour. Loaded exactly as ``_build_scene`` loads it (force="mesh",
+    label's colour. Loaded with ``load_mesh``, as the labels were made (force="mesh",
     default processing) so the face order the labels index is the same.
     """
-    mesh = trimesh.load(mesh_path, force="mesh")
+    mesh = load_mesh(mesh_path)
     labels = np.asarray(face_labels).reshape(-1).astype(np.int64)
     if len(labels) != len(mesh.faces):
         raise ValueError(f"{len(labels)} labels for {len(mesh.faces)} faces")
@@ -131,18 +124,96 @@ def bake_labels_to_glb(mesh_path: str, face_labels: np.ndarray, out_glb: str,
     return palette
 
 
-def split_with_segvigen(baked_glb: str, out_glb: Optional[str] = None,
-                        **split_kwargs) -> str:
-    """SegviGen's split on a baked GLB. ``split_kwargs`` go straight through."""
-    kwargs = dict(output_mode="vertex_colors", debug_print=True)
-    kwargs.update(split_kwargs)
-    return split_glb_by_texture_palette_rgb(baked_glb, out_glb, **kwargs)
+# ── Parts ────────────────────────────────────────────────────────────────────
+
+# UNASSIGNED_LABELS: 999 is the value mask_aggregation initialises its label
+# volume with (_lift.py), so it survives on any face no mask ever covered --
+# the reference sample_00 run carries it on 0.7% of faces -- and counting it
+# as a part inflates every part count by one and paints a phantom region. 0 is
+# the background label the exporter paints black.
+_UNLABELED_RGBA = np.array([*UNASSIGNED_RGB, 255], dtype=np.uint8)
 
 
-def labels_to_parts(mesh_path: str, face_labels: np.ndarray, work_dir: str,
-                    **split_kwargs) -> str:
-    """The whole bridge: labels -> baked texture -> SegviGen split -> parts GLB."""
-    baked = os.path.join(work_dir, "baked.glb")
-    bake_labels_to_glb(mesh_path, face_labels, baked)
-    return split_with_segvigen(baked, os.path.join(work_dir, "segvigen_parts.glb"),
-                               **split_kwargs)
+def _rgb_to_hex(rgb) -> str:
+    return "#{:02X}{:02X}{:02X}".format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+
+def export_parts(
+    mesh_path: Union[str, Path], face_label: np.ndarray
+) -> Tuple[trimesh.Scene, Dict[str, Any]]:
+    """Paint per-face labels onto the original mesh, one geometry per part.
+
+    The GLB that the propagation exports is rebuilt in a rotated/translated/scaled
+    frame, so it cannot be shown next to the input. The label array, by contrast,
+    indexes the input mesh's faces directly -- so the source mesh is reloaded and
+    coloured instead, keeping both viewers aligned.
+
+    Returns the scene and its structure (``{"name", "children": [{"name",
+    "color", "faces"}]}``).
+    """
+    mesh_path = Path(mesh_path)
+    mesh = load_mesh(mesh_path)   # the loader the labels were made with
+    face_label = np.asarray(face_label).reshape(-1)
+
+    if len(face_label) != len(mesh.faces):
+        raise RuntimeError(
+            f"label/mesh mismatch: {len(face_label)} labels for {len(mesh.faces)} faces"
+        )
+
+    labels = np.unique(face_label)
+    part_labels = [int(v) for v in labels if int(v) not in UNASSIGNED_LABELS]
+    palette = label_palette(face_label)
+
+    scene = trimesh.Scene()
+    children: List[Dict[str, Any]] = []
+
+    # Parts are named by label id, not by rank: the raw lift and the
+    # post-process share ids, so "part_003" is the same part in both.
+    for label in part_labels:
+        part_mask = face_label == label
+        rgba = np.array([*palette[label], 255], dtype=np.uint8)
+        name = f"part_{label:03d}"
+        _add_part(scene, mesh, part_mask, rgba, name)
+        children.append({"name": name, "color": _rgb_to_hex(rgba), "faces": int(part_mask.sum())})
+
+    # Every unassigned label collapses into one grey region: they all mean
+    # the same thing, and how much of the mesh lands here is the signal --
+    # a prompt set that misses whole areas shows up as this growing.
+    unassigned = np.isin(face_label, UNASSIGNED_LABELS)
+    unlabeled_faces = int(unassigned.sum())
+    logger.info("[lift] %d parts over %d faces, %d unassigned (%.1f%%)",
+                len(part_labels), len(mesh.faces), unlabeled_faces,
+                100.0 * unlabeled_faces / max(len(mesh.faces), 1))
+    if not part_labels:
+        logger.warning("[lift] no part survived -- the seed prompt reached no face.")
+    if unlabeled_faces:
+        _add_part(scene, mesh, unassigned, _UNLABELED_RGBA, "unassigned")
+        children.append({
+            "name": "unassigned",
+            "color": _rgb_to_hex(_UNLABELED_RGBA),
+            "faces": unlabeled_faces,
+        })
+
+    structure = {"name": mesh_path.stem, "children": children}
+    return scene, structure
+
+
+def _add_part(
+    scene: trimesh.Scene,
+    mesh: trimesh.Trimesh,
+    mask: np.ndarray,
+    rgba: np.ndarray,
+    name: str,
+) -> None:
+    part = mesh.submesh([mask], append=True)
+    # Replace the visual rather than assigning to visual.vertex_colors: a
+    # textured source mesh yields TextureVisuals, which has no vertex_colors
+    # setter, so the assignment would be a silent no-op and the part would
+    # keep the original texture instead of its part colour. COLOR_0 is
+    # linear in glTF: encode, or the part renders lighter than its texture.
+    rgba = np.array([*to_linear_u8(rgba[:3]), 255], dtype=np.uint8)
+    part.visual = trimesh.visual.ColorVisuals(
+        mesh=part, vertex_colors=np.tile(rgba, (len(part.vertices), 1))
+    )
+    part.metadata["name"] = name
+    scene.add_geometry(part, node_name=name, geom_name=name)

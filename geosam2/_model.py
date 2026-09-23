@@ -1,10 +1,10 @@
 """The GeoSAM2 model, built in Python.
 
-This replaces Hydra's ``instantiate`` over ``configs/geosam2.yaml``: the same
-classes with the same arguments, in the same order, so the module tree and the
-parameter names are what the checkpoint expects. ``build_sam2`` and
-``build_sam2_video_predictor_geosam2`` keep their old names and signatures;
-``config_file`` is accepted and ignored.
+This replaces Hydra's ``instantiate`` over VAST's ``configs/geosam2.yaml``: the
+same classes with the same arguments, in the same order, so the module tree
+and the parameter names are what the checkpoint expects -- ``strict=True``
+below is what guarantees it. Both builders return the model on the CPU, in
+eval mode; the segmenter moves it to the GPU for a call.
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ from geosam2.sam2.modeling.sam.transformer import RoPEAttention
 from geosam2.sam2.modeling.sam2_base_geosam2 import SAM2Base
 from geosam2.sam2.sam2_video_predictor_geosam2 import SAM2VideoPredictor
 
-# What build_sam2 / the video predictor used to add as Hydra overrides when
-# apply_postprocessing was on.
+# What VAST's build added as Hydra overrides for the video predictor.
 _DECODER_POSTPROCESSING = dict(
     dynamic_multimask_via_stability=True,
     dynamic_multimask_stability_delta=0.05,
@@ -127,43 +126,24 @@ _BASE_ARGS = dict(
 )
 
 
-def build_sam2(config_file=None, ckpt_path=None, device="cuda", mode="eval",
-               apply_postprocessing=True, **kwargs):
-    """The image-level model (the automatic mask generator's)."""
-    extra = dict(sam_mask_decoder_extra_args=dict(_DECODER_POSTPROCESSING)) if apply_postprocessing else {}
-    model = SAM2Base(**_components(), **_BASE_ARGS, **extra)
-    return _finish(model, ckpt_path, device, mode)
+def image_model(checkpoint: str) -> SAM2Base:
+    """The image-level model the automatic mask generator drives (no decoder post-processing)."""
+    return _load(SAM2Base(**_components(), **_BASE_ARGS), checkpoint)
 
 
-def build_sam2_video_predictor_geosam2(config_file=None, ckpt_path=None, device="cuda",
-                                       mode="eval", apply_postprocessing=True, **kwargs):
-    """The video predictor used for the multi-view propagation."""
-    extra = {}
-    if apply_postprocessing:
-        extra = dict(
-            sam_mask_decoder_extra_args=dict(_DECODER_POSTPROCESSING),
-            binarize_mask_from_pts_for_mem_enc=True,
-            fill_hole_area=8,
-        )
-    model = SAM2VideoPredictor(**_components(), **_BASE_ARGS, **extra)
-    return _finish(model, ckpt_path, device, mode)
+def video_predictor(checkpoint: str) -> SAM2VideoPredictor:
+    """The video predictor the multi-view propagation runs on."""
+    model = SAM2VideoPredictor(
+        **_components(), **_BASE_ARGS,
+        sam_mask_decoder_extra_args=dict(_DECODER_POSTPROCESSING),
+        binarize_mask_from_pts_for_mem_enc=True,
+        fill_hole_area=8,
+    )
+    return _load(model, checkpoint)
 
 
-def _finish(model, ckpt_path, device, mode):
-    _load_checkpoint(model, ckpt_path)
-    model = model.to(device)
-    if mode == "eval":
-        model.eval()
-    return model
-
-
-def _load_checkpoint(model, ckpt_path):
-    if ckpt_path is None:
-        return
-    sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
-    missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
-    if missing_keys:
-        logging.warning("Missing keys when loading checkpoint: %s", missing_keys)
-    if unexpected_keys:
-        logging.warning("Unexpected keys when loading checkpoint: %s", unexpected_keys)
-    logging.info("Loaded checkpoint from %s", ckpt_path)
+def _load(model, checkpoint: str):
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)["model"]
+    model.load_state_dict(state, strict=True)
+    logging.info("Loaded checkpoint from %s", checkpoint)
+    return model.eval()

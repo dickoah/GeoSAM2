@@ -1,12 +1,16 @@
-import matplotlib.pyplot as plt
+"""From masks on the views to labels on the faces, and the two post-processes.
+
+VAST's ``inference_utils``, kept to what the propagation calls: the mask
+filters between propagations, the lift (``lift_2dmask_3d``), the completion
+of labels over the mesh (``complete_labels``) and the fragment cleanup
+(``clean_label_fragments``).
+"""
+
 import numpy as np
-import os
 import torch
 import math
 import torch.nn.functional as F
-import trimesh
 from collections import defaultdict, Counter
-from typing import Dict, List, Tuple
 import cv2
 from geosam2.sam2.utils.amg import calculate_stability_score
 from scipy.sparse import coo_matrix
@@ -15,60 +19,8 @@ from scipy.spatial import cKDTree
 from geosam2.util.logs import get_logger
 from geosam2.ext.mode_ext import mode_except_negative_one
 
-logger = get_logger("geosam2.inference_utils")
+logger = get_logger("geosam2.lift")
 
-
-def get_ray_directions(W, H, fx, fy, cx, cy, use_pixel_centers=True):
-    """Build per-pixel camera rays in camera space.
-
-    Args:
-        W: Image width in pixels.
-        H: Image height in pixels.
-        fx: Focal length along x axis.
-        fy: Focal length along y axis.
-        cx: Principal point x coordinate.
-        cy: Principal point y coordinate.
-        use_pixel_centers: Whether to offset samples by 0.5 pixel.
-    """
-    pixel_center = 0.5 if use_pixel_centers else 0
-    i, j = np.meshgrid(
-        np.arange(W, dtype=np.float32) + pixel_center,
-        np.arange(H, dtype=np.float32) + pixel_center,
-        indexing="xy",
-    )
-    directions = np.stack(
-        [(i - cx) / fx, -(j - cy) / fy, -np.ones_like(i)], -1
-    ) 
-
-    return directions
-
-def gen_pcd(depth, c2w_opengl, camera_angle_x):
-    """Convert a depth map into a clipped world-space position map.
-
-    Args:
-        depth: Depth image with shape [H, W].
-        c2w_opengl: Camera-to-world matrix in OpenGL convention.
-        camera_angle_x: Horizontal field-of-view in radians.
-    """
-    h, w = depth.shape
-    
-    depth_valid = depth < 65500.0
-    focal = 0.5 * w / math.tan(0.5 * camera_angle_x)
-    ray_directions = get_ray_directions(w, h, focal, focal, w // 2, h // 2)
-
-    org_points = np.zeros((h, w, 3))
-
-    points_c = ray_directions[depth_valid] * depth[depth_valid, None]
-    points_c_homo = np.concatenate(
-        [points_c, np.ones_like(points_c[..., :1])], axis=-1
-    )
-    valid_points = (points_c_homo @ c2w_opengl.T)[..., :3]
-
-    valid_points = np.clip(valid_points, -1.0, 1.0)
-
-    org_points[depth_valid] = valid_points
-
-    return org_points
 
 def compute_iou(pred, gt):
     """Compute IoU percentage between two boolean masks.
@@ -84,51 +36,13 @@ def compute_iou(pred, gt):
     else:
         return 0
 
-def eval_per_shape_part_mean_iou(
-    pred_ins: np.ndarray,
-    gt_ins: dict,
-    ) -> float:
-    """Compute mean best-IoU score per GT part for one shape.
+
+def filter_masks(anns):
+    """The automatic masks worth keeping: deduplicated by IoU, largest first.
 
     Args:
-        pred_ins: Predicted instance list/array with `segmentation` fields.
-        gt_ins: Mapping from part id to GT binary mask.
-    """
-
-    ious = []
-    for key, gt_mask in gt_ins.items():
-        best_iou = 0
-        for mask_ in pred_ins:
-            pred_mask = mask_['segmentation']
-            iou = compute_iou(pred_mask, gt_mask)
-            if iou > best_iou:
-                best_iou = iou
-            ious.append(best_iou)
-    return np.mean(ious)
-
-def compute_intersect_mask1(mask1, mask2):
-    """Compute intersection ratio relative to mask1 area in percent.
-
-    Args:
-        mask1: Reference mask.
-        mask2: Target mask to intersect with.
-    """
-    intersection = np.logical_and(mask1, mask2).sum()
-    mask1_ = mask1.sum()
-    if mask1_ != 0:
-        return (intersection / mask1_) * 100  
-    else:
-        return 0
-
-def show_anns(anns, save_path=None, borders=True):
-    """Filter overlapping auto-generated masks and optionally render an overlay.
-
-    Args:
-        anns: List of SAM mask annotations (each with ``segmentation``,
-            ``predicted_iou`` and ``area`` keys).
-        save_path: Optional path to write the overlay image to. When ``None``
-            no image is rendered and the function only returns the filtered list.
-        borders: Whether to draw contour borders for each mask in the overlay.
+        anns: SAM mask annotations (each with ``segmentation``, ``predicted_iou``
+            and ``area`` keys).
     """
     if len(anns) == 0:
         return []
@@ -146,49 +60,8 @@ def show_anns(anns, save_path=None, borders=True):
         if accept:
             mask_accept_list.append(ann)
 
-    sorted_anns = sorted(mask_accept_list, key=(lambda x: x['area']), reverse=True)
+    return sorted(mask_accept_list, key=(lambda x: x['area']), reverse=True)
 
-    if save_path is not None:
-        ax = plt.gca()
-        ax.set_autoscale_on(True)
-
-        h, w = sorted_anns[0]['segmentation'].shape
-        img = np.ones((h, w, 4))
-        img[:, :, 3] = 0
-        for ann in sorted_anns:
-            m = ann['segmentation']
-            color_mask = np.concatenate([np.random.random(3), [0.9]])
-            img[m] = color_mask
-            if borders:
-                contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                contours = [cv2.approxPolyDP(contour, epsilon=0.01, closed=True) for contour in contours]
-                cv2.drawContours(img, contours, -1, (0, 0, 1, 0.4), thickness=1)
-
-        ax.imshow(img)
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(save_path)
-        plt.close()
-
-    return sorted_anns
-
-def show_mask(mask, ax, obj_id=None, random_color=False):
-    """Overlay one mask on a matplotlib axis.
-
-    Args:
-        mask: Binary mask with shape [H, W] (or equivalent squeezable shape).
-        ax: Target matplotlib axis.
-        obj_id: Optional object id used to pick a stable color.
-        random_color: Whether to sample a random RGBA color.
-    """
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.9])], axis=0)
-    else:
-        cmap = plt.get_cmap("tab10")
-        cmap_idx = 0 if obj_id is None else obj_id
-        color = np.array([*cmap(cmap_idx)[:3], 0.9])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
 
 def filter_mask_area(video_segments, track_id, alpha=5):
     """Drop objects whose non-track-view area is too large.
@@ -351,16 +224,6 @@ def transform_points_homo(pos: torch.FloatTensor, mtx: torch.FloatTensor):
     pos = (pos_homo[None,:,None] * mtx.unsqueeze(1)).sum(-1)[...,:3]
     return pos
 
-def norms_mask(norms, cam2world, threshold=0.0):
-    """Compute a visibility mask by normal-camera facing direction.
-
-    Args:
-        norms: Normal vectors per pixel/point.
-        cam2world: Camera-to-world matrix.
-        threshold: Cosine threshold for facing criterion.
-    """
-    lookat = cam2world[:3, :3] @ np.array([0, 0, -1])
-    return np.abs(np.dot(norms, lookat)) > threshold
 
 def cal_link(imgs_mask, depth_images, c2ws, fovy_deg, coord):
     """Link sampled 3D points to per-view image pixels and visibility.
@@ -441,114 +304,40 @@ def mask_aggregation(video_segments, prior_keys=None):
         
     return all_masks
 
-def find_most_frequent(tensor):
-    """Return mode per row, with fallback when all values are -1.
 
-    Args:
-        tensor: Tensor with shape [N, K] storing candidate labels.
-    """
-    values, _ = torch.mode(tensor, dim=1)
-
-    all_neg_one = (tensor == -1).all(dim=1)
-    mask = (values == -1) & (~all_neg_one)
-
-    if mask.any():
-        tensor_masked = tensor.masked_fill(tensor == -1, float('nan'))
-
-        second_values, _ = torch.mode(tensor_masked, dim=1)
-
-        values[mask] = second_values[mask]
-    
-    return values
-
-def lift_2dmask_3d(imgs_mask, depth_imgs, norm_maps, c2ws, fovy_deg, coord, selected_frames, video_segments, mesh, sample_num_per_face, view_id, uuid, ckpt_name=None, face_label=None, prior_keys=None, export_mesh=True, export_root="outputs", to_source_frame=None):
+def lift_2dmask_3d(imgs_mask, depth_imgs, c2ws, fovy_deg, coord, selected_frames,
+                   video_segments, sample_num_per_face, prior_keys=None):
     """Lift 2D segmentation masks to per-face 3D labels.
 
     Args:
         imgs_mask: RGBA validity mask tensor for all views.
         depth_imgs: Depth maps for all views.
-        norm_maps: Normal maps for all views (reserved, currently unused).
         c2ws: Camera-to-world matrices.
         fovy_deg: Vertical FOV in degrees.
-        coord: Sampled 3D points used for lifting.
+        coord: Sampled 3D points used for lifting, ``sample_num_per_face`` per face.
         selected_frames: View indices used in current lifting pass.
         video_segments: Dict[frame_idx, Dict[obj_id, bool_mask]].
-        mesh: Trimesh mesh whose faces are labeled.
         sample_num_per_face: Number of points sampled per face.
-        view_id: Export file stem.
-        uuid: Object identifier used in export path naming.
-        ckpt_name: Optional run tag; when set it adds an extra export folder level.
-        face_label: Optional precomputed face labels for postprocess overwrite.
         prior_keys: Optional object ids with prompt-priority in aggregation.
-        export_mesh: Whether to export `.glb` and `.npy` files.
-        to_source_frame: Matrix putting the export back in the input mesh's frame.
-        export_root: Output root directory for mesh export.
     """
-    if face_label is None:
-        all_masks = mask_aggregation(video_segments,prior_keys=prior_keys)
-        link = torch.ones([coord.shape[0], 3, len(selected_frames)], dtype=torch.int)
-        link[:, 0:3, :] = cal_link(imgs_mask, depth_imgs, c2ws, fovy_deg, coord).permute(1,2,0)
-        grid_normalized = (link[:,:-1,:].permute(2,0,1).unsqueeze(-2).to(torch.float32) / (1024 - 1)) * 2 - 1
-        pc_labels = F.grid_sample(
-            torch.from_numpy(all_masks),
-            grid_normalized,
-            mode="nearest"
-        ).squeeze(1)
-        link_ = link.permute(2,0,1)[:,:,-1:].to(torch.bool)
-        pc_labels[~link_] = 0
+    all_masks = mask_aggregation(video_segments,prior_keys=prior_keys)
+    link = torch.ones([coord.shape[0], 3, len(selected_frames)], dtype=torch.int)
+    link[:, 0:3, :] = cal_link(imgs_mask, depth_imgs, c2ws, fovy_deg, coord).permute(1,2,0)
+    grid_normalized = (link[:,:-1,:].permute(2,0,1).unsqueeze(-2).to(torch.float32) / (1024 - 1)) * 2 - 1
+    pc_labels = F.grid_sample(
+        torch.from_numpy(all_masks),
+        grid_normalized,
+        mode="nearest"
+    ).squeeze(1)
+    link_ = link.permute(2,0,1)[:,:,-1:].to(torch.bool)
+    pc_labels[~link_] = 0
 
-        pc_labels = pc_labels.squeeze().permute(1,0)
-        pc_label = mode_except_negative_one(pc_labels.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
+    pc_labels = pc_labels.squeeze().permute(1,0)
+    pc_label = mode_except_negative_one(pc_labels.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
 
-        pc_label = pc_label.reshape(-1, sample_num_per_face)
-        face_label = mode_except_negative_one(pc_label.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
+    pc_label = pc_label.reshape(-1, sample_num_per_face)
+    return mode_except_negative_one(pc_label.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
 
-    # The one palette every stage uses (utils.split), keyed by label id: this
-    # GLB, the post-processed one, the app's own and the baked texture all
-    # paint a part the same colour.
-    from geosam2.util.bake import label_palette, to_linear_u8   # split imports nothing from here
-    colors = np.ones((len(mesh.vertices), 3)) * 255
-    color_map = {i: to_linear_u8(c).astype(np.float64)   # COLOR_0 is linear in glTF
-                 for i, c in label_palette(face_label).items()}
-    for obj_id in np.unique(face_label):
-        colors[mesh.faces[face_label==obj_id].flatten()] = color_map[int(obj_id)][None,:]
-
-    mesh_ = mesh
-    fill_rgb = np.full((colors.shape[0], 1), 255, dtype=np.uint8)
-    colors = np.hstack((colors, fill_rgb))
-    mesh_.visual.vertex_colors = np.uint8(colors)
-    if export_mesh:
-        export_dir = export_root
-        if ckpt_name:
-            export_dir = os.path.join(export_root, ckpt_name, uuid)
-        os.makedirs(export_dir, exist_ok=True)
-        glb_path = os.path.join(export_dir, f"{view_id}.glb")
-        np.save(glb_path.replace(".glb",".npy"), face_label.cpu().numpy())
-        if to_source_frame is not None:
-            # Back to the input mesh's frame -- see export_labelled_mesh.
-            mesh_ = mesh_.copy()
-            mesh_.apply_transform(to_source_frame)
-        mesh_.export(glb_path)
-        print(f"Exported labelled mesh to {glb_path}")
-    return face_label
-
-def load_mesh_with_faces(mesh_path):
-    """Load mesh and rebuild a face-index-friendly trimesh object.
-
-    Args:
-        mesh_path: Input mesh file path.
-    """
-    mesh = trimesh.load(mesh_path,force="mesh",processed=False)
-
-    mesh_vanilla = mesh
-    vertices = mesh.vertices  # Array of vertex coordinates
-    faces = mesh.faces        # Array of face indices (each row contains 3 vertex indices)
-    vertices = vertices[faces].reshape(-1, 3)
-
-    faces = np.arange(len(faces) * 3).reshape(-1, 3)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-
-    return mesh, mesh_vanilla
 
 def sample_points_on_faces_parallel(face_to_vertex, num_points=3, use_vertex=False):
     """Sample points on each mesh face using barycentric coordinates.
@@ -582,33 +371,6 @@ def sample_points_on_faces_parallel(face_to_vertex, num_points=3, use_vertex=Fal
         sampled_points = np.concatenate([sampled_points,face_to_vertex],axis=-2)
     return sampled_points
 
-def trimesh_to_blender(mesh):
-    """Convert trimesh axis convention to Blender convention.
-
-    Args:
-        mesh: Trimesh object to be transformed in place.
-    """
-    rotation_matrix = np.array([
-        [1, 0, 0, 0],
-        [0, 0,-1, 0],
-        [0, 1, 0, 0],
-        [0, 0, 0, 1]])
-    mesh.apply_transform(rotation_matrix)
-    return mesh
-
-def blender_to_trimesh(mesh):
-    """Convert Blender axis convention back to trimesh convention.
-
-    Args:
-        mesh: Trimesh object to be transformed in place.
-    """
-    rotation_matrix = np.array([
-        [1, 0, 0, 0],
-        [0, 0, 1, 0],
-        [0,-1, 0, 0],
-        [0, 0, 0, 1]])
-    mesh.apply_transform(rotation_matrix)
-    return mesh
 
 def complete_labels(face_labels, mesh, PA=0.025, smooth_type="knn"):
     """Remove tiny components and fill unlabeled faces.
@@ -817,38 +579,6 @@ def _to_np_int(x) -> np.ndarray:
     if hasattr(x, "cpu"):
         x = x.cpu().numpy()
     return np.asarray(x).astype(np.int64)
-
-
-def export_labelled_mesh(mesh_exploded, face_labels, glb_path,
-                         to_source_frame=None):
-    """Write a per-face-labelled mesh to ``glb_path`` (+ a sibling ``.npy``).
-
-    Colours come from the one palette every stage uses (utils.split), keyed by
-    label id, so this GLB, the app's own and the baked texture paint a part the
-    same. Colours the exploded ``mesh`` (unique verts per face) so labels don't
-    bleed at shared vertices.
-    """
-    from geosam2.util.bake import label_palette, to_linear_u8   # split imports nothing from here
-    lab = _to_np_int(face_labels)
-    ids = np.unique(lab)
-    cmap = {i: to_linear_u8(c).astype(np.float64)   # COLOR_0 is linear in glTF
-            for i, c in label_palette(lab).items()}
-    colors = np.ones((len(mesh_exploded.vertices), 3)) * 255
-    for i in ids:
-        colors[mesh_exploded.faces[lab == i].flatten()] = cmap[int(i)][None, :]
-    m = mesh_exploded.copy()
-    if to_source_frame is not None:
-        # Back to the input mesh's own frame. The pipeline works on a mesh
-        # prepare_mesh_and_point_cloud rotated Z-up -> Y-up, translated and
-        # scaled to match the cameras; exporting that as-is hands the caller a
-        # result that does not sit on its own input (bbox Y and Z swapped).
-        m.apply_transform(to_source_frame)
-    colors = np.hstack((colors, np.full((colors.shape[0], 1), 255, dtype=np.uint8)))
-    m.visual.vertex_colors = np.uint8(colors)
-    os.makedirs(os.path.dirname(glb_path) or ".", exist_ok=True)
-    np.save(glb_path.replace(".glb", ".npy"), lab)
-    m.export(glb_path)
-    print(f"Exported labelled mesh to {glb_path}")
 
 
 # Fragment cleanup thresholds, measured on furniture assets in the PixMesh

@@ -1,6 +1,6 @@
 """Rasterise the twelve canonical views GeoSAM2 consumes, without Blender.
 
-    from geosam2.util.render import render_views
+    from geosam2.util.views import render_views
     render_views("mesh.glb", "views/")   # 12 views + meta.json + mesh.glb
 
 Replaces VAST's Blender script (``geosam2_render.py``, kept in git history at b5de23c). The network never sees a shaded
@@ -32,13 +32,13 @@ Output contract
 Three details are load-bearing, each learned by getting it wrong first:
 
 * **Depth is z-depth, not radial distance.** ``get_ray_directions``
-  (``utils/inference_utils.py:14``) returns *unnormalised* rays with ``z = -1``,
+  (``get_ray_directions`` below) returns *unnormalised* rays with ``z = -1``,
   so ``direction * depth`` only lands on the surface if depth measures along the
   camera axis. pyrender's depth buffer already is exactly this.
 * **The EXR needs three channels.** Every consumer indexes ``depth[..., 0]``,
   which silently degenerates to a 1-D array on a single-channel file rather than
   failing loudly.
-* **``mesh.glb`` is copied, never re-exported.** inference.py reloads it and
+* **``mesh.glb`` is copied, never re-exported.** ``read_views`` reloads it and
   indexes the label array by its face order; a re-export that welds or reorders
   faces would misalign every label without erroring.
 
@@ -52,9 +52,9 @@ Validation
 Correctness is checked, not asserted. The bundled ``example/sample_*`` roots are
 ground truth -- the data the model demonstrably works on::
 
-    python -m utils.render example/sample_00
-    python -m utils.render example/sample_00 --images example/render_comparison
-    python -m utils.render example/sample_00 --against /path/to/blender_render
+    python -m tests.views_check example/sample_00
+    python -m tests.views_check example/sample_00 --images example/render_comparison
+    python -m tests.views_check example/sample_00 --against /path/to/blender_render
 
 The ``--images`` sheets show each channel side by side plus an error heatmap,
 compositing onto white the way the loader does -- comparing raw RGB would diff
@@ -94,12 +94,9 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 # OpenEXR is an opt-in codec in OpenCV and the depth maps are EXR.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
-import argparse
 import json
 import math
 import shutil
-import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -107,6 +104,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 import pyrender
+import torch
 import trimesh
 from PIL import Image, ImageEnhance
 
@@ -151,7 +149,7 @@ def camera_angle_x() -> float:
 
 
 def focal_length(width_px: int) -> float:
-    """Focal length in pixels, matching ``utils/inference_utils.get_ray_directions``."""
+    """Focal length in pixels, matching ``get_ray_directions``."""
     return 0.5 * width_px / math.tan(0.5 * camera_angle_x())
 
 
@@ -215,7 +213,7 @@ def build_meta(
     """The ``meta.json`` payload.
 
     Only ``camera_angle_x``, ``transforms``, ``scaling_factor`` and
-    ``translation`` are read downstream (inference.py:371-447); the rest is
+    ``translation`` are read downstream (``read_views``); the rest is
     recorded because the reference files carry it and it costs nothing.
     """
     return {
@@ -234,13 +232,14 @@ def build_meta(
 # Rasterisation
 # ---------------------------------------------------------------------------
 
-# What inference.py treats as "no geometry here" (utils/inference_utils.py:48).
+# What ``gen_pcd`` treats as "no geometry here".
 INVALID_DEPTH = 65504.0
 
 RESOLUTION = 1024
 
 # glTF is Y-up, Blender is Z-up, and the reference renders were made in Z-up.
-# inference.py:472 applies this same rotation to mesh.glb before lifting, so the
+# _propagation.prepare_mesh_and_point_cloud applies this same rotation to mesh.glb
+# before lifting, so the
 # render must live in the rotated frame or the two disagree.
 _Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=float)
 
@@ -305,7 +304,7 @@ def normalize(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, float, np.ndarray
     """Rotate into Z-up and fit the mesh into a unit box centred on the origin.
 
     Returns ``(mesh, scaling_factor, translation, bbox_size)`` where the two
-    scalars are what ``meta.json`` must carry: inference.py:472-480 rebuilds this
+    scalars are what ``meta.json`` must carry: ``prepare_mesh_and_point_cloud`` rebuilds this
     exact mesh as ``(raw_rotated + translation) * scaling_factor``, so they are
     defined to satisfy *that* formula rather than to mirror how Blender happened
     to compose its own transform.
@@ -436,10 +435,10 @@ def render_views(
 
     Writes ``color_XXXX.webp``, ``depth_XXXX.exr``, ``normal_XXXX.webp`` for the
     twelve views, plus ``meta.json`` and a copy of the source mesh as
-    ``mesh.glb`` (inference.py:434 hard-codes that name).
+    ``mesh.glb`` (``read_views`` hard-codes that name).
 
     ``resolution`` is a knob for testing only. GeoSAM2 hard-codes 1024 in its
-    lifting maths (``utils/inference_utils.py:409,483``), so anything else
+    lifting maths (``_lift.cal_link``, ``_lift.lift_2dmask_3d``), so anything else
     produces a silently wrong 3D result -- callers should leave it alone.
     """
     output_dir = Path(output_dir)
@@ -528,7 +527,7 @@ def _write_view(
     # pyrender leaves misses at 0.0; GeoSAM2 reads "no geometry" as >= 65500.
     depth_out = np.where(hit, depth, INVALID_DEPTH).astype(np.float32)
     # Three channels, not one: every consumer indexes `depth[..., 0]`
-    # (sam2/utils/misc.py:509, inference.py:393), which silently degenerates to a
+    # (``load_video_frame_geosam2``, ``read_views``), which silently degenerates to a
     # 1-D array on a single-channel EXR instead of failing loudly.
     cv2.imwrite(str(output_dir / f"depth_{view:04d}.exr"), np.repeat(depth_out[..., None], 3, axis=2))
 
@@ -537,7 +536,7 @@ def _write_view(
     normal[..., 3] = np.where(hit, 255, 0)
     Image.fromarray(normal, mode="RGBA").save(output_dir / f"normal_{view:04d}.webp", lossless=True)
 
-    # inference.py:385 reads only this file's alpha, as the visibility mask. The
+    # ``read_views`` reads only this file's alpha, as the visibility mask. The
     # RGB is the lit render: free to the model, and the only human- (or VLM-)
     # readable view of the object in the directory.
     #
@@ -552,7 +551,7 @@ def _write_view(
 def _write_mesh(source, loaded: trimesh.Trimesh, destination: Path) -> None:
     """Copy the source GLB verbatim when we have one, else export what we loaded.
 
-    Copying beats re-exporting: inference.py reloads this file and indexes the
+    Copying beats re-exporting: ``read_views`` reloads this file and indexes the
     label array by its face order, so a re-export that reorders or welds faces
     would silently misalign every label.
     """
@@ -563,248 +562,304 @@ def _write_mesh(source, loaded: trimesh.Trimesh, destination: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Validation -- see the module docstring; run with `python -m utils.render`
+# Reading a view directory back
 # ---------------------------------------------------------------------------
 
-# The lifting step calls a sample point visible when its reprojected depth lands
-# within 1e-3 of the depth map (utils/inference_utils.py:394), in a space
-# normalised to [-1, 1]. A depth error at that scale starts silently dropping
-# points, so it is the tolerance that matters -- not an arbitrary epsilon.
-DEPTH_TOLERANCE = 1e-3
+MASK_MIN_AREA_PX = 64
+MASK_COLOR_QUANT_STEP = 8
 
-# The noise floor of comparing two independent rasterisations of a dense mesh
-# through an 8-bit encoding, not a quality target. Two irreducible terms:
-# quantising a unit normal to 8 bits per channel costs ~0.45 degrees, and this
-# class of mesh projects several triangles into one pixel (sample_00: 407k faces
-# into ~200k covered pixels, median dihedral 3.9 degrees), so which triangle a
-# pixel reports is a coin toss worth a degree or two.
-#
-# Measured on sample_00: flat normals land at 1.05 degrees, smooth at 2.06. The
-# threshold sits between them deliberately -- it still catches the flat/smooth
-# mix-up, which is a real error and the one this check exists to find.
-NORMAL_TOLERANCE_DEG = 2.0
+
+def is_view_directory(path: Path) -> bool:
+    """Whether ``path`` holds a complete set of GeoSAM2 input views."""
+    if not path.is_dir():
+        return False
+    if not (path / "meta.json").is_file() or not (path / "mesh.glb").is_file():
+        return False
+    for prefix, suffix in (("color", "webp"), ("depth", "exr"), ("normal", "webp")):
+        for view in range(NUM_VIEWS):
+            if not (path / f"{prefix}_{view:04d}.{suffix}").is_file():
+                return False
+    return True
+
+
+def load_mesh(path: Union[str, Path]) -> trimesh.Trimesh:
+    """``mesh.glb`` as one mesh, in the face order the labels refer to."""
+    return trimesh.load(str(path), force="mesh")
+
+
+def explode_faces(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """The same faces with their own vertices: face ``i`` owns vertices ``3i..3i+2``.
+
+    The lift samples points per face and votes per face; unshared vertices
+    make that indexing trivial. Unprocessed, so nothing is merged back.
+    """
+    vertices = mesh.vertices[mesh.faces].reshape(-1, 3)
+    faces = np.arange(len(mesh.faces) * 3).reshape(-1, 3)
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def get_ray_directions(W, H, fx, fy, cx, cy, use_pixel_centers=True):
+    """Build per-pixel camera rays in camera space.
+
+    Args:
+        W: Image width in pixels.
+        H: Image height in pixels.
+        fx: Focal length along x axis.
+        fy: Focal length along y axis.
+        cx: Principal point x coordinate.
+        cy: Principal point y coordinate.
+        use_pixel_centers: Whether to offset samples by 0.5 pixel.
+    """
+    pixel_center = 0.5 if use_pixel_centers else 0
+    i, j = np.meshgrid(
+        np.arange(W, dtype=np.float32) + pixel_center,
+        np.arange(H, dtype=np.float32) + pixel_center,
+        indexing="xy",
+    )
+    directions = np.stack(
+        [(i - cx) / fx, -(j - cy) / fy, -np.ones_like(i)], -1
+    ) 
+
+    return directions
+
+
+def gen_pcd(depth, c2w_opengl, camera_angle_x):
+    """Convert a depth map into a clipped world-space position map.
+
+    Args:
+        depth: Depth image with shape [H, W].
+        c2w_opengl: Camera-to-world matrix in OpenGL convention.
+        camera_angle_x: Horizontal field-of-view in radians.
+    """
+    h, w = depth.shape
+    
+    depth_valid = depth < 65500.0
+    focal = 0.5 * w / math.tan(0.5 * camera_angle_x)
+    ray_directions = get_ray_directions(w, h, focal, focal, w // 2, h // 2)
+
+    org_points = np.zeros((h, w, 3))
+
+    points_c = ray_directions[depth_valid] * depth[depth_valid, None]
+    points_c_homo = np.concatenate(
+        [points_c, np.ones_like(points_c[..., :1])], axis=-1
+    )
+    valid_points = (points_c_homo @ c2w_opengl.T)[..., :3]
+
+    valid_points = np.clip(valid_points, -1.0, 1.0)
+
+    org_points[depth_valid] = valid_points
+
+    return org_points
+
+
+def _encode_color(rgb: np.ndarray) -> int:
+    return (int(rgb[0]) << 16) + (int(rgb[1]) << 8) + int(rgb[2])
+
+
+def _quantize_rgb(rgb: np.ndarray, step: int) -> np.ndarray:
+    """Quantize RGB to reduce tiny color variation from anti-aliasing/compression."""
+    if step <= 1:
+        return rgb
+    q = (rgb // step) * step
+    return q.astype(np.uint8)
+
+
+def extract_mask_segments(mask_path: str) -> List[Tuple[Tuple[str, int], np.ndarray]]:
+    """Extract mask segments with stable keys from label maps or color previews."""
+    ext = os.path.splitext(mask_path)[1].lower()
+
+    if ext == ".exr":
+        raw = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise ValueError(f"Failed to read mask file: {mask_path}")
+        label_map = _to_int_label_map(raw[..., 0] if raw.ndim == 3 else raw)
+        unique_ids = np.unique(label_map)
+        unique_ids = unique_ids[unique_ids != 0]
+        segments: List[Tuple[Tuple[str, int], np.ndarray]] = []
+        for obj_id in unique_ids:
+            m = label_map == int(obj_id)
+            if int(m.sum()) < MASK_MIN_AREA_PX:
+                continue
+            segments.append((("id", int(obj_id)), m))
+        return segments
+    elif ext == ".npy":
+        label_map = _to_int_label_map(np.load(mask_path))
+        unique_ids = np.unique(label_map)
+        unique_ids = unique_ids[unique_ids != 0]
+        segments: List[Tuple[Tuple[str, int], np.ndarray]] = []
+        for obj_id in unique_ids:
+            m = label_map == int(obj_id)
+            if int(m.sum()) < MASK_MIN_AREA_PX:
+                continue
+            segments.append((("id", int(obj_id)), m))
+        return segments
+    elif ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
+        mask_image = np.array(Image.open(mask_path))
+
+        if mask_image.ndim == 2:
+            label_map = _to_int_label_map(mask_image)
+            unique_ids = np.unique(label_map)
+            unique_ids = unique_ids[unique_ids != 0]
+            segments: List[Tuple[Tuple[str, int], np.ndarray]] = []
+            for obj_id in unique_ids:
+                m = label_map == int(obj_id)
+                if int(m.sum()) < MASK_MIN_AREA_PX:
+                    continue
+                segments.append((("id", int(obj_id)), m))
+            return segments
+
+        if mask_image.ndim == 3 and mask_image.shape[2] >= 3:
+            rgb = mask_image[..., :3].astype(np.uint8)
+            # Treat transparent pixels as background.
+            if mask_image.shape[2] == 4:
+                rgb[mask_image[..., 3] == 0] = 0
+
+            # Reduce color noise from interpolation/compression.
+            rgb = _quantize_rgb(rgb, MASK_COLOR_QUANT_STEP)
+
+            # If RGB channels are identical, treat it as a numeric label map.
+            if np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 1], rgb[..., 2]):
+                label_map = _to_int_label_map(rgb[..., 0])
+                unique_ids = np.unique(label_map)
+                unique_ids = unique_ids[unique_ids != 0]
+                segments: List[Tuple[Tuple[str, int], np.ndarray]] = []
+                for obj_id in unique_ids:
+                    m = label_map == int(obj_id)
+                    if int(m.sum()) < MASK_MIN_AREA_PX:
+                        continue
+                    segments.append((("id", int(obj_id)), m))
+                return segments
+
+            flat_rgb = rgb.reshape(-1, 3)
+            unique_colors, counts = np.unique(flat_rgb, axis=0, return_counts=True)
+            segments: List[Tuple[Tuple[str, int], np.ndarray]] = []
+            if unique_colors.shape[0] == 0:
+                return segments
+
+            # Assume dominant color is background for color preview masks.
+            bg_color = unique_colors[int(np.argmax(counts))]
+            for color in unique_colors:
+                if np.array_equal(color, np.array([0, 0, 0], dtype=np.uint8)):
+                    continue
+                if np.array_equal(color, bg_color):
+                    continue
+                color_key = _encode_color(color)
+                color_mask = np.all(rgb == color, axis=-1)
+                if int(color_mask.sum()) < MASK_MIN_AREA_PX:
+                    continue
+                segments.append((("color", color_key), color_mask))
+            return segments
+
+        raise ValueError(f"Unsupported mask image shape: {mask_image.shape}")
+    else:
+        raise ValueError(
+            f"Unsupported mask format: {ext}. Supported: .exr, .npy, image formats"
+        )
+
+
+def add_mask_file_to_frame(
+    frame_segments: Dict[int, np.ndarray],
+    key_to_objid: Dict[Tuple[str, int], int],
+    mask_path: str,
+) -> Tuple[Dict[int, np.ndarray], Dict[Tuple[str, int], int]]:
+    """Add one mask file into a frame with stable ID mapping for repeated keys."""
+    segments = extract_mask_segments(mask_path)
+    segments = sorted(segments, key=lambda x: x[0])
+
+    next_obj_id = max(frame_segments.keys(), default=0) + 1
+    for seg_key, seg_mask in segments:
+        seg_mask = seg_mask.astype(bool)
+        if not seg_mask.any():
+            continue
+        if seg_key in key_to_objid:
+            obj_id = key_to_objid[seg_key]
+            if obj_id in frame_segments:
+                frame_segments[obj_id] = np.logical_or(frame_segments[obj_id], seg_mask)
+            else:
+                frame_segments[obj_id] = seg_mask
+            continue
+
+        while next_obj_id in frame_segments:
+            next_obj_id += 1
+        frame_segments[next_obj_id] = seg_mask
+        key_to_objid[seg_key] = next_obj_id
+        next_obj_id += 1
+
+    return frame_segments, key_to_objid
 
 
 @dataclass
-class Check:
-    name: str
-    passed: bool
-    detail: str
+class Views:
+    """A view directory, read: the 12 canonical renders and the seed on one of them."""
 
-    def __str__(self) -> str:
-        return f"  [{'PASS' if self.passed else 'FAIL'}] {self.name:22s} {self.detail}"
-
-
-def _load_depth(path: Path) -> np.ndarray:
-    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if depth is None:
-        raise RuntimeError(
-            f"cannot read {path} -- opencv-python 5.x ships without the OpenEXR codec"
-        )
-    return depth[..., 0] if depth.ndim == 3 else depth
-
-
-def _load_normal(path: Path) -> np.ndarray:
-    return np.asarray(Image.open(path).convert("RGBA"))
+    root: str
+    obj_name: str
+    images: List[np.ndarray]          # RGB, composited on white
+    img_masks: List[np.ndarray]       # HxWx1 bool: where the object is (alpha > 0)
+    depth_maps: List[np.ndarray]
+    pos_maps: List[torch.Tensor]      # 3xHxW world positions, from the depth
+    norm_maps: List[np.ndarray]       # RGB-encoded normals, composited on white
+    c2ws: List[torch.Tensor]
+    fovy_deg: float
+    scaling_factor: float
+    translation: np.ndarray           # float32, as meta.json's, the way the lift applies it
+    mesh: trimesh.Trimesh             # faces exploded, see explode_faces
+    mesh_vanilla: trimesh.Trimesh     # as loaded: the labels index its faces
+    seed_view: int
+    seed_masks: Dict[int, np.ndarray]  # object id -> bool mask on seed_view
 
 
-def _decode_normals(rgba: np.ndarray) -> np.ndarray:
-    n = rgba[..., :3].astype(np.float64) / 255.0 * 2.0 - 1.0
-    return n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-9)
+def read_views(data_root: str, mask_path: str, mask_view: int) -> Views:
+    """Read a view directory and the seed mask drawn on one of its views.
 
-
-def compare_views(reference: Path, candidate: Path) -> List[Check]:
-    """Diff two view directories channel by channel."""
-    checks: List[Check] = []
-
-    meta_ref = json.loads((reference / "meta.json").read_text())
-    meta_new = json.loads((candidate / "meta.json").read_text())
-
-    t_ref = np.array(meta_ref["transforms"])
-    t_new = np.array(meta_new["transforms"])
-    err = np.abs(t_ref - t_new).max()
-    checks.append(Check("camera transforms", err < 1e-4, f"max|diff| = {err:.2e}"))
-
-    err = abs(meta_ref["camera_angle_x"] - meta_new["camera_angle_x"])
-    checks.append(Check("camera_angle_x", err < 1e-9, f"diff = {err:.2e}"))
-
-    depth_err, normal_err, mask_iou = [], [], []
-    for view in range(NUM_VIEWS):
-        d_ref = _load_depth(reference / f"depth_{view:04d}.exr")
-        d_new = _load_depth(candidate / f"depth_{view:04d}.exr")
-
-        hit_ref, hit_new = d_ref < 65500.0, d_new < 65500.0
-        both = hit_ref & hit_new
-        union = hit_ref | hit_new
-        mask_iou.append(both.sum() / max(union.sum(), 1))
-
-        if both.any():
-            depth_err.append(np.abs(d_ref[both] - d_new[both]))
-
-        n_ref = _decode_normals(_load_normal(reference / f"normal_{view:04d}.webp"))
-        n_new = _decode_normals(_load_normal(candidate / f"normal_{view:04d}.webp"))
-        if both.any():
-            dot = np.abs((n_ref[both] * n_new[both]).sum(-1))
-            normal_err.append(np.degrees(np.arccos(np.clip(dot, 0, 1))))
-
-    depth_all = np.concatenate(depth_err) if depth_err else np.zeros(1)
-    normal_all = np.concatenate(normal_err) if normal_err else np.zeros(1)
-    iou = float(np.mean(mask_iou))
-
-    # Compare medians, not maxima: silhouette pixels legitimately disagree,
-    # because the reference antialiases its edges and a rasteriser does not.
-    checks.append(Check(
-        "depth", float(np.median(depth_all)) < DEPTH_TOLERANCE,
-        f"median {np.median(depth_all):.2e}, p95 {np.percentile(depth_all, 95):.2e} "
-        f"(tolerance {DEPTH_TOLERANCE:.0e})",
-    ))
-    checks.append(Check(
-        "normals", float(np.median(normal_all)) < NORMAL_TOLERANCE_DEG,
-        f"median {np.median(normal_all):.3f} deg, p95 {np.percentile(normal_all, 95):.3f} deg",
-    ))
-    checks.append(Check("silhouette IoU", iou > 0.99, f"{iou * 100:.3f}%"))
-    return checks
-
-
-def _colorize_depth(depth: np.ndarray) -> np.ndarray:
-    """Depth to greyscale, scaled to the object's own range so it stays readable."""
-    hit = depth < 65500.0
-    out = np.zeros(depth.shape, dtype=np.uint8)
-    if hit.any():
-        lo, hi = depth[hit].min(), depth[hit].max()
-        span = max(hi - lo, 1e-9)
-        out[hit] = (255 * (1.0 - (depth[hit] - lo) / span)).astype(np.uint8)
-    return np.stack([out] * 3, -1)
-
-
-def _heatmap(error: np.ndarray, valid: np.ndarray, vmax: float) -> np.ndarray:
-    """Error magnitude as a black-to-red ramp, saturating at ``vmax``."""
-    out = np.zeros((*error.shape, 3), dtype=np.uint8)
-    scaled = np.clip(error / vmax, 0.0, 1.0)
-    out[..., 0] = np.where(valid, (scaled * 255).astype(np.uint8), 0)
-    return out
-
-
-def _label(tile: np.ndarray, text: str) -> np.ndarray:
-    tile = tile.copy()
-    cv2.putText(tile, text, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
-    return tile
-
-
-def _as_model_sees_it(rgba: np.ndarray) -> np.ndarray:
-    """Composite over white, the way ``_load_img_as_tensor`` does before inference.
-
-    Showing raw RGB would compare pixels the model never reads: the loader
-    (``sam2/utils/misc.py:98``) alpha-composites every normal map onto white, so
-    whatever a renderer leaves in its masked-out background is discarded. Compare
-    the input, not the file.
+    ``mask_path`` is a label map (``.npy``, ``.exr``) or a flat-colour image;
+    ``extract_mask_segments`` turns either into one boolean mask per object.
     """
-    alpha = rgba[..., 3:4].astype(np.float64) / 255.0
-    return (rgba[..., :3] * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+    meta = json.load(open(os.path.join(data_root, "meta.json")))
+    camera_angle_x = meta["camera_angle_x"]
 
+    images, img_masks, depth_maps, pos_maps, norm_maps, c2ws = [], [], [], [], [], []
+    for idx in range(NUM_VIEWS):
+        img = Image.open(os.path.join(data_root, f"color_{idx:04d}.webp"))
+        img_masks.append(np.array(img)[:, :, -1:] > 0)
+        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        images.append(np.array(Image.alpha_composite(background, img).convert("RGB")))
 
-def write_comparison_images(
-    reference: Path, candidate: Path, out_dir: Path, views: Sequence[int] = (0, 3, 6, 9)
-) -> List[Path]:
-    """Write one contact sheet per view: reference, candidate, and error maps.
+        depth = cv2.imread(os.path.join(data_root, f"depth_{idx:04d}.exr"), cv2.IMREAD_UNCHANGED)
+        depth = depth[..., 0]
+        depth_maps.append(depth)
 
-    The numbers say the renders agree; these say *where* they disagree, which is
-    what tells a silhouette artefact apart from a systematic bias.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written: List[Path] = []
+        c2w = np.array(meta["transforms"][idx])
+        pos_map = gen_pcd(depth, c2w, camera_angle_x)
+        pos_maps.append(torch.from_numpy(pos_map).to(torch.float32).permute(2, 0, 1))
+        c2ws.append(torch.tensor(c2w, dtype=torch.float32))
 
-    for view in views:
-        d_ref = _load_depth(reference / f"depth_{view:04d}.exr")
-        d_new = _load_depth(candidate / f"depth_{view:04d}.exr")
-        n_ref = _load_normal(reference / f"normal_{view:04d}.webp")
-        n_new = _load_normal(candidate / f"normal_{view:04d}.webp")
+        norm = Image.open(os.path.join(data_root, f"normal_{idx:04d}.webp"))
+        background = Image.new("RGBA", norm.size, (255, 255, 255, 255))
+        norm_maps.append(np.array(Image.alpha_composite(background, norm).convert("RGB")))
 
-        hit_ref, hit_new = d_ref < 65500.0, d_new < 65500.0
-        both = hit_ref & hit_new
+    if not 0 <= mask_view < NUM_VIEWS:
+        raise ValueError(f"mask_view={mask_view} is not one of the {NUM_VIEWS} views")
+    seed_masks, _ = add_mask_file_to_frame({}, {}, mask_path)
+    if not seed_masks:
+        raise ValueError(f"no object found in the seed mask {mask_path}")
 
-        depth_err = np.where(both, np.abs(d_ref - d_new), 0.0)
-        angle = np.zeros(d_ref.shape)
-        dot = (_decode_normals(n_ref) * _decode_normals(n_new)).sum(-1)
-        angle[both] = np.degrees(np.arccos(np.clip(np.abs(dot[both]), 0, 1)))
+    mesh_vanilla = load_mesh(os.path.join(data_root, "mesh.glb"))
 
-        # Disagreeing silhouette pixels: green = reference only, red = ours.
-        silhouette = np.zeros((*d_ref.shape, 3), dtype=np.uint8)
-        silhouette[hit_ref & ~hit_new] = (0, 255, 0)
-        silhouette[hit_new & ~hit_ref] = (255, 0, 0)
-
-        top = np.hstack([
-            _label(_as_model_sees_it(n_ref), "normal: reference"),
-            _label(_as_model_sees_it(n_new), "normal: pyrender"),
-            _label(_heatmap(angle, both, NORMAL_TOLERANCE_DEG), f"normal err (0-{NORMAL_TOLERANCE_DEG:g} deg)"),
-        ])
-        bottom = np.hstack([
-            _label(_colorize_depth(d_ref), "depth: reference"),
-            _label(_colorize_depth(d_new), "depth: pyrender"),
-            _label(_heatmap(depth_err, both, DEPTH_TOLERANCE), f"depth err (0-{DEPTH_TOLERANCE:g})"),
-        ])
-        sheet = np.vstack([top, bottom, np.hstack([
-            _label(silhouette, "silhouette: green=ref only, red=ours"),
-            np.zeros_like(silhouette), np.zeros_like(silhouette),
-        ])])
-
-        path = out_dir / f"view_{view:04d}.webp"
-        Image.fromarray(sheet).save(path, quality=90)
-        written.append(path)
-    return written
-
-
-def validate(reference: Path, against: Optional[Path] = None, keep: Optional[Path] = None,
-             images: Optional[Path] = None) -> bool:
-    """Render ``reference``'s own mesh and diff it against ``reference``.
-
-    ``against`` diffs a second, externally produced directory (a Blender render
-    of the same mesh) against the same reference, so the two renderers can be
-    judged on one scale.
-    """
-    reference = Path(reference)
-    work = Path(keep) if keep else Path(tempfile.mkdtemp(prefix="render_validate_"))
-
-    print(f"reference : {reference}")
-    print(f"rendering : {work}\n")
-    render_views(reference / "mesh.glb", work)
-
-    print(f"=== pyrender vs {reference.name} ===")
-    checks = compare_views(reference, work)
-    for check in checks:
-        print(check)
-    ok = all(c.passed for c in checks)
-
-    if against is not None:
-        print(f"\n=== {Path(against).name} vs {reference.name} ===")
-        other = compare_views(reference, Path(against))
-        for check in other:
-            print(check)
-        ok = ok and all(c.passed for c in other)
-
-    if images is not None:
-        written = write_comparison_images(reference, work, images)
-        print(f"\ncomparison images -> {images}")
-        for path in written:
-            print(f"  {path.name}")
-
-    print(f"\n{'ALL CHECKS PASSED' if ok else 'SOME CHECKS FAILED'}")
-    return ok
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("reference", type=Path, help="A view directory to reproduce and diff against.")
-    parser.add_argument("--against", type=Path, default=None,
-                        help="A second view directory (e.g. a Blender render) to score on the same scale.")
-    parser.add_argument("--keep", type=Path, default=None,
-                        help="Render into this directory instead of a temporary one.")
-    parser.add_argument("--images", type=Path, default=None,
-                        help="Write side-by-side comparison sheets into this directory.")
-    args = parser.parse_args()
-    return 0 if validate(args.reference, args.against, args.keep, args.images) else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    return Views(
+        root=data_root,
+        obj_name=os.path.basename(os.path.normpath(data_root)),
+        images=images,
+        img_masks=img_masks,
+        depth_maps=depth_maps,
+        pos_maps=pos_maps,
+        norm_maps=norm_maps,
+        c2ws=c2ws,
+        fovy_deg=meta["camera_angle_x"] * 180.0 / math.pi,
+        scaling_factor=meta["scaling_factor"],
+        translation=np.asarray(meta["translation"], dtype=np.float32),
+        mesh=explode_faces(mesh_vanilla),
+        mesh_vanilla=mesh_vanilla,
+        seed_view=int(mask_view),
+        seed_masks=seed_masks,
+    )

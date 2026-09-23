@@ -9,7 +9,7 @@ step.
 
     1. /api/jobs/render    mesh          -> 12 canonical views
     2. /api/jobs/pickview  views         -> the seed view SegviGen's picker chooses
-    3. /api/jobs/guidance  views + view  -> SegviGen's describe/palette/paint -> points
+    3. /api/jobs/guidance  views + view  -> SegviGen's describe/palette/paint -> the map
     4. /api/jobs/segment   views + map   -> GeoSAM2, as the paper runs it
     5. /api/jobs/bake      labels        -> the labels as a texture on the UVs
     6. /api/jobs/split     baked mesh    -> SegviGen's split (its code), one mesh per part
@@ -28,7 +28,7 @@ import threading
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 # The UI polls job status once a second; those lines drown the real log.
 logging.getLogger("uvicorn.access").addFilter(
@@ -44,7 +44,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from geosam2.segmenter import REPO_ROOT, GeoSAM2Segmenter, export_parts, is_view_directory
+from geosam2.segmenter import REPO_ROOT, GeoSAM2Segmenter
+from geosam2.util.views import is_view_directory
 from geosam2.util.logs import get_logger
 
 # Before /api/status reports on it: utils.guidance loads the same file, but only
@@ -178,7 +179,7 @@ def start_render(params: RenderParams) -> dict:
         raise HTTPException(400, f"mesh not found: {mesh_path}")
 
     def _run() -> dict:
-        from geosam2.util.render import render_views
+        from geosam2.util.views import render_views
         out = _WORK_ROOT / f"views_{uuid.uuid4().hex[:8]}"
         render_views(str(mesh_path), out)
         return {"data_root": str(out), "mesh_path": str(out / "mesh.glb"),
@@ -199,7 +200,7 @@ def start_pickview(params: PickViewParams) -> dict:
 
     def _run() -> dict:
         from geosam2.util.guidance import VIEW_MAP, pick_seed_view
-        from geosam2.util.render import AZIMUTHS_REFERENCE
+        from geosam2.util.views import AZIMUTHS_REFERENCE
         view = pick_seed_view(data_root)
         compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
                    "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
@@ -261,7 +262,7 @@ class SegmentParams(BaseModel):
 
 def _parts_glb(data_root: Path, labels_path: Path, work: Path, name: str) -> dict:
     """Cut the source mesh into one geometry per label and write it out."""
-    scene, structure, labels = export_parts(data_root / "mesh.glb", np.load(labels_path))
+    scene, structure = _segmenter.parts(data_root / "mesh.glb", np.load(labels_path))
     glb_path = work / f"{name}.glb"
     scene.export(glb_path)
     parts = [p for p in structure["children"] if p["name"] != "unassigned"]
@@ -288,16 +289,14 @@ def start_segment(params: SegmentParams) -> dict:
         out_dir = work / "3d_seg"
         glb_path = _segmenter.run(data_root, mask_path, params.seed_view, out_dir,
                                   postprocess_pa=params.postprocess_pa)
-        raw = sorted(out_dir.glob("segmentation_result_*.npy"))
-        post = sorted(out_dir.glob("segmentation_postprocessed_*.npy"))
-        # The GLB run() wrote is the post-processed lift after the fragment
-        # cleanup; the app also hands back GeoSAM2's raw lift, so both can
-        # feed the later stages and be weighed against each other.
-        out = _parts_glb(data_root, post[-1], work, "geosam2")
+        # Both of GeoSAM2's own outputs are handed back: the raw lift and its
+        # post-process are two of the methods whose weight the later stages
+        # are there to measure, so either can feed the bake.
+        out = _parts_glb(data_root, out_dir / "labels_post.npy", work, "geosam2")
+        raw = _parts_glb(data_root, out_dir / "labels_raw.npy", work, "geosam2_raw")
         out.update(work_dir=str(work), out_dir=str(out_dir), seed_view=params.seed_view,
                    mask_path=str(mask_path), glb_path=glb_path,
-                   raw_labels_path=str(raw[-1]) if raw else None,
-                   raw_glb=str(raw[-1]).replace(".npy", ".glb") if raw else None)
+                   raw_labels_path=raw["labels_path"], raw_glb=raw["glb_path"])
         return out
 
     return _start_job(_run)
@@ -310,7 +309,7 @@ class BakeParams(BaseModel):
     data_root: str
     work_dir: str
     labels_path: str
-    texture_size: int = 2048
+    texture_size: int = 4096
 
 
 class SplitParams(BaseModel):
@@ -335,8 +334,8 @@ SPLIT_FIELDS = ("color_quant_step", "palette_min_frac", "palette_max_colors",
 
 @app.get("/api/presets/split")
 def split_presets() -> dict:
-    from geosam2.util.bake import split_presets
-    return split_presets()
+    from geosam2.util.split import SPLIT_PRESETS
+    return SPLIT_PRESETS
 
 
 @app.post("/api/jobs/bake")
@@ -350,7 +349,7 @@ def start_bake(params: BakeParams) -> dict:
         raise HTTPException(400, f"labels not found: {params.labels_path} (re-run stage 4)")
 
     def _run() -> dict:
-        from geosam2.util.bake import bake_labels_to_glb
+        from geosam2.util.labels import bake_labels_to_glb
         out = work / "segvigen"
         out.mkdir(parents=True, exist_ok=True)
         baked = out / f"baked_{params.texture_size}_{uuid.uuid4().hex[:6]}.glb"
@@ -375,13 +374,13 @@ def start_split(params: SplitParams) -> dict:
     def _run() -> dict:
         import trimesh
 
-        from geosam2.util.bake import split_with_segvigen
+        from geosam2.util.split import split_glb_by_texture_palette_rgb
         # One file per parameter set: a fixed name would make two runs
         # indistinguishable in the viewer and on disk.
         tag = uuid.uuid4().hex[:6]
         out = work / "segvigen" / f"parts_{params.output_mode}_{tag}.glb"
-        split_with_segvigen(params.baked_glb, str(out),
-                            **{k: getattr(params, k) for k in SPLIT_FIELDS})
+        split_glb_by_texture_palette_rgb(params.baked_glb, str(out), debug_print=True,
+                                         **{k: getattr(params, k) for k in SPLIT_FIELDS})
         scene = trimesh.load(out, force="scene")
         return {"segvigen_glb": str(out), "n_split_parts": len(scene.geometry),
                 "output_mode": params.output_mode}

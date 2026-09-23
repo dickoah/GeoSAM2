@@ -7,10 +7,8 @@ torchvision
 iopath
 pillow
 opencv-python<5
-matplotlib
 tqdm
 trimesh
-pandas
 ninja
 
 # ── Step-by-step app (app.py) ────────────────────────────────────────────

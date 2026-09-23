@@ -1,4 +1,4 @@
-"""Self-check for clean_label_fragments (utils/inference_utils.py).
+"""Self-check for clean_label_fragments (geosam2/_lift.py).
 
 Run directly: ``python tests/test_geometry_cleanup.py``. It fails silently in
 both directions -- eating a real part or leaving speckle -- and either only
