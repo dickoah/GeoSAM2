@@ -262,7 +262,7 @@ class SegmentParams(BaseModel):
 
 def _parts_glb(data_root: Path, labels_path: Path, work: Path, name: str) -> dict:
     """Cut the source mesh into one geometry per label and write it out."""
-    scene, structure = _segmenter.parts(data_root / "mesh.glb", np.load(labels_path))
+    scene, structure, _ = _segmenter.parts(data_root / "mesh.glb", np.load(labels_path))
     glb_path = work / f"{name}.glb"
     scene.export(glb_path)
     parts = [p for p in structure["children"] if p["name"] != "unassigned"]

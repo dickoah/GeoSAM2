@@ -3,7 +3,6 @@ import math
 import torch
 from geosam2.sam2.modeling.backbones.image_encoder import ImageEncoder
 from torch import nn
-import copy
 
 
 class SAMLoraImgEncoder(ImageEncoder):

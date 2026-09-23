@@ -38,10 +38,6 @@ class SAM2Transforms(nn.Module):
         x = self.to_tensor(x)
         return self.transforms(x)
 
-    def forward_batch(self, img_list):
-        img_batch = [self.transforms(self.to_tensor(img)) for img in img_list]
-        img_batch = torch.stack(img_batch, dim=0)
-        return img_batch
 
     def transform_coords(
         self, coords: torch.Tensor, normalize=False, orig_hw=None
@@ -63,15 +59,6 @@ class SAM2Transforms(nn.Module):
         coords = coords * self.resolution  # unnormalize coords
         return coords
 
-    def transform_boxes(
-        self, boxes: torch.Tensor, normalize=False, orig_hw=None
-    ) -> torch.Tensor:
-        """
-        Expects a tensor of shape Bx4. The coordinates can be in absolute image or normalized coordinates,
-        if the coords are in absolute image coordinates, normalize should be set to True and original image size is required.
-        """
-        boxes = self.transform_coords(boxes.reshape(-1, 2, 2), normalize, orig_hw)
-        return boxes
 
     def postprocess_masks(self, masks: torch.Tensor, orig_hw) -> torch.Tensor:
         """

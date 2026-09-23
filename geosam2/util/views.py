@@ -238,7 +238,7 @@ INVALID_DEPTH = 65504.0
 RESOLUTION = 1024
 
 # glTF is Y-up, Blender is Z-up, and the reference renders were made in Z-up.
-# _propagation.prepare_mesh_and_point_cloud applies this same rotation to mesh.glb
+# _propagation._point_cloud applies this same rotation to mesh.glb
 # before lifting, so the
 # render must live in the rotated frame or the two disagree.
 _Y_UP_TO_Z_UP = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=float)
@@ -304,7 +304,7 @@ def normalize(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, float, np.ndarray
     """Rotate into Z-up and fit the mesh into a unit box centred on the origin.
 
     Returns ``(mesh, scaling_factor, translation, bbox_size)`` where the two
-    scalars are what ``meta.json`` must carry: ``prepare_mesh_and_point_cloud`` rebuilds this
+    scalars are what ``meta.json`` must carry: ``_propagation._point_cloud`` rebuilds this
     exact mesh as ``(raw_rotated + translation) * scaling_factor``, so they are
     defined to satisfy *that* formula rather than to mirror how Blender happened
     to compose its own transform.

@@ -223,7 +223,6 @@ def _welded_face_incidence(weld: np.ndarray, F: np.ndarray,
                       shape=(nF, int(Fw.max()) + 1)).tocsr()
 
 
-
 def _unwrap_uv3_for_seam(uv3: np.ndarray) -> np.ndarray:
     out = uv3.copy()
     for d in range(2):
@@ -1339,267 +1338,6 @@ def _smooth_label_map_boundaries(label_map: np.ndarray, sigma: float,
     return lm
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  STAGE INSTRUMENTATION — with ``debug_dir``, every stage dumps its output,
-#  numbered in pipeline order: the final GLB says WHERE it is wrong, the dumps
-#  say WHICH stage made it wrong. Label stages export EXPLODED (one vertex
-#  triple per face — shared vertices would average the colours and blur the
-#  boundaries the dumps exist to show); magenta = "no label" (-1).
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-_DEBUG_UNLABELLED_RGB = (255, 0, 255)
-
-
-def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
-    """sRGB (0-255) -> CIELab, D65. DIAGNOSTIC ONLY: the split maps colours in
-    euclidean RGB, and this is here to show what that choice costs, not to
-    replace it."""
-    c = np.asarray(rgb, np.float64).reshape(-1, 3) / 255.0
-    c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    m = np.array([[0.4124, 0.3576, 0.1805],
-                  [0.2126, 0.7152, 0.0722],
-                  [0.0193, 0.1192, 0.9505]])
-    xyz = (c @ m.T) / np.array([0.95047, 1.0, 1.08883])
-    f = np.where(xyz > 216 / 24389, np.cbrt(xyz),
-                 (24389 / 27 * xyz + 16) / 116)
-    return np.stack([116 * f[:, 1] - 16,
-                     500 * (f[:, 0] - f[:, 1]),
-                     200 * (f[:, 1] - f[:, 2])], axis=1)
-
-
-def _label_colour_lut(label_rgb: np.ndarray, n: int) -> np.ndarray:
-    """RGB lookup covering label indices 0..n-1 (black past the palette)."""
-    lut = np.zeros((max(int(n), 1), 3), np.uint8)
-    pal = np.asarray(label_rgb, np.uint8).reshape(-1, 3)
-    k = min(len(pal), len(lut))
-    lut[:k] = pal[:k]
-    return lut
-
-
-class _StageDump:
-    """One artifact per pipeline stage, written under ``debug_dir``.
-
-    Label dumps accumulate across nodes and are exported as one scene per
-    stage at ``flush()``; the summary records, per stage and per node, how
-    many faces that stage moved with respect to the previous one — which is
-    the same question the GLBs answer visually.
-    """
-
-    def __init__(self, debug_dir: str, debug_print: bool = False):
-        self.dir = debug_dir
-        self.debug_print = debug_print
-        self.scenes: Dict[str, trimesh.Scene] = {}
-        self.summary: list = []
-        self._prev: Dict[str, np.ndarray] = {}
-        os.makedirs(debug_dir, exist_ok=True)
-
-    def labels(self, stem: str, node_name: str, mesh: trimesh.Trimesh,
-               face_label: np.ndarray, label_rgb: np.ndarray) -> None:
-        """Dump the per-face labels of a stage as a flat-coloured mesh."""
-        lab = np.asarray(face_label, np.int32)
-        lut = _label_colour_lut(label_rgb, int(lab.max()) + 1 if lab.size else 1)
-        cols = np.empty((len(lab), 4), np.uint8)
-        cols[:, 3] = 255
-        ok = lab >= 0
-        cols[ok, :3] = lut[lab[ok]]
-        cols[~ok, :3] = _DEBUG_UNLABELLED_RGB
-
-        V = np.asarray(mesh.vertices, np.float64)[
-            np.asarray(mesh.faces, np.int64)].reshape(-1, 3)
-        m = trimesh.Trimesh(vertices=V,
-                            faces=np.arange(len(V), dtype=np.int64).reshape(-1, 3),
-                            process=False)
-        m.visual = trimesh.visual.ColorVisuals(
-            m, vertex_colors=np.repeat(cols, 3, axis=0))
-        self.scenes.setdefault(stem, trimesh.Scene()).add_geometry(
-            m, geom_name=node_name)
-        np.save(os.path.join(self.dir, f"{stem}__{node_name}.npy"), lab)
-
-        prev = self._prev.get(node_name)
-        self._prev[node_name] = lab.copy()
-        self.summary.append(dict(
-            stage=stem, node=node_name, faces=int(len(lab)),
-            labels_used=int(len(np.unique(lab[ok]))), unlabelled=int((~ok).sum()),
-            changed_vs_prev=None if prev is None else int((prev != lab).sum())))
-
-    def palette_vote(self, node_name: str, tex_rgba: np.ndarray,
-                     palette_rgb: np.ndarray, color_quant_step: int,
-                     vote: Dict[str, Any],
-                     pal_trace: Optional[Dict[str, Any]] = None) -> None:
-        """Explain stage 1: for every source colour, where it ended up and why.
-
-        Three suspects can produce a wrong part colour and the report
-        separates them: the palette BUILD (a colour dropped below
-        `palette_min_pixels`, or folded into a distant entry by the greedy
-        merge — columns ``kept``/``merged_into``/``merge_drift``), the
-        MAPPING metric (nearest palette entry in euclidean RGB, with the
-        runner-up and the margin next to it, plus the CIELab distance the
-        same choice would have had), and the per-face VOTE (``faces_top`` vs
-        the face's winning label, and the purity stats in the json).
-        """
-        step = color_quant_step
-        pal = np.asarray(palette_rgb, np.uint8).reshape(-1, 3)
-
-        # ── every quantised colour of the atlas, and its texel weight ──
-        q_all = _quantize_rgb(tex_rgba[..., :3].reshape(-1, 3).astype(np.uint8),
-                              step)
-        src, atlas_texels = np.unique(q_all, axis=0, return_counts=True)
-        key = lambda a: (a[:, 0].astype(np.int64) << 16 |   # noqa: E731
-                         a[:, 1].astype(np.int64) << 8 | a[:, 2].astype(np.int64))
-        src_key = key(src)
-        pos = {int(k): i for i, k in enumerate(src_key)}
-
-        # ── texels this node's faces actually own (the rest is gutter) ──
-        owned = np.zeros(len(src), np.int64)
-        faces_touched = np.zeros(len(src), np.int64)
-        faces_top = np.zeros(len(src), np.int64)
-        t_rgb, t_face = vote["texel_rgb"], vote["texel_face"]
-        if len(t_rgb):
-            ci = np.searchsorted(src_key, key(t_rgb))
-            np.add.at(owned, ci, 1)
-            # per (face, colour) tally -> the colour that carries each face
-            fc, cnt = np.unique(t_face.astype(np.int64) * len(src) + ci,
-                                return_counts=True)
-            np.add.at(faces_touched, (fc % len(src)).astype(np.int64), 1)
-            f_of = fc // len(src)
-            first = np.flatnonzero(np.r_[True, f_of[1:] != f_of[:-1]])
-            bounds = np.r_[first, len(fc)]
-            for lo, hi in zip(bounds[:-1], bounds[1:]):
-                np.add.at(faces_top, int(fc[lo + int(cnt[lo:hi].argmax())]
-                                         % len(src)), 1)
-
-        # ── the mapping decision, its runner-up, and the Lab view of it ──
-        d = np.linalg.norm(src[:, None, :].astype(np.float64)
-                           - pal[None, :, :].astype(np.float64), axis=2)
-        order = np.argsort(d, axis=1)
-        lab1, lab2 = order[:, 0], (order[:, 1] if pal.shape[0] > 1 else order[:, 0])
-        d1 = d[np.arange(len(src)), lab1]
-        d2 = d[np.arange(len(src)), lab2]
-        lab_src, lab_pal = _srgb_to_lab(src), _srgb_to_lab(pal)
-        de = np.linalg.norm(lab_src - lab_pal[lab1], axis=1)
-        de_best = np.linalg.norm(lab_src[:, None, :] - lab_pal[None, :, :],
-                                 axis=2).argmin(axis=1)
-
-        # ── palette provenance: kept, dropped, or merged into whom ──
-        kept = np.zeros(len(src), bool)
-        merged = np.full(len(src), -1, np.int32)
-        drift = np.full(len(src), np.nan)
-        if pal_trace and "survivors" in pal_trace:
-            surv = pal_trace["survivors"]
-            assign = pal_trace.get("merge_assign")
-            for i, c in enumerate(surv):
-                j = pos.get(int(key(c[None, :])[0]))
-                if j is None:
-                    continue
-                kept[j] = True
-                if assign is not None and i < len(assign):
-                    merged[j] = int(assign[i])
-                    drift[j] = float(np.linalg.norm(
-                        c.astype(np.float64) - pal[int(assign[i])].astype(np.float64)))
-
-        rows = np.argsort(-owned)
-        path = os.path.join(self.dir, f"01_palette_vote__{node_name}.csv")
-        with open(path, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(["src_r", "src_g", "src_b", "atlas_texels",
-                        "owned_texels", "faces_touched", "faces_top",
-                        "label", "pal_r", "pal_g", "pal_b", "d_rgb",
-                        "label2", "d_rgb2", "margin", "deltaE_lab",
-                        "label_if_lab", "kept_in_palette", "merged_into",
-                        "merge_drift"])
-            for i in rows:
-                w.writerow([*src[i].tolist(), int(atlas_texels[i]),
-                            int(owned[i]), int(faces_touched[i]),
-                            int(faces_top[i]), int(lab1[i]),
-                            *pal[lab1[i]].tolist(), round(float(d1[i]), 1),
-                            int(lab2[i]), round(float(d2[i]), 1),
-                            round(float(d2[i] - d1[i]), 1), round(float(de[i]), 1),
-                            int(de_best[i]), bool(kept[i]), int(merged[i]),
-                            "" if np.isnan(drift[i]) else round(float(drift[i]), 1)])
-
-        self._palette_vote_png(node_name, src, pal, owned, atlas_texels, lab1,
-                               d1, de, de_best, kept, merged)
-
-        hist = vote["hist"]
-        tot = hist.sum(axis=1)
-        seen = tot > 0
-        top = np.sort(hist[seen], axis=1)
-        purity = top[:, -1] / tot[seen]
-        stats = {
-            "node": node_name,
-            "palette": pal.tolist(),
-            "source_colours": int(len(src)),
-            "palette_candidates": int(len(pal_trace.get("candidates", [])))
-            if pal_trace else None,
-            "counted_owned_texels": (pal_trace or {}).get("counted_texels"),
-            "merge_near_cliff": [
-                [list(c), what, round(d, 2)] for c, what, d in
-                (pal_trace or {}).get("merge_near_cliff", [])],
-            "faces_total": int(len(hist)),
-            "faces_without_texel": int((~seen).sum()),
-            "face_vote_purity_mean": round(float(purity.mean()), 3),
-            "faces_purity_below_0.6": int((purity < 0.6).sum()),
-            "colours_disagreeing_rgb_vs_lab": int(
-                (lab1[owned > 0] != de_best[owned > 0]).sum()),
-            "owned_texels_disagreeing": int(owned[lab1 != de_best].sum()),
-        }
-        with open(os.path.join(self.dir,
-                               f"01_vote_stats__{node_name}.json"), "w") as fh:
-            json.dump(stats, fh, indent=2)
-        if self.debug_print:
-            print(f"[Debug] palette vote report -> {path}")
-
-    def _palette_vote_png(self, node_name, src, pal, owned, atlas_texels,
-                          lab1, d1, de, de_best, kept, merged,
-                          max_rows: int = 48) -> None:
-        """Swatch table: source colour -> assigned palette colour, ranked by
-        how much of the node's surface the source colour covers."""
-        rows = [i for i in np.argsort(-owned) if owned[i] > 0][:max_rows]
-        rh, pad = 26, 8
-        img = Image.new("RGB", (760, pad * 2 + rh * (len(rows) + 1)), (24, 24, 24))
-        drw = ImageDraw.Draw(img)
-        drw.text((pad, pad + 6), "src            ->  palette        "
-                 "owned texels   d_rgb   dE_Lab  build", fill=(200, 200, 200))
-        for r, i in enumerate(rows):
-            y = pad + rh * (r + 1)
-            drw.rectangle([pad, y + 3, pad + 60, y + rh - 3],
-                          fill=tuple(int(v) for v in src[i]))
-            drw.text((pad + 70, y + 7), "->", fill=(160, 160, 160))
-            drw.rectangle([pad + 95, y + 3, pad + 155, y + rh - 3],
-                          fill=tuple(int(v) for v in pal[lab1[i]]))
-            build = ("kept" if kept[i] else "absorbed") + \
-                    (f" -> {int(merged[i])}" if merged[i] >= 0 else "")
-            flag = "  MISMATCH" if lab1[i] != de_best[i] else ""
-            drw.text((pad + 170, y + 7),
-                     f"{tuple(int(v) for v in src[i])}  L{int(lab1[i])} "
-                     f"{tuple(int(v) for v in pal[lab1[i]])}  "
-                     f"{int(owned[i]):>8}  {float(d1[i]):6.1f}  "
-                     f"{float(de[i]):6.1f}  {build}{flag}",
-                     fill=(230, 230, 230) if not flag else (255, 140, 140))
-        img.save(os.path.join(self.dir, f"01_palette_vote__{node_name}.png"))
-
-    def label_map(self, stem: str, node_name: str, label_map: np.ndarray,
-                  label_rgb: np.ndarray) -> None:
-        """Dump a texture-space label map as a colour PNG."""
-        lut = _label_colour_lut(label_rgb, int(label_map.max()) + 1)
-        idx = np.clip(label_map, 0, len(lut) - 1)
-        Image.fromarray(lut[idx]).save(
-            os.path.join(self.dir, f"{stem}__{node_name}.png"))
-
-    def copy(self, name: str, src_path: str) -> None:
-        """Snapshot a file a stage just wrote, before anything overwrites it."""
-        shutil.copyfile(src_path, os.path.join(self.dir, name))
-
-    def flush(self) -> None:
-        for stem, scene in self.scenes.items():
-            scene.export(os.path.join(self.dir, f"{stem}.glb"))
-        with open(os.path.join(self.dir, "summary.json"), "w") as fh:
-            json.dump(self.summary, fh, indent=2)
-        if self.debug_print:
-            print(f"[Debug] {len(self.scenes)} stage dump(s) -> {self.dir}")
-
-
 def split_glb_by_texture_palette_rgb(
     in_glb_path: str,
     out_glb_path: Optional[str] = None,
@@ -1631,7 +1369,6 @@ def split_glb_by_texture_palette_rgb(
     output_mode: str = "vertex_colors",
     min_faces_per_part: int = 1,
     bake_transforms: bool = True,
-    debug_dir: Optional[str] = None,
     debug_print: bool = True,
 ) -> str:
     """Split a segmented GLB into per-part sub-meshes.
@@ -1657,13 +1394,9 @@ def split_glb_by_texture_palette_rgb(
        input's UVs on every part.
     smooth        : SDF Gaussian sigma in px; parts narrower than ~2*sigma
        texels erode.
-    debug_dir     : per-stage dumps, numbered in pipeline order.
     """
     if out_glb_path is None:
         out_glb_path = f"{os.path.splitext(in_glb_path)[0]}_seg.glb"
-    dump = _StageDump(debug_dir, debug_print) if debug_dir else None
-    if dump:
-        dump.copy("00_input.glb", in_glb_path)
 
     # ── texture (once per GLB: all nodes share the atlas) ──
     tex_rgba = _extract_basecolor_texture_image(in_glb_path, debug_print=debug_print)
@@ -1700,7 +1433,6 @@ def split_glb_by_texture_palette_rgb(
                     if owned else (np.empty(0, np.int64), np.empty(0, np.int64)))
     colours = np.stack([(keys >> 16) & 255, (keys >> 8) & 255, keys & 255],
                        axis=1).astype(np.uint8)
-    pal_trace: Optional[Dict[str, Any]] = {} if dump else None
     palette_rgb = _build_palette_rgb(
         colours,
         counts.astype(np.int64),
@@ -1708,16 +1440,13 @@ def split_glb_by_texture_palette_rgb(
         palette_max_colors=palette_max_colors,
         palette_merge_dist=palette_merge_dist,
         debug_print=debug_print,
-        trace=pal_trace,
     )
 
     for node_name, mesh, raster in node_meshes:
         # ── stage 1 : palette labelling ──
-        vote_dbg: Optional[Dict[str, Any]] = {} if dump else None
         res = _face_labels_from_texture_rgb(
             mesh, tex_rgba, palette_rgb,
             color_quant_step=color_quant_step,
-            debug=vote_dbg,
             raster=raster,
         )
         if res is None:
@@ -1727,11 +1456,6 @@ def split_glb_by_texture_palette_rgb(
             continue
         face_label, label_rgb = res
         raw_face_label = face_label.copy()
-        if dump:
-            dump.labels("01_labels_texture_vote", node_name, mesh,
-                        face_label, label_rgb)
-            dump.palette_vote(node_name, tex_rgba, label_rgb,
-                              color_quant_step, vote_dbg, pal_trace)
 
         # 02/03/04 only run island-OFF: stage 05 votes on the RAW evidence and
         # discards them anyway (measured byte-identical on the 4 refs).
@@ -1748,9 +1472,6 @@ def split_glb_by_texture_palette_rgb(
                 debug_print=debug_print,
             )
             label_forced |= face_label != _pre
-            if dump:
-                dump.labels("02_labels_topology_smooth", node_name, mesh,
-                            face_label, label_rgb)
         if refine_labels and graphcut_refine:
             _pre = face_label.copy()
             face_label = refine_face_labels_graphcut(
@@ -1760,18 +1481,12 @@ def split_glb_by_texture_palette_rgb(
                 islands=islands, raster=raster,
                 debug_print=debug_print)
             label_forced |= face_label != _pre
-            if dump:
-                dump.labels("04_labels_graphcut_mrf", node_name, mesh,
-                            face_label, label_rgb)
         if refine_labels and band_refine:
             _pre = face_label.copy()
             face_label = refine_face_labels_boundary_band(
                 mesh, face_label, lam=graphcut_lambda,
                 debug_print=debug_print)
             label_forced |= face_label != _pre
-            if dump:
-                dump.labels("04b_labels_boundary_band", node_name, mesh,
-                            face_label, label_rgb)
 
         if island_majority:
             _pre = face_label.copy()
@@ -1780,9 +1495,6 @@ def split_glb_by_texture_palette_rgb(
                 dominance=island_dominance, islands=islands,
                 debug_print=debug_print)
             label_forced |= face_label != _pre
-            if dump:
-                dump.labels("05_labels_island_majority", node_name, mesh,
-                            face_label, label_rgb)
 
         if debug_print:
             uniq_labels, cnts = np.unique(face_label[face_label >= 0],
@@ -1820,17 +1532,11 @@ def split_glb_by_texture_palette_rgb(
                     else:
                         label_map[cov] = tex_map[cov]
                 label_map = _fill_gutter(label_map, cov)
-                if dump:
-                    dump.label_map("06_labelmap_faces", node_name, label_map,
-                                   label_rgb)
                 sigma_b = (boundary_smooth_px if boundary_smooth_px is not None
                            else 1.0)
                 if sigma_b > 0:
                     label_map = _smooth_label_map_boundaries(
                         label_map, sigma_b, iters=1)
-                if dump:
-                    dump.label_map("07_labelmap_sdf_input", node_name,
-                                   label_map, label_rgb)
                 parts = _split_by_sdf_labels(
                     V_np, UV_np, F_np, label_map, smooth=smooth)
             except Exception as exc:  # pragma: no cover
@@ -1913,8 +1619,6 @@ def split_glb_by_texture_palette_rgb(
     out_scene.export(out_glb_path)
     if debug_print:
         print(f"[INFO] exported {part_count} part(s) -> {out_glb_path}")
-    if dump:
-        dump.copy("08_split_sdf_cut.glb", out_glb_path)
 
     # ── stage 4 : reassign the speckle fragments this split leaves behind ──
     # Texture speckle gives each label a correct main body plus small detached
@@ -1929,10 +1633,6 @@ def split_glb_by_texture_palette_rgb(
         except Exception as exc:      # never lose a good split to cleanup
             if debug_print:
                 print(f"[PostProcess] skipped ({type(exc).__name__}: {exc})")
-        if dump:
-            dump.copy("09_split_fragment_cleanup.glb", out_glb_path)
-    if dump:
-        dump.flush()
     return out_glb_path
 
 

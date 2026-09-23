@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
-from torch.nn.functional import grid_sample
 
 from geosam2.sam2.modeling.sam2_base_geosam2 import SAM2Base
 from geosam2.sam2.sam2_image_predictor_geosam2 import SAM2ImagePredictor
@@ -21,12 +20,10 @@ from geosam2.sam2.utils.amg import (
     box_xyxy_to_xywh,
     build_all_layer_point_grids,
     calculate_stability_score,
-    coco_encode_rle,
     generate_crop_boxes,
     is_box_near_crop_edge,
     mask_to_rle_pytorch,
     MaskData,
-    remove_small_regions,
     rle_to_mask,
     uncrop_boxes_xyxy,
     uncrop_masks,
@@ -98,7 +95,7 @@ class SAM2AutomaticMaskGenerator:
             to remove disconnected regions and holes in masks with area smaller
             than min_mask_region_area. Requires opencv.
           output_mode (str): The form masks are returned in. Can be 'binary_mask',
-            'uncompressed_rle', or 'coco_rle'. 'coco_rle' requires pycocotools.
+            or 'uncompressed_rle'.
             For large resolutions, 'binary_mask' may consume large amounts of
             memory.
           use_m2m (bool): Whether to add a one step refinement using previous mask predictions.
@@ -121,14 +118,7 @@ class SAM2AutomaticMaskGenerator:
         assert output_mode in [
             "binary_mask",
             "uncompressed_rle",
-            "coco_rle",
         ], f"Unknown output_mode {output_mode}."
-        if output_mode == "coco_rle":
-            try:
-                from pycocotools import mask as mask_utils  # type: ignore  # noqa: F401
-            except ImportError as e:
-                print("Please install pycocotools")
-                raise e
 
         self.predictor = SAM2ImagePredictor(
             model,
@@ -182,11 +172,7 @@ class SAM2AutomaticMaskGenerator:
         mask_data = self._generate_masks(image, pos_map, norm_map, img_mask)
 
         # Encode masks
-        if self.output_mode == "coco_rle":
-            mask_data["segmentations"] = [
-                coco_encode_rle(rle) for rle in mask_data["rles"]
-            ]
-        elif self.output_mode == "binary_mask":
+        if self.output_mode == "binary_mask":
             mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
             mask_data["segmentations"] = mask_data["rles"]
@@ -376,56 +362,6 @@ class SAM2AutomaticMaskGenerator:
 
         return data
 
-    @staticmethod
-    def postprocess_small_regions(
-        mask_data: MaskData, min_area: int, nms_thresh: float
-    ) -> MaskData:
-        """
-        Removes small disconnected regions and holes in masks, then reruns
-        box NMS to remove any new duplicates.
-
-        Edits mask_data in place.
-
-        Requires open-cv as a dependency.
-        """
-        if len(mask_data["rles"]) == 0:
-            return mask_data
-
-        # Filter small disconnected regions and holes
-        new_masks = []
-        scores = []
-        for rle in mask_data["rles"]:
-            mask = rle_to_mask(rle)
-
-            mask, changed = remove_small_regions(mask, min_area, mode="holes")
-            unchanged = not changed
-            mask, changed = remove_small_regions(mask, min_area, mode="islands")
-            unchanged = unchanged and not changed
-
-            new_masks.append(torch.as_tensor(mask).unsqueeze(0))
-            # Give score=0 to changed masks and score=1 to unchanged masks
-            # so NMS will prefer ones that didn't need postprocessing
-            scores.append(float(unchanged))
-
-        # Recalculate boxes and remove any new duplicates
-        masks = torch.cat(new_masks, dim=0)
-        boxes = batched_mask_to_box(masks)
-        keep_by_nms = batched_nms(
-            boxes.float(),
-            torch.as_tensor(scores),
-            torch.zeros_like(boxes[:, 0]),  # categories
-            iou_threshold=nms_thresh,
-        )
-
-        # Only recalculate RLEs for masks that have changed
-        for i_mask in keep_by_nms:
-            if scores[i_mask] == 0.0:
-                mask_torch = masks[i_mask].unsqueeze(0)
-                mask_data["rles"][i_mask] = mask_to_rle_pytorch(mask_torch)[0]
-                mask_data["boxes"][i_mask] = boxes[i_mask]  # update res directly
-        mask_data.filter(keep_by_nms)
-
-        return mask_data
 
     def refine_with_m2m(self, points, point_labels, low_res_masks, points_per_batch):
         new_masks = []

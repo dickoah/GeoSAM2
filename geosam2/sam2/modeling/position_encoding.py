@@ -50,41 +50,6 @@ class PositionEmbeddingSine(nn.Module):
                 cache_key = (image_size // stride, image_size // stride)
                 self._pe(1, device, *cache_key)
 
-    def _encode_xy(self, x, y):
-        # The positions are expected to be normalized
-        assert len(x) == len(y) and x.ndim == y.ndim == 1
-        x_embed = x * self.scale
-        y_embed = y * self.scale
-
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
-        dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
-
-        pos_x = x_embed[:, None] / dim_t
-        pos_y = y_embed[:, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2
-        ).flatten(1)
-        pos_y = torch.stack(
-            (pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2
-        ).flatten(1)
-        return pos_x, pos_y
-
-    @torch.no_grad()
-    def encode_boxes(self, x, y, w, h):
-        pos_x, pos_y = self._encode_xy(x, y)
-        pos = torch.cat((pos_y, pos_x, h[:, None], w[:, None]), dim=1)
-        return pos
-
-    encode = encode_boxes  # Backwards compatibility
-
-    @torch.no_grad()
-    def encode_points(self, x, y, labels):
-        (bx, nx), (by, ny), (bl, nl) = x.shape, y.shape, labels.shape
-        assert bx == by and nx == ny and bx == bl and nx == nl
-        pos_x, pos_y = self._encode_xy(x.flatten(), y.flatten())
-        pos_x, pos_y = pos_x.reshape(bx, nx, -1), pos_y.reshape(by, ny, -1)
-        pos = torch.cat((pos_y, pos_x, labels[:, :, None]), dim=2)
-        return pos
 
     @torch.no_grad()
     def _pe(self, B, device, *cache_key):

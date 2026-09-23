@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from torch.nn.init import trunc_normal_
 
-from geosam2.sam2.modeling.sam.mask_decoder import MaskDecoder, MaskDecoder_2ioupred
+from geosam2.sam2.modeling.sam.mask_decoder import MaskDecoder
 from geosam2.sam2.modeling.sam.prompt_encoder import PromptEncoder
 from geosam2.sam2.modeling.sam.transformer import TwoWayTransformer
 from geosam2.sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames

@@ -93,6 +93,8 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         <input type="file" id="file" accept=".glb,.gltf,.obj,.ply,.stl"/>
       </label>
       <div class="out" id="o0">no mesh selected</div>
+      <div class="row" style="margin-top:10px"><button id="ball" disabled>Run all steps</button>
+        <span class="hint" style="margin:0">Every stage in turn with the settings below, stopping at the first error. Each stage stays re-runnable on its own afterwards.</span></div>
     </div>
 
     <div class="step" id="s1">
@@ -363,7 +365,7 @@ function useViews(root,msg){
 sel.onchange=()=>{
   if(!sel.value){$('o0').textContent='no mesh selected';return;}
   S.mesh=sel.value+'/mesh.glb'; $('o0').textContent=sel.value;
-  resetStages(); $('b1').disabled=true;
+  resetStages(); $('b1').disabled=true; $('ball').disabled=false;
   useViews(sel.value,'pre-rendered sample — step 1 skipped');
   log('sample: '+sel.value);
 };
@@ -375,7 +377,7 @@ async function uploadMesh(f){
   const r=await response.json();
   S.mesh=r.path; S.dataRoot=null; $('sample').value='';
   $('o0').classList.remove('error'); $('o0').textContent=f.name+' → '+r.path; $('b1').disabled=false;
-  resetStages();
+  $('ball').disabled=false; resetStages();
   log('uploaded: '+f.name);
 }
 // A new mesh invalidates every result: the registry, the selectors, the gates.
@@ -492,6 +494,25 @@ $('b6').onclick=()=>{ const inp=picked('in6'); const opts=Object.fromEntries(SPL
     register('split','6 '+preset+' '+opts.output_mode+' '+r.n_split_parts+'p ← '+inp.id,
       {},r.segvigen_glb);
   }); };
+
+// ── All steps ────────────────────────────────────────────────────────────
+// The buttons return step()'s promise, so the chain is the buttons themselves:
+// the seed view comes from the VLM, and the bake and the split take the latest
+// result, which the registry selects by default.
+$('ball').onclick=async()=>{
+  if(!S.mesh) return;
+  const t0=Date.now(); $('ball').disabled=true; log('▶ all steps');
+  try{
+    if(!S.dataRoot) await $('b1').onclick();      // an uploaded mesh; a sample is pre-rendered
+    await $('b2').onclick();
+    await $('b3').onclick();
+    await $('b4').onclick();
+    await $('b5').onclick();
+    await $('b6').onclick();
+    log('✔ all steps in '+((Date.now()-t0)/1000).toFixed(0)+' s');
+  }catch(e){ log('✘ stopped: '+e.message); }
+  finally{ $('ball').disabled=false; }
+};
 
 // ── Status ───────────────────────────────────────────────────────────────
 const st = await (await fetch('/api/status')).json();
