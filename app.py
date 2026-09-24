@@ -11,8 +11,8 @@ step.
     2. /api/jobs/pickview  views         -> the seed view SegviGen's picker chooses
     3. /api/jobs/guidance  views + view  -> SegviGen's describe/palette/paint -> the map
     4. /api/jobs/segment   views + map   -> GeoSAM2, as the paper runs it
-    5. /api/jobs/bake      labels        -> the labels as a texture on the UVs
-    6. /api/jobs/split     baked mesh    -> SegviGen's split (its code), one mesh per part
+    4b /api/jobs/fill      labels        -> the unassigned faces given a label
+    5. /api/jobs/split     labels        -> SegviGen's split, one mesh per part
 
 Run with:
     python app.py            # http://127.0.0.1:7862
@@ -20,6 +20,7 @@ Run with:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import shutil
@@ -44,6 +45,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from geosam2._propagation import PropagationSettings
 from geosam2.segmenter import REPO_ROOT, GeoSAM2Segmenter
 from geosam2.util.views import is_view_directory
 from geosam2.util.logs import get_logger
@@ -258,6 +260,35 @@ class SegmentParams(BaseModel):
     data_root: str
     seed_view: int
     postprocess_pa: float = 0.02
+    # GeoSAM2's other knobs, PropagationSettings' fields; defaults are VAST's values.
+    settings: Dict[str, Any] = {}
+
+
+GEOSAM2_HELP = {
+    "auto_complement": "Segment the opposite view automatically for what the seed map left uncovered, and propagate it.",
+    "opposite_offset": "Which view the complement runs on: seed view + offset (6 = the view behind).",
+    "seed_stability": "Min stability score of the masks propagated from the map (0 = keep them all).",
+    "seed_area_alpha": "Drop a map object whose mask grows more than alpha times in another view (10000 = never).",
+    "auto_stability": "Min stability score of the complement's masks.",
+    "auto_area_alpha": "Drop a complement object whose mask grows more than alpha times in another view (1 = never grows).",
+    "merge_iou": "Two objects overlapping more than this (0-1) are merged into one.",
+    "shrink_kernel": "Every propagated mask is opened (eroded then dilated): kernel size in px.",
+    "shrink_iters": "Opening iterations. Features thinner than about kernel x iters px are erased (handles, thin legs).",
+    "pred_iou_thresh": "Automatic generator: min predicted quality of a mask.",
+    "stability_score_thresh": "Automatic generator: min stability of a mask.",
+    "box_nms_thresh": "Automatic generator: masks whose boxes overlap more than this are redundant.",
+    "min_mask_region_area": "Automatic generator: masks smaller than this (px) are dropped.",
+    "dedup_iou": "Automatic masks overlapping more than this (%) count as one.",
+    "samples_per_face": "Points sampled per face to vote its label. More helps large faces.",
+    "postprocess": "GeoSAM2's post-process (complete_labels): speckle removal, filling. Off: the post-processed labels are the raw lift.",
+}
+
+
+@app.get("/api/geosam2_settings")
+def geosam2_settings() -> list:
+    """The knobs the page lists, with their defaults and what they do."""
+    return [{"name": f.name, "default": f.default, "help": GEOSAM2_HELP.get(f.name, "")}
+            for f in dataclasses.fields(PropagationSettings)]
 
 
 def _parts_glb(data_root: Path, labels_path: Path, work: Path, name: str) -> dict:
@@ -287,11 +318,13 @@ def start_segment(params: SegmentParams) -> dict:
     def _run() -> dict:
         work = _WORK_ROOT / f"seg_{uuid.uuid4().hex[:8]}"
         out_dir = work / "3d_seg"
+        known = {f.name for f in dataclasses.fields(PropagationSettings)}
+        settings = PropagationSettings(**{k: v for k, v in params.settings.items() if k in known})
         glb_path = _segmenter.run(data_root, mask_path, params.seed_view, out_dir,
-                                  postprocess_pa=params.postprocess_pa)
+                                  postprocess_pa=params.postprocess_pa, settings=settings)
         # Both of GeoSAM2's own outputs are handed back: the raw lift and its
         # post-process are two of the methods whose weight the later stages
-        # are there to measure, so either can feed the bake.
+        # are there to measure, so either can feed the split.
         out = _parts_glb(data_root, out_dir / "labels_post.npy", work, "geosam2")
         raw = _parts_glb(data_root, out_dir / "labels_raw.npy", work, "geosam2_raw")
         out.update(work_dir=str(work), out_dir=str(out_dir), seed_view=params.seed_view,
@@ -302,88 +335,101 @@ def start_segment(params: SegmentParams) -> dict:
     return _start_job(_run)
 
 
-# ── 5-6. Bake the labels, then SegviGen's split ────────────────────────────
+# ── 4b. Fill the unassigned faces ──────────────────────────────────────────
 
-class BakeParams(BaseModel):
-    """5 -- labels onto the mesh's own UVs, as a flat-colour texture."""
+class FillParams(BaseModel):
+    """4b -- the unassigned faces given a label, by the geometry."""
     data_root: str
     work_dir: str
     labels_path: str
-    texture_size: int = 4096
+    lam: float = 1.0
+    thickness_weight: float = 1.0
+    crease_deg: float = 15.0
 
 
-class SplitParams(BaseModel):
-    """6 -- SegviGen's split, its own knobs under its own names."""
+@app.post("/api/jobs/fill")
+def start_fill(params: FillParams) -> dict:
+    """4b: unassigned faces are no evidence, never a part -- fill them from their
+    neighbours along the surface and, where no view saw them, from the other
+    side of the thickness. Takes any label file, gives a label file."""
+    data_root = _require_dir(params.data_root)
+    work = Path(params.work_dir)
+    if not work.is_dir():
+        raise HTTPException(400, f"unknown work dir: {work}")
+    if not Path(params.labels_path).is_file():
+        raise HTTPException(400, f"labels not found: {params.labels_path}")
+
+    def _run() -> dict:
+        from geosam2.util.labels import export_parts, fill_labels
+        labels, report = fill_labels(data_root / "mesh.glb", np.load(params.labels_path),
+                                     np.load(work / "3d_seg" / "labels_raw.npy"),
+                                     lam=params.lam, thickness_weight=params.thickness_weight,
+                                     crease_deg=params.crease_deg)
+        tag = uuid.uuid4().hex[:6]
+        out = work / f"labels_filled_{tag}.npy"
+        np.save(out, labels)
+        # Shown as filled, without the fragment cleanup parts() applies: once
+        # nothing is unassigned, that cleanup would move faces that already had
+        # a label, and this stage must only show what it changed.
+        scene, structure = export_parts(data_root / "mesh.glb", labels)
+        glb = work / f"filled_{tag}.glb"
+        scene.export(glb)
+        parts = [p for p in structure["children"] if p["name"] != "unassigned"]
+        return {"glb_path": str(glb), "labels_path": str(out), "n_parts": len(parts),
+                "unlabeled_faces": report["unassigned_after"], "parts": structure["children"],
+                "report": report, "work_dir": str(work)}
+
+    return _start_job(_run)
+
+
+# ── 5. Split the labels into parts ─────────────────────────────────────────
+
+
+class FaceSplitParams(BaseModel):
+    """5 -- SegviGen's split, fed the labels directly."""
+    data_root: str
     work_dir: str
-    baked_glb: str
-    color_quant_step: int = 16
-    palette_min_frac: float = 0.0005
-    palette_max_colors: int = 256
-    palette_merge_dist: int = 32
+    labels_path: str
+    mode: str = "sdf"        # sdf: keep the UV marching-triangle cut | faces: edges only
+    small_component_min_faces: int = 50
+    postprocess_iters: int = 3
     smooth: float = 1.5
-    min_faces_per_part: int = 1
+    band_refine: bool = True
     island_majority: bool = False
-    cleanup_fragments: bool = False
-    output_mode: str = "vertex_colors"
+    min_faces_per_part: int = 1
+    cleanup_fragments: bool = True
 
 
-SPLIT_FIELDS = ("color_quant_step", "palette_min_frac", "palette_max_colors",
-                "palette_merge_dist", "smooth", "min_faces_per_part",
-                "island_majority", "cleanup_fragments", "output_mode")
+FACE_SPLIT_FIELDS = ("mode", "small_component_min_faces", "postprocess_iters",
+                     "smooth", "band_refine", "island_majority",
+                     "min_faces_per_part", "cleanup_fragments")
 
 
-@app.get("/api/presets/split")
-def split_presets() -> dict:
-    from geosam2.util.split import SPLIT_PRESETS
-    return SPLIT_PRESETS
-
-
-@app.post("/api/jobs/bake")
-def start_bake(params: BakeParams) -> dict:
-    """5: the translation step -- labels become a texture the split can read."""
+@app.post("/api/jobs/split")
+def start_split(params: FaceSplitParams) -> dict:
+    """5: SegviGen's split on a label file -- the only stage that cuts geometry."""
     data_root = _require_dir(params.data_root)
     work = Path(params.work_dir)
     if not work.is_dir():
         raise HTTPException(400, f"unknown work dir: {work}")
     if not Path(params.labels_path).is_file():
         raise HTTPException(400, f"labels not found: {params.labels_path} (re-run stage 4)")
-
-    def _run() -> dict:
-        from geosam2.util.labels import bake_labels_to_glb
-        out = work / "segvigen"
-        out.mkdir(parents=True, exist_ok=True)
-        baked = out / f"baked_{params.texture_size}_{uuid.uuid4().hex[:6]}.glb"
-        palette = bake_labels_to_glb(str(data_root / "mesh.glb"),
-                                     np.load(params.labels_path), str(baked),
-                                     size=params.texture_size)
-        return {"baked_glb": str(baked), "n_labels": len(palette),
-                "texture_size": params.texture_size}
-
-    return _start_job(_run)
-
-
-@app.post("/api/jobs/split")
-def start_split(params: SplitParams) -> dict:
-    """6: SegviGen's split, unchanged -- the only stage that cuts geometry."""
-    work = Path(params.work_dir)
-    if not work.is_dir():
-        raise HTTPException(400, f"unknown work dir: {work}")
-    if not Path(params.baked_glb).is_file():
-        raise HTTPException(400, f"baked mesh not found: {params.baked_glb} (re-run stage 5)")
+    if params.mode not in ("sdf", "faces"):
+        raise HTTPException(400, f"mode must be sdf or faces, got {params.mode!r}")
 
     def _run() -> dict:
         import trimesh
 
-        from geosam2.util.split import split_glb_by_texture_palette_rgb
-        # One file per parameter set: a fixed name would make two runs
-        # indistinguishable in the viewer and on disk.
-        tag = uuid.uuid4().hex[:6]
-        out = work / "segvigen" / f"parts_{params.output_mode}_{tag}.glb"
-        split_glb_by_texture_palette_rgb(params.baked_glb, str(out), debug_print=True,
-                                         **{k: getattr(params, k) for k in SPLIT_FIELDS})
+        from geosam2.util.split import split_glb_by_face_labels
+        out_dir = work / "segvigen"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"parts_{params.mode}_{uuid.uuid4().hex[:6]}.glb"
+        split_glb_by_face_labels(
+            str(data_root / "mesh.glb"), np.load(params.labels_path), str(out),
+            debug_print=True, **{k: getattr(params, k) for k in FACE_SPLIT_FIELDS})
         scene = trimesh.load(out, force="scene")
         return {"segvigen_glb": str(out), "n_split_parts": len(scene.geometry),
-                "output_mode": params.output_mode}
+                "mode": params.mode}
 
     return _start_job(_run)
 

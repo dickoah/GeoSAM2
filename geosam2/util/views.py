@@ -583,8 +583,18 @@ def is_view_directory(path: Path) -> bool:
 
 
 def load_mesh(path: Union[str, Path]) -> trimesh.Trimesh:
-    """``mesh.glb`` as one mesh, in the face order the labels refer to."""
-    return trimesh.load(str(path), force="mesh")
+    """``mesh.glb`` as one mesh, in the face order the labels refer to.
+
+    Geometry only: every caller reads ``faces`` and ``vertices``, and
+    ``force="mesh"`` also concatenates the materials into one atlas -- 6.0 s on
+    a 30k-face asset carrying 84 MB of textures, against 0.4 s on a 664k-face
+    one carrying none. ``dump()`` applies the scene graph's transforms, which is
+    what makes the face order and the coordinates byte-equal to what
+    ``force="mesh"`` returned (checked on 14 assets, 1.8k to 664k faces).
+    """
+    scene = trimesh.load(str(path), force="scene", process=False)
+    return trimesh.util.concatenate(
+        [trimesh.Trimesh(m.vertices, m.faces, process=False) for m in scene.dump()])
 
 
 def explode_faces(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -662,6 +672,14 @@ def _quantize_rgb(rgb: np.ndarray, step: int) -> np.ndarray:
         return rgb
     q = (rgb // step) * step
     return q.astype(np.uint8)
+
+
+def _to_int_label_map(mask_like: np.ndarray) -> np.ndarray:
+    if mask_like.ndim != 2:
+        raise ValueError(f"Mask must be HxW, got shape: {mask_like.shape}")
+    if np.issubdtype(mask_like.dtype, np.floating):
+        return np.rint(mask_like).astype(np.int32)
+    return mask_like.astype(np.int32)
 
 
 def extract_mask_segments(mask_path: str) -> List[Tuple[Tuple[str, int], np.ndarray]]:

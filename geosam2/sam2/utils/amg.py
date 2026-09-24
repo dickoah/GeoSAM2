@@ -44,30 +44,35 @@ class MaskData:
         return self._stats.items()
 
     def filter(self, keep: torch.Tensor) -> None:
+        # The lists (the RLEs) are filtered against a numpy copy of keep: indexing
+        # a tensor scalar per element cost 5 s per image on a dense mesh.
+        keep_np = keep.detach().cpu().numpy()
         for k, v in self._stats.items():
             if v is None:
                 self._stats[k] = None
             elif isinstance(v, torch.Tensor):
                 self._stats[k] = v[torch.as_tensor(keep, device=v.device)]
             elif isinstance(v, np.ndarray):
-                self._stats[k] = v[keep.detach().cpu().numpy()]
+                self._stats[k] = v[keep_np]
             elif isinstance(v, list) and keep.dtype == torch.bool:
-                self._stats[k] = [a for i, a in enumerate(v) if keep[i]]
+                self._stats[k] = [a for a, kept in zip(v, keep_np) if kept]
             elif isinstance(v, list):
-                self._stats[k] = [v[i] for i in keep]
+                self._stats[k] = [v[i] for i in keep_np]
             else:
                 raise TypeError(f"MaskData key {k} has an unsupported type {type(v)}.")
 
     def cat(self, new_stats: "MaskData") -> None:
+        # Lists hold RLE dicts that are only ever read, so a new list is enough;
+        # deepcopy-ing them cost 1.7 s per image on a dense mesh.
         for k, v in new_stats.items():
             if k not in self._stats or self._stats[k] is None:
-                self._stats[k] = deepcopy(v)
+                self._stats[k] = list(v) if isinstance(v, list) else v.clone() if isinstance(v, torch.Tensor) else v.copy()
             elif isinstance(v, torch.Tensor):
                 self._stats[k] = torch.cat([self._stats[k], v], dim=0)
             elif isinstance(v, np.ndarray):
                 self._stats[k] = np.concatenate([self._stats[k], v], axis=0)
             elif isinstance(v, list):
-                self._stats[k] = self._stats[k] + deepcopy(v)
+                self._stats[k] = self._stats[k] + list(v)
             else:
                 raise TypeError(f"MaskData key {k} has an unsupported type {type(v)}.")
 

@@ -761,7 +761,7 @@ VIEW_MAP: Dict[str, int] = {
 }
 WHITE = (255, 255, 255)
 
-DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL", "google:gemini-3.1-pro-preview")
+DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL", "google:gemini-3.7-flash")
 PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL", "google:gemini-3.1-flash-image")
 
 

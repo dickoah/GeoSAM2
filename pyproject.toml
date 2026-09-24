@@ -35,6 +35,7 @@ dependencies = [
     "tqdm",
     "trimesh",
     "ninja",
+    # No pyrender/PyOpenGL: its stale pin makes any resolve fail. See requirements.txt.
 ]
 
 [project.urls]
