@@ -27,35 +27,63 @@ logger = get_logger("geosam2.labels")
 # post-process carry different id sets, and a rank-based palette would shift
 # every colour between the two.
 #
-# The split quantises texels to a 16-step grid and folds palette entries
-# closer than palette_merge_dist=32 into one part, so two labels must never be
-# painted less than that apart. Kelly's colours are not (several pairs sit ~30
-# apart: 19 labels came out as 16 parts). Farthest-point on the RGB grid, with
-# black (unmapped texels) and the unassigned grey pre-taken, keeps every pair
-# >= _MIN_SEP.
-_MIN_SEP = 64.0
+# Colours come from the pool the guidance paints its part map with, picked the
+# way it picks them (farthest-point over what is already taken), so a run's
+# parts wear the hues the seed map showed. Past the pool they are generated on
+# the hue circle at fixed saturation and lightness: the RGB-grid farthest point
+# this used before had to reach the cube's corners and handed out saturated
+# primaries. _MIN_SEP is a floor on the closest pair, warned about rather than
+# enforced -- it was 64 while the texture split folded entries closer than
+# palette_merge_dist=32, and nothing reads colours back now.
+_MIN_SEP = 32.0
 UNASSIGNED_LABELS = (0, 999)
 UNASSIGNED_RGB = (120, 120, 120)
+# The guidance's pool minus its grey (#7f7e80 sits 12 from UNASSIGNED_RGB and
+# would read as "no label"); see guidance._KELLY_PALETTE.
+_POOL = ("#dedede", "#333333", "#ebce2b", "#702c8c", "#ba1c30", "#5fa641",
+         "#d485b2", "#db6917", "#4277b6", "#df8461", "#c0bd7f", "#463397",
+         "#e1a11a", "#91218c", "#e8e948", "#7e1510", "#92ae31", "#6f340d",
+         "#d32b1e", "#2b3514", "#96cde6")
 _sequence: list = []
 
 
+def _candidates() -> np.ndarray:
+    """The grid colours past the pool may come from: muted, mid-lightness.
+
+    A farthest-point walk over the whole RGB cube heads for its corners and
+    hands out saturated primaries, which is what this palette used to look
+    like. Bounding chroma and lightness keeps the generated ones in the same
+    register as the pool's.
+    """
+    step = np.arange(24, 232, 8, dtype=np.float64)
+    grid = np.stack(np.meshgrid(step, step, step, indexing="ij"), -1).reshape(-1, 3)
+    chroma = grid.max(axis=1) - grid.min(axis=1)
+    light = grid.mean(axis=1)
+    return grid[(chroma >= 40) & (chroma <= 150) & (light >= 60) & (light <= 200)]
+
+
 def _colour_sequence(n: int) -> list:
-    """The first ``n`` farthest-point colours, cached: colour k never changes."""
+    """The first ``n`` palette colours, cached: colour k never changes."""
     if len(_sequence) >= n:
         return _sequence[:n]
-    # 32..224: near-white reads as "unassigned" and near-black as background.
-    step = np.arange(32, 225, 16, dtype=np.float64)
-    grid = np.stack(np.meshgrid(step, step, step, indexing="ij"), -1).reshape(-1, 3)
-    taken = np.vstack([np.zeros((1, 3)), np.array([UNASSIGNED_RGB], np.float64),
-                       np.array(_sequence, np.float64).reshape(-1, 3)])
+    pool = [tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in _POOL]
+    # Black and the unassigned grey are taken: a part must not wear either.
+    taken = [(0, 0, 0), UNASSIGNED_RGB, *_sequence]
+    grid = None
     while len(_sequence) < n:
-        d = np.linalg.norm(grid[:, None] - taken[None], axis=2).min(axis=1)
-        pick = grid[int(np.argmax(d))]
-        if d.max() < _MIN_SEP:
-            logger.warning("[palette] colour %d: closest pair down to %.0f (< %.0f), "
-                           "the split may fold two parts", len(_sequence), d.max(), _MIN_SEP)
-        _sequence.append(tuple(int(c) for c in pick))
-        taken = np.vstack([taken, pick])
+        free = [c for c in pool if c not in _sequence]
+        if not free:
+            if grid is None:
+                grid = _candidates()
+            free = [tuple(int(v) for v in c) for c in grid]
+        far = np.linalg.norm(np.array(free, np.float64)[:, None]
+                             - np.array(taken, np.float64)[None], axis=2).min(axis=1)
+        pick, gap = free[int(np.argmax(far))], float(far.max())
+        if gap < _MIN_SEP:
+            logger.warning("[palette] colour %d is only %.0f from another (< %.0f): "
+                           "two parts may look alike", len(_sequence), gap, _MIN_SEP)
+        _sequence.append(pick)
+        taken.append(pick)
     return _sequence[:n]
 
 

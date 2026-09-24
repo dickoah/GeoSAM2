@@ -583,8 +583,18 @@ def is_view_directory(path: Path) -> bool:
 
 
 def load_mesh(path: Union[str, Path]) -> trimesh.Trimesh:
-    """``mesh.glb`` as one mesh, in the face order the labels refer to."""
-    return trimesh.load(str(path), force="mesh")
+    """``mesh.glb`` as one mesh, in the face order the labels refer to.
+
+    Geometry only: every caller reads ``faces`` and ``vertices``, and
+    ``force="mesh"`` also concatenates the materials into one atlas -- 6.0 s on
+    a 30k-face asset carrying 84 MB of textures, against 0.4 s on a 664k-face
+    one carrying none. ``dump()`` applies the scene graph's transforms, which is
+    what makes the face order and the coordinates byte-equal to what
+    ``force="mesh"`` returned (checked on 14 assets, 1.8k to 664k faces).
+    """
+    scene = trimesh.load(str(path), force="scene", process=False)
+    return trimesh.util.concatenate(
+        [trimesh.Trimesh(m.vertices, m.faces, process=False) for m in scene.dump()])
 
 
 def explode_faces(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
