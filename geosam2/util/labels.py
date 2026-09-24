@@ -210,6 +210,7 @@ def _add_part(
 def fill_labels(
     mesh_path: Union[str, Path],
     face_label: np.ndarray,
+    raw_label: np.ndarray,
     lam: float = 1.0,
     thickness_weight: float = 1.0,
     crease_deg: float = 15.0,
@@ -229,13 +230,16 @@ def fill_labels(
       (``thickness_weight``): the faces no view saw -- the back of a door
       panel -- take the label of what is on the other side of the thickness.
 
+    Faces the lift never saw (``raw_label``) are free too: the post-process
+    labels them blindly, the inside of a door becoming the carcass.
+
     Returns the labels and a small report.
     """
     mesh = load_mesh(mesh_path)
     labels = np.asarray(face_label).reshape(-1).astype(np.int64).copy()
     if len(labels) != len(mesh.faces):
         raise RuntimeError(f"label/mesh mismatch: {len(labels)} labels for {len(mesh.faces)} faces")
-    un = np.isin(labels, UNASSIGNED_LABELS)
+    un = np.isin(labels, UNASSIGNED_LABELS) | np.isin(np.asarray(raw_label).reshape(-1), UNASSIGNED_LABELS)
     report = {"unassigned_before": int(un.sum()), "unassigned_after": int(un.sum()),
               "from_neighbours": 0, "from_thickness": 0}
     if not un.any() or un.all():
