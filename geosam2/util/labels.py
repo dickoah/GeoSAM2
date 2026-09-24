@@ -1,63 +1,89 @@
-"""Per-face labels onto the input mesh: the palette, the baked texture, the parts.
+"""Per-face labels onto the input mesh: the palette, the fill, the parts.
 
-The palette is keyed by label id and shared by every stage, so a part keeps
-its colour from the raw lift to the split. ``bake_labels_to_glb`` paints the
-labels into a flat-colour texture on the mesh's own UVs, which is what
-SegviGen's split (``geosam2.util.split``) reads. ``export_parts`` cuts the
-mesh into one geometry per label, in the input's own frame.
+The palette is keyed by label id and shared by every stage, so a part keeps its
+colour from the raw lift to the split. ``export_parts`` cuts the mesh into one
+geometry per label, in the input's own frame.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
-import cv2
 import numpy as np
 import trimesh
-from PIL import Image
+from scipy.spatial import cKDTree
 
 from geosam2.util.logs import get_logger
+from geosam2.util.split import (_CONCAVE_ETA, _D_CLIP, _SCALE, _WEIGHT_FLOOR, _expand,
+                                _weld_index, _welded_face_pairs)
 from geosam2.util.views import load_mesh
 
 logger = get_logger("geosam2.labels")
 
 # THE palette: one colour per label id, the same at every stage (raw lift,
-# post-process, bake, split), so a part keeps its colour from one viewer entry
+# post-process, fill, split), so a part keeps its colour from one viewer entry
 # to the next. Keyed by the id's VALUE, not its rank -- the raw lift and the
 # post-process carry different id sets, and a rank-based palette would shift
 # every colour between the two.
 #
-# The split quantises texels to a 16-step grid and folds palette entries
-# closer than palette_merge_dist=32 into one part, so two labels must never be
-# painted less than that apart. Kelly's colours are not (several pairs sit ~30
-# apart: 19 labels came out as 16 parts). Farthest-point on the RGB grid, with
-# black (unmapped texels) and the unassigned grey pre-taken, keeps every pair
-# >= _MIN_SEP.
-_MIN_SEP = 64.0
+# Colours come from the pool the guidance paints its part map with, picked the
+# way it picks them (farthest-point over what is already taken), so a run's
+# parts wear the hues the seed map showed. Past the pool they are generated on
+# the hue circle at fixed saturation and lightness: the RGB-grid farthest point
+# this used before had to reach the cube's corners and handed out saturated
+# primaries. _MIN_SEP is a floor on the closest pair, warned about rather than
+# enforced -- it was 64 while the texture split folded entries closer than
+# palette_merge_dist=32, and nothing reads colours back now.
+_MIN_SEP = 32.0
 UNASSIGNED_LABELS = (0, 999)
 UNASSIGNED_RGB = (120, 120, 120)
+# The guidance's pool minus its grey (#7f7e80 sits 12 from UNASSIGNED_RGB and
+# would read as "no label"); see guidance._KELLY_PALETTE.
+_POOL = ("#dedede", "#333333", "#ebce2b", "#702c8c", "#ba1c30", "#5fa641",
+         "#d485b2", "#db6917", "#4277b6", "#df8461", "#c0bd7f", "#463397",
+         "#e1a11a", "#91218c", "#e8e948", "#7e1510", "#92ae31", "#6f340d",
+         "#d32b1e", "#2b3514", "#96cde6")
 _sequence: list = []
 
 
+def _candidates() -> np.ndarray:
+    """The grid colours past the pool may come from: muted, mid-lightness.
+
+    A farthest-point walk over the whole RGB cube heads for its corners and
+    hands out saturated primaries, which is what this palette used to look
+    like. Bounding chroma and lightness keeps the generated ones in the same
+    register as the pool's.
+    """
+    step = np.arange(24, 232, 8, dtype=np.float64)
+    grid = np.stack(np.meshgrid(step, step, step, indexing="ij"), -1).reshape(-1, 3)
+    chroma = grid.max(axis=1) - grid.min(axis=1)
+    light = grid.mean(axis=1)
+    return grid[(chroma >= 40) & (chroma <= 150) & (light >= 60) & (light <= 200)]
+
+
 def _colour_sequence(n: int) -> list:
-    """The first ``n`` farthest-point colours, cached: colour k never changes."""
+    """The first ``n`` palette colours, cached: colour k never changes."""
     if len(_sequence) >= n:
         return _sequence[:n]
-    # 32..224: near-white reads as "unassigned" and near-black as background.
-    step = np.arange(32, 225, 16, dtype=np.float64)
-    grid = np.stack(np.meshgrid(step, step, step, indexing="ij"), -1).reshape(-1, 3)
-    taken = np.vstack([np.zeros((1, 3)), np.array([UNASSIGNED_RGB], np.float64),
-                       np.array(_sequence, np.float64).reshape(-1, 3)])
+    pool = [tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in _POOL]
+    # Black and the unassigned grey are taken: a part must not wear either.
+    taken = [(0, 0, 0), UNASSIGNED_RGB, *_sequence]
+    grid = None
     while len(_sequence) < n:
-        d = np.linalg.norm(grid[:, None] - taken[None], axis=2).min(axis=1)
-        pick = grid[int(np.argmax(d))]
-        if d.max() < _MIN_SEP:
-            logger.warning("[palette] colour %d: closest pair down to %.0f (< %.0f), "
-                           "the split may fold two parts", len(_sequence), d.max(), _MIN_SEP)
-        _sequence.append(tuple(int(c) for c in pick))
-        taken = np.vstack([taken, pick])
+        free = [c for c in pool if c not in _sequence]
+        if not free:
+            if grid is None:
+                grid = _candidates()
+            free = [tuple(int(v) for v in c) for c in grid]
+        far = np.linalg.norm(np.array(free, np.float64)[:, None]
+                             - np.array(taken, np.float64)[None], axis=2).min(axis=1)
+        pick, gap = free[int(np.argmax(far))], float(far.max())
+        if gap < _MIN_SEP:
+            logger.warning("[palette] colour %d is only %.0f from another (< %.0f): "
+                           "two parts may look alike", len(_sequence), gap, _MIN_SEP)
+        _sequence.append(pick)
+        taken.append(pick)
     return _sequence[:n]
 
 
@@ -66,7 +92,7 @@ def to_linear_u8(rgb) -> np.ndarray:
 
     Textures are sRGB in glTF and vertex colours are linear; a viewer converts
     the latter on output. The palette is authored in sRGB (it is what the
-    swatches and the baked texture show), so a vertex-colour export has to be
+    swatches show), so a vertex-colour export has to be
     encoded, or the same part comes out lighter than its texture.
     """
     c = np.asarray(rgb, np.float64) / 255.0
@@ -80,48 +106,6 @@ def label_palette(labels: np.ndarray) -> Dict[int, Tuple[int, int, int]]:
     parts = [i for i in ids if i not in UNASSIGNED_LABELS]
     seq = _colour_sequence(max(parts, default=-1) + 1)
     return {i: (UNASSIGNED_RGB if i in UNASSIGNED_LABELS else seq[i]) for i in ids}
-
-
-def bake_labels_to_glb(mesh_path: str, face_labels: np.ndarray, out_glb: str,
-                       size: int = 4096) -> Dict[int, Tuple[int, int, int]]:
-    """Write ``mesh_path`` with a flat-colour texture carrying ``face_labels``.
-
-    The mesh keeps its own UVs; each face's UV triangle is filled with its
-    label's colour. Loaded with ``load_mesh``, as the labels were made (force="mesh",
-    default processing) so the face order the labels index is the same.
-    """
-    mesh = load_mesh(mesh_path)
-    labels = np.asarray(face_labels).reshape(-1).astype(np.int64)
-    if len(labels) != len(mesh.faces):
-        raise ValueError(f"{len(labels)} labels for {len(mesh.faces)} faces")
-    uv = getattr(mesh.visual, "uv", None)
-    if uv is None or len(uv) != len(mesh.vertices):
-        raise ValueError("mesh has no per-vertex UVs; SegviGen's split needs an atlas")
-
-    palette = label_palette(labels)
-    img = np.zeros((size, size, 3), np.uint8)
-    # u right, v up in glTF/trimesh; image rows go down.
-    px = np.stack([uv[:, 0] * (size - 1), (1.0 - uv[:, 1]) * (size - 1)], axis=1)
-    faces = np.asarray(mesh.faces)
-    shift = 4
-    for label, colour in palette.items():
-        tris = (px[faces[labels == label]] * (1 << shift)).round().astype(np.int32)
-        # The array is handed to PIL as RGB; cv2 writes the tuple in channel
-        # order, so it is NOT reversed here (that swap painted blue parts brown).
-        rgb = tuple(int(c) for c in colour)
-        cv2.fillPoly(img, list(tris), rgb, lineType=cv2.LINE_8, shift=shift)
-        # Thin triangles can rasterise to nothing; their edges still own texels.
-        cv2.polylines(img, list(tris), True, rgb, 1, lineType=cv2.LINE_8, shift=shift)
-    pil = Image.fromarray(img)
-
-    material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=pil, metallicFactor=0.0, roughnessFactor=1.0)
-    baked = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
-    baked.visual = trimesh.visual.TextureVisuals(uv=uv, image=pil, material=material)
-    os.makedirs(os.path.dirname(out_glb) or ".", exist_ok=True)
-    baked.export(out_glb)
-    logger.info("[bake] %d labels -> %s (%dx%d)", len(palette), out_glb, size, size)
-    return palette
 
 
 # ── Parts ────────────────────────────────────────────────────────────────────
@@ -166,6 +150,8 @@ def export_parts(
 
     scene = trimesh.Scene()
     children: List[Dict[str, Any]] = []
+    # bare: submesh would concatenate the texture into every part, _add_part drops it
+    mesh = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
 
     # Parts are named by label id, not by rank: the raw lift and the
     # post-process share ids, so "part_003" is the same part in both.
@@ -217,3 +203,107 @@ def _add_part(
     )
     part.metadata["name"] = name
     scene.add_geometry(part, node_name=name, geom_name=name)
+
+
+# ── Filling the unassigned faces ─────────────────────────────────────────────
+
+def fill_labels(
+    mesh_path: Union[str, Path],
+    face_label: np.ndarray,
+    lam: float = 1.0,
+    thickness_weight: float = 1.0,
+    crease_deg: float = 15.0,
+    sweeps: int = 3,
+    samples: int = 400_000,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Give every unassigned face a label, following the geometry.
+
+    Unassigned means "no evidence", never a part: those faces are the only
+    free variables of an alpha-expansion graph cut over the mesh, the
+    assigned faces are fixed and speak through their edges. Two terms:
+
+    - between two faces, the length of their shared edge times how flat the
+      fold is (``lam``): a boundary costs little on a crease and a lot across
+      a flat surface, so labels spread over surfaces and stop at edges;
+    - on each unassigned face, the label of the closest assigned surface
+      (``thickness_weight``): the faces no view saw -- the back of a door
+      panel -- take the label of what is on the other side of the thickness.
+
+    Returns the labels and a small report.
+    """
+    mesh = load_mesh(mesh_path)
+    labels = np.asarray(face_label).reshape(-1).astype(np.int64).copy()
+    if len(labels) != len(mesh.faces):
+        raise RuntimeError(f"label/mesh mismatch: {len(labels)} labels for {len(mesh.faces)} faces")
+    un = np.isin(labels, UNASSIGNED_LABELS)
+    report = {"unassigned_before": int(un.sum()), "unassigned_after": int(un.sum()),
+              "from_neighbours": 0, "from_thickness": 0}
+    if not un.any() or un.all():
+        return labels, report
+
+    ids = np.unique(labels[~un])                  # the real parts, sorted: searchsorted indexes them
+    L = len(ids)
+    area = np.asarray(mesh.area_faces, np.float64)
+
+    # Through-thickness prior: the closest assigned surface, sampled densely.
+    seen = mesh.submesh([~un], append=True, repair=False)
+    points, tri = trimesh.sample.sample_surface(seen, samples, seed=0)
+    _, nn = cKDTree(points).query(mesh.triangles_center[un], workers=-1)
+    nearest = np.searchsorted(ids, labels[~un][tri[nn]])
+
+    free = np.flatnonzero(un)
+    cmp = np.full(len(labels), -1, np.int64)
+    cmp[free] = np.arange(len(free))
+    aw = np.clip(area[free] / max(float(area.mean()), 1e-12), 0.0, _D_CLIP)
+    D = np.tile((thickness_weight * aw)[:, None], (1, L))
+    D[np.arange(len(free)), nearest] = 0.0
+
+    # Edges, weighted by length and fold: the split's boundary band terms.
+    V = np.asarray(mesh.vertices, np.float64)
+    F = np.asarray(mesh.faces, np.int64)
+    inv = _weld_index(V, decimals=3)
+    pairs, hs, sel = _welded_face_pairs(inv, F, drop_collapsed=True)
+    ends = np.zeros((int(inv.max()) + 1, 3), np.float64)
+    ends[inv] = V
+    e = hs[sel]
+    length = np.linalg.norm(ends[e[:, 0]] - ends[e[:, 1]], axis=1)
+    a, b = pairs[:, 0], pairs[:, 1]
+    n = np.asarray(mesh.face_normals, np.float64)
+    c = V[F].mean(axis=1)
+    angle = np.arccos(np.clip(np.einsum("ij,ij->i", n[a], n[b]), -1.0, 1.0))
+    convex = np.einsum("ij,ij->i", c[b] - c[a], n[a]) < 0.0
+    flat = np.clip((1.0 + np.cos(angle)) * 0.5, 0.0, 1.0)
+    pen = np.where(convex | (angle < np.radians(crease_deg)), flat, flat * _CONCAVE_ETA)
+    ln = length / max(float(np.mean(length)), 1e-12)
+    w = lam * ln * np.maximum(pen, _WEIGHT_FLOOR)
+
+    # An edge from a free face to a fixed one folds into the free face's unary.
+    one = un[a] ^ un[b]
+    fa = np.where(un[a[one]], a[one], b[one])
+    fixed = np.where(un[a[one]], b[one], a[one])
+    fixed_idx = np.searchsorted(ids, labels[fixed])
+    D += np.bincount(cmp[fa], weights=w[one], minlength=len(free))[:, None]
+    np.subtract.at(D, (cmp[fa], fixed_idx), w[one])
+    both = un[a] & un[b]
+    pairs_f = cmp[pairs[both]]
+    w_f = np.rint(w[both] * _SCALE).astype(np.int64)
+
+    lab_f = nearest.copy()
+    for _ in range(sweeps):
+        moved = 0
+        for alpha in range(L):
+            new = _expand(lab_f, alpha, D, pairs_f, w_f)
+            moved += int((new != lab_f).sum())
+            lab_f = new
+        if moved == 0:
+            break
+    labels[free] = ids[lab_f]
+    if not np.array_equal(labels[~un], np.asarray(face_label).reshape(-1)[~un]):
+        raise RuntimeError("fill_labels changed an assigned face; only the unassigned ones may move")
+    report.update(unassigned_after=int(np.isin(labels, UNASSIGNED_LABELS).sum()),
+                  from_neighbours=int((lab_f != nearest).sum()),
+                  from_thickness=int((lab_f == nearest).sum()))
+    logger.info("[fill] %d unassigned faces labelled (%d by their neighbours, %d through the thickness)",
+                len(free), report["from_neighbours"], report["from_thickness"])
+    return labels, report
+

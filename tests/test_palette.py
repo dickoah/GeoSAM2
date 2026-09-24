@@ -14,12 +14,20 @@ def test_same_id_same_colour_across_label_sets():
     assert all(raw[i] == post[i] for i in post), "colour must follow the id, not its rank"
 
 
-def test_pairs_far_enough_for_the_split():
-    pal = label_palette(np.arange(1, 25))
+def test_pairs_stay_apart():
+    """The floor is the pool's own closest pair (#2b3514/#333333, 32); the
+    generated colours past it must not come nearer than that."""
+    pal = label_palette(np.arange(1, 31))
     cols = np.array(list(pal.values()), np.float64)
     d = np.linalg.norm(cols[:, None] - cols[None], axis=2)
     np.fill_diagonal(d, np.inf)
     assert d.min() >= _MIN_SEP, f"closest pair {d.min():.0f} < {_MIN_SEP}"
+
+
+def test_no_part_wears_the_unassigned_grey():
+    cols = np.array(list(label_palette(np.arange(1, 31)).values()), np.float64)
+    d = np.linalg.norm(cols - np.array(UNASSIGNED_RGB, np.float64), axis=1)
+    assert d.min() >= _MIN_SEP, f"a part sits {d.min():.0f} from the unassigned grey"
 
 
 def test_unassigned_is_grey():

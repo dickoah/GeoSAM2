@@ -4,21 +4,16 @@ Copied from SegviGen (pixmesh/backend/src/libraries/segvigen/util/split.py, as o
 pixmesh commit d6099934) so geosam2 stops loading it from a sibling checkout.
 Owned here from now on; the original module docstring follows.
 
-Split a segmented GLB into per-part sub-meshes (palette labelling + SDF cut).
+Split a GLB into per-part sub-meshes from per-face labels (refinements + SDF cut).
 """
 
 from __future__ import annotations
 
-import csv
 import cv2
-import json
-import struct
 import numpy as np
 import os
-import shutil
 import trimesh
 from PIL import Image, ImageDraw
-from collections import defaultdict
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import (breadth_first_order, connected_components,
                                   maximum_flow)
@@ -28,122 +23,9 @@ from typing import Literal, Any, Dict, Optional, Tuple
 
 # ── Shared low-level helpers (SegviGen's util/_common.py) ─────────────────────
 
-CHUNK_TYPE_JSON = 0x4E4F534A  # b'JSON'
-CHUNK_TYPE_BIN = 0x004E4942   # b'BIN\0'
-
-
-def _load_glb(
-    input_fname: str,
-    force: Literal["scene", "mesh"] = "mesh",
-    process: bool = False,
-) -> trimesh.Scene:
-    scene = trimesh.load(input_fname,
-                         force="scene",
-                         process=process,
-                         merge_primitives=False,
-                         skip_materials=False,
-                         maintain_order=True)
-    if force == "scene":
-        return scene
-
-    placed = [(T, scene.geometry[name])
-              for T, name in map(scene.graph.__getitem__, scene.graph.nodes_geometry)]
-    parts = [g.copy().apply_transform(T) for T, g in placed
-             if isinstance(g, trimesh.Trimesh)]
-    authored_uv = all(getattr(g.visual, "uv", None) is not None
-                      and len(g.visual.uv) == len(g.vertices) for g in parts)
-
-    merged = trimesh.util.concatenate(parts)
-    if not authored_uv:
-        merged.visual = trimesh.visual.texture.TextureVisuals(
-            uv=None, material=getattr(merged.visual, "material", None))
-    return trimesh.Scene(merged)
-
-
-def _quantize_rgb(rgb: np.ndarray, step: int) -> np.ndarray:
-    if step is None or step <= 0:
-        return rgb
-    q = (rgb.astype(np.int32) + step // 2) // step * step
-    return np.clip(q, 0, 255).astype(np.uint8)
-
-
-def _load_glb_json_and_bin(glb_path: str) -> Tuple[dict, bytes]:
-    data = open(glb_path, "rb").read()
-    if len(data) < 12:
-        raise RuntimeError("Invalid GLB: too small")
-    magic, version, length = struct.unpack_from("<4sII", data, 0)
-    if magic != b"glTF":
-        raise RuntimeError("Not a GLB file (missing glTF header)")
-    offset = 12
-    gltf_json = None
-    bin_chunk = None
-    while offset + 8 <= len(data):
-        chunk_len, chunk_type = struct.unpack_from("<II", data, offset)
-        offset += 8
-        chunk_data = data[offset: offset + chunk_len]
-        offset += chunk_len
-        if chunk_type == CHUNK_TYPE_JSON:
-            gltf_json = chunk_data.decode("utf-8", errors="replace")
-        elif chunk_type == CHUNK_TYPE_BIN:
-            bin_chunk = chunk_data
-    if gltf_json is None:
-        raise RuntimeError("GLB missing JSON chunk")
-    if bin_chunk is None:
-        raise RuntimeError("GLB missing BIN chunk")
-    return json.loads(gltf_json), bin_chunk
-
-
-def _extract_basecolor_texture_image(glb_path: str, debug_print: bool = False) -> np.ndarray:
-    gltf, bin_chunk = _load_glb_json_and_bin(glb_path)
-    materials = gltf.get("materials", [])
-    textures = gltf.get("textures", [])
-    images = gltf.get("images", [])
-    buffer_views = gltf.get("bufferViews", [])
-    if not materials:
-        raise RuntimeError("No materials in GLB")
-    pbr = materials[0].get("pbrMetallicRoughness", {})
-    base_tex_index = pbr.get("baseColorTexture", {}).get("index", None)
-    if base_tex_index is None:
-        raise RuntimeError("Material has no baseColorTexture")
-    if base_tex_index >= len(textures):
-        raise RuntimeError("baseColorTexture index out of range")
-    tex = textures[base_tex_index]
-    img_index = tex.get("source", None)
-    if img_index is None or img_index >= len(images):
-        raise RuntimeError("Texture has no valid image source")
-    img_info = images[img_index]
-    bv_index = img_info.get("bufferView", None)
-    mime = img_info.get("mimeType", None)
-    if bv_index is None:
-        uri = img_info.get("uri", None)
-        raise RuntimeError(f"Image is not embedded (bufferView missing). uri={uri}")
-    if bv_index >= len(buffer_views):
-        raise RuntimeError("image.bufferView out of range")
-    bv = buffer_views[bv_index]
-    bo = int(bv.get("byteOffset", 0))
-    bl = int(bv.get("byteLength", 0))
-    img_bytes = bin_chunk[bo: bo + bl]
-    if debug_print:
-        print(
-            f"[Texture] baseColorTextureIndex={base_tex_index}, imageIndex={img_index}, "
-            f"bufferView={bv_index}, mime={mime}, bytes={len(img_bytes)}"
-        )
-    pil = Image.open(trimesh.util.wrap_as_stream(img_bytes)).convert("RGBA")
-    return np.array(pil, dtype=np.uint8)
-
-
-# ── Welded face adjacency ────────────────────────────────────────────────────
-#
-# Welding matters because a UV seam splits a vertex, and a segmentation
-# boundary likes to sit on exactly those edges: the authored indexing severs
-# the adjacency there. Two notions are used across the split — faces sharing a
-# welded EDGE, and faces sharing a welded VERTEX (the looser one, the only kind
-# that survives the degenerate slivers welding creates).
-#
-# The weld tolerance stays a CALLER argument. The call sites use two different
-# ones (`round(V, decimals=3)` and `round(V / (1e-6 * diag))`, the latter
-# sometimes with a scene-wide diagonal rather than a per-mesh one); unifying
-# them changes results and is a measured decision of its own.
+def _load_glb(input_fname: str) -> trimesh.Scene:
+    return trimesh.load(input_fname, force="scene", process=False,
+                        merge_primitives=False, skip_materials=False, maintain_order=True)
 
 
 def _weld_index(V: np.ndarray, decimals: Optional[int] = None,
@@ -237,181 +119,6 @@ def _unwrap_uv3_for_seam(uv3: np.ndarray) -> np.ndarray:
     return out
 
 
-def _pack_rgb(rgb: np.ndarray) -> np.ndarray:
-    """(N, 3) uint8 -> (N,) int32 key. Exact counting without the
-    sort-by-rows cost of ``np.unique(axis=0)`` on a full atlas."""
-    r = np.asarray(rgb, np.int32)
-    return (r[:, 0] << 16) | (r[:, 1] << 8) | r[:, 2]
-
-
-def _build_palette_rgb(
-    colours: np.ndarray,
-    counts: np.ndarray,
-    palette_min_frac: float,
-    palette_max_colors: int,
-    palette_merge_dist: int,
-    debug_print: bool = False,
-    trace: Optional[Dict[str, Any]] = None,
-) -> np.ndarray:
-    """Palette from the OWNED-texel colour histogram (already quantised).
-
-    The floor is a FRACTION of the owned texels, never an absolute pixel
-    count — an absolute one changes meaning with the atlas resolution
-    (measured: dropped two real parts at 0.27% / 0.47% of the drawer), and
-    owned-only counting keeps the off-surface gutter from voting. Phantom
-    parts are the greedy merge's job below, not the floor's.
-    """
-    order = np.argsort(-np.asarray(counts))
-    uniq = np.asarray(colours, np.uint8)[order]
-    cnt = np.asarray(counts, np.int64)[order]
-    total = int(cnt.sum())
-    if trace is not None:
-        trace.update(counted_texels=total, candidates=uniq.copy(),
-                     candidate_counts=cnt.copy())
-    keep = cnt >= max(palette_min_frac * total, 1.0)
-    if not keep.any() and len(uniq):
-        keep[0] = True            # degenerate atlas: keep the dominant colour
-    uniq, cnt = uniq[keep], cnt[keep]
-    if len(uniq) > palette_max_colors:
-        uniq = uniq[:palette_max_colors]
-        cnt = cnt[:palette_max_colors]
-    if trace is not None:
-        trace["survivors"] = uniq.copy()          # entries the merge starts from
-    if debug_print:
-        print(f"[Palette] owned_texels={total} floor={palette_min_frac:.4%} "
-              f"palette_size(before_merge)={len(uniq)}")
-    # greedy weighted merge: colours within palette_merge_dist fold into one
-    # entry, processed by decreasing weight. Order-dependent with a hard cliff
-    # at the threshold (the drawer's orange survived by d=64.07 vs 64), so
-    # near-cliff decisions are reported instead of staying silent.
-    if len(uniq) and palette_merge_dist and palette_merge_dist > 0:
-        rgbf = uniq.astype(np.float32)
-        centers, center_w, assign, cliff = [], [], [], []
-        for x, w in zip(rgbf, cnt.astype(np.int64)):
-            if centers:
-                d2 = np.sum((np.stack(centers) - x[None, :]) ** 2, axis=1)
-                k = int(np.argmin(d2))
-                d = float(np.sqrt(d2[k]))
-                if d <= palette_merge_dist:
-                    if d > 0.9 * palette_merge_dist:
-                        cliff.append((tuple(int(v) for v in x), "merged", d))
-                    cw = center_w[k]
-                    centers[k] = (centers[k] * cw + x * int(w)) / (cw + int(w))
-                    center_w[k] = cw + int(w)
-                    assign.append(k)
-                    continue
-                if d <= 1.1 * palette_merge_dist:
-                    cliff.append((tuple(int(v) for v in x), "survived", d))
-            centers.append(x.copy())
-            center_w.append(int(w))
-            assign.append(len(centers) - 1)
-        uniq = np.clip(np.rint(np.stack(centers)), 0, 255).astype(np.uint8)
-        if trace is not None:
-            trace["merge_assign"] = np.asarray(assign, np.int32)
-            trace["merge_near_cliff"] = cliff
-        if debug_print:
-            print(f"[PaletteMerge] after={len(uniq)} merge_dist={palette_merge_dist}")
-            for c, what, d in cliff:
-                print(f"  [PaletteMerge] near-cliff: {c} {what} at d={d:.1f} "
-                      f"(thr {palette_merge_dist})")
-    if debug_print:
-        print(f"[Palette] palette_size(after_merge)={len(uniq)}")
-    return uniq.astype(np.uint8)
-
-
-def _map_to_palette_rgb(
-    colors_rgb: np.ndarray, palette_rgb: np.ndarray, chunk: int = 200_000
-) -> Tuple[np.ndarray, np.ndarray]:
-    if palette_rgb is None or len(palette_rgb) == 0:
-        uniq, inv = np.unique(colors_rgb, axis=0, return_inverse=True)
-        return inv.astype(np.int32), uniq.astype(np.uint8)
-    c = colors_rgb.astype(np.float32)
-    p = palette_rgb.astype(np.float32)
-    pp = (p * p).sum(axis=1)
-    out = np.empty((c.shape[0],), dtype=np.int32)
-    for i in range(0, c.shape[0], chunk):
-        cc = c[i: i + chunk]
-        d2 = (cc * cc).sum(axis=1, keepdims=True) - 2.0 * (cc @ p.T) + pp
-        out[i: i + chunk] = np.argmin(d2, axis=1).astype(np.int32)
-    return out, palette_rgb
-
-
-def _node_texel_ownership(mesh: trimesh.Trimesh, w: int, h: int):
-    """Rasterise which texel belongs to which face; ``None`` when the node has
-    no usable uv. A texel is owned by exactly ONE face — barycentric
-    point-sampling reads NEIGHBOURING islands' texels on sliver/degenerate-UV
-    faces (structurally wrong labels that weld onto legitimate same-colour
-    components and survive smoothing — a whole leg repainted in the apron's
-    colour); ownership rasterisation cannot do that."""
-    uv = getattr(mesh.visual, "uv", None)
-    if uv is None:
-        return None
-    uv = np.asarray(uv, dtype=np.float32)
-    if uv.ndim != 2 or uv.shape[1] != 2 or uv.shape[0] != len(mesh.vertices):
-        return None
-    return _rasterize_face_labels(
-        np.mod(uv, 1.0).astype(np.float64), np.asarray(mesh.faces, np.int64),
-        np.arange(len(mesh.faces)), w, h)
-
-
-def _face_labels_from_texture_rgb(
-    mesh: trimesh.Trimesh,
-    tex_rgba: np.ndarray,
-    palette_rgb: np.ndarray,
-    color_quant_step: int,
-    debug: Optional[Dict[str, Any]] = None,
-    raster=None,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    # Label each face by majority over the texels it OWNS (see
-    # _node_texel_ownership; the raster is computed once per node and shared
-    # with the palette build, which counts the same texels).
-    h, w = tex_rgba.shape[0], tex_rgba.shape[1]
-    Fn = len(mesh.faces)
-    if raster is None:
-        raster = _node_texel_ownership(mesh, w, h)
-    if raster is None:
-        return None
-    fid_map, cov = raster
-    ys, xs = np.nonzero(cov)
-    f = fid_map[ys, xs]
-    texel_rgb = _quantize_rgb(tex_rgba[ys, xs, :3].astype(np.uint8),
-                              color_quant_step)
-    texel_label, used_palette = _map_to_palette_rgb(texel_rgb, palette_rgb)
-    n_lab = max(len(used_palette), 1)
-    hist = np.bincount(f * n_lab + texel_label,
-                       minlength=Fn * n_lab).reshape(Fn, n_lab)
-    best = np.where(hist.sum(axis=1) > 0, hist.argmax(axis=1), -1).astype(np.int32)
-    if debug is not None:
-        # the vote as it was actually cast: which texel each face owns, what
-        # colour that texel carries, and how the per-face histogram broke down
-        debug.update(fid_map=fid_map, cov=cov, hist=hist, texel_ys=ys,
-                     texel_xs=xs, texel_face=f, texel_rgb=texel_rgb,
-                     texel_label=texel_label, best_raw=best.copy())
-
-    # Faces with no texel of their own (slivers, seam-crossing charts) inherit
-    # by topological neighbour-majority propagation.
-    if (best < 0).any() and (best >= 0).any():
-        v_unique, inv = np.unique(np.round(mesh.vertices, decimals=3),
-                                  axis=0, return_inverse=True)
-        edges = trimesh.Trimesh(vertices=v_unique, faces=inv[mesh.faces],
-                                process=False).face_adjacency
-        a, b = edges[:, 0], edges[:, 1]
-        while True:
-            unk = best < 0
-            if not unk.any():
-                break
-            votes = np.zeros((Fn, n_lab), np.int32)
-            m1 = (best[a] >= 0) & unk[b]
-            m2 = (best[b] >= 0) & unk[a]
-            np.add.at(votes, (b[m1], best[a[m1]]), 1)
-            np.add.at(votes, (a[m2], best[b[m2]]), 1)
-            fillable = unk & (votes.sum(axis=1) > 0)
-            if not fillable.any():
-                break  # isolated unlabeled islands: left at -1 (caller skips)
-            best[fillable] = votes[fillable].argmax(axis=1)
-    return best, used_palette
-
-
 def _same_label_components(labels: np.ndarray, edges: np.ndarray, F: int):
     """Connected components of faces linked by an adjacency edge to a same-label
     neighbour. Returns ``(n_components, comp_labels)``."""
@@ -437,94 +144,7 @@ def _authored_islands(mesh: trimesh.Trimesh) -> np.ndarray:
     return connected_components(inc @ inc.T, directed=False)[1]
 
 
-_WRAP_ALPHA = 0.70          # closed half-surface; see the envelopment guard
-_WRAP_CLIFF = (0.55, 0.85)  # ratios reported so future assets build evidence
-
-
 # Unplugged for now: breaks some cases. Kept for reference.
-def _absorb_label_enclaves(
-    mesh: trimesh.Trimesh,
-    face_label: np.ndarray,
-    boundary_frac: float = 0.70,
-    max_label_rel: float = 0.20,
-    max_iters: int = 4,
-    debug_print: bool = False,
-) -> np.ndarray:
-    """Absorb label ENCLAVES: components surrounded almost entirely by ONE
-    other label — the hole-makers the SDF cut would detach, too large for the
-    50-face threshold of ``smooth_face_labels_by_topology`` (measured 55..868).
-
-    Three guards, all judged on the COMPLETE welded adjacency — both size and
-    boundary assume maximal components; chart-scoping this adjacency turned
-    the stage into a per-chart majority vote (8.9% of the dinning chair
-    repainted, 0.01% once reverted):
-    - size: a component above ``max_label_rel`` of its label's area is that
-      label's main mass (a genuine embedded part), never moved;
-    - envelopment: absorbable only if its boundary can actually surround it,
-      L >= _WRAP_ALPHA * 2*sqrt(pi*A) in real edge lengths. Necessary, not
-      sufficient: neck-attached pieces score 0.28-0.44, true enclaves 1.2+;
-      a strip abutting along its whole length still passes (boundary_frac is
-      the only defence there), a patch past a knob's equator is spared.
-    - vote: the surrounding label must hold >= ``boundary_frac`` of it.
-    Faces are only relabelled, never dropped.
-    """
-    labels = face_label.copy()
-    F = len(mesh.faces)
-    V = np.asarray(mesh.vertices)
-    Fc = np.asarray(mesh.faces, np.int64)
-    # welded EDGE adjacency (uv seams must not break enclosure detection)
-    inv = _weld_index(V, decimals=3)
-    pairs, hs, sel = _welded_face_pairs(inv, Fc)
-    ends = np.zeros((int(inv.max()) + 1, 3), np.float64)
-    ends[inv] = V
-    e = hs[sel]
-    edge_len = np.linalg.norm(ends[e[:, 0]] - ends[e[:, 1]], axis=1)
-    tri = V[Fc]
-    fa = 0.5 * np.linalg.norm(
-        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
-
-    n_lab = int(labels.max()) + 1
-    for _ in range(max_iters):
-        lab_area = np.zeros(n_lab)
-        valid = labels >= 0
-        np.add.at(lab_area, labels[valid], fa[valid])
-        n, comp = _same_label_components(labels, pairs, F)
-        comp_area = np.zeros(n)
-        np.add.at(comp_area, comp, fa)
-        inter = labels[pairs[:, 0]] != labels[pairs[:, 1]]
-        moved = 0
-        for c in np.unique(comp):
-            own = int(labels[np.where(comp == c)[0][0]])
-            if own < 0:
-                continue
-            if comp_area[c] > max_label_rel * max(lab_area[own], 1e-12):
-                continue                     # major piece of its label: keep
-            m0 = inter & (comp[pairs[:, 0]] == c)
-            m1 = inter & (comp[pairs[:, 1]] == c)
-            wrap = float(edge_len[m0 | m1].sum()) / (
-                2.0 * np.sqrt(np.pi * max(float(comp_area[c]), 1e-12)))
-            if debug_print and _WRAP_CLIFF[0] <= wrap <= _WRAP_CLIFF[1]:
-                print(f"  [Enclaves] near-cliff: composante de "
-                      f"{int((comp == c).sum())} faces (label {own}) "
-                      f"enveloppement={wrap:.2f} (seuil {_WRAP_ALPHA})")
-            if wrap < _WRAP_ALPHA:
-                continue                     # abutting, not surrounded
-            neigh = np.concatenate([labels[pairs[m0, 1]], labels[pairs[m1, 0]]])
-            neigh = neigh[neigh >= 0]
-            if len(neigh) == 0:
-                continue
-            cnt = np.bincount(neigh, minlength=n_lab)
-            win = int(cnt.argmax())
-            if win != own and cnt[win] / len(neigh) >= boundary_frac:
-                labels[comp == c] = win
-                moved += 1
-        if debug_print and moved:
-            print(f"  [Enclaves] {moved} enclave(s) absorbée(s)")
-        if moved == 0:
-            break
-    return labels
-
-
 _P1_AREA_FLOOR = 0.005          # object-area share; see the phase 1 guard
 
 
@@ -654,9 +274,9 @@ def smooth_face_labels_by_topology(
 
 
 def _fill_gutter(label_map: np.ndarray, cov: np.ndarray) -> np.ndarray:
-    """Replace uncovered bake-gutter texels with their nearest covered label.
+    """Replace uncovered gutter texels with their nearest covered label.
 
-    Bake-gutter padding is unreliable near island borders and distorts the SDF
+    Gutter padding is unreliable near island borders and distorts the SDF
     close to UV-island edges.  Propagating the nearest covered label prevents this.
     """
     src8     = (~cov).astype(np.uint8)   # 0 = covered (source), 1 = gutter
@@ -942,105 +562,6 @@ def _expand(face_label: np.ndarray, alpha: int, D: np.ndarray,
     return out
 
 
-def refine_face_labels_graphcut(
-    mesh: trimesh.Trimesh,
-    face_label: np.ndarray,
-    tex_rgba: np.ndarray,
-    palette_rgb: np.ndarray,
-    color_quant_step: int,
-    distrust: Optional[np.ndarray] = None,
-    lam: float = 2.0,
-    prior: float = 1.0,
-    max_cycles: int = 3,
-    islands: Optional[np.ndarray] = None,
-    raster=None,
-    debug_print: bool = False,
-) -> np.ndarray:
-    """Globally minimise the Potts MRF, warm-started from `face_label`.
-
-    `prior` (nats) discounts the incoming label so upstream stages are not
-    overruled by the raw evidence they were built to correct. `distrust`
-    flattens the data term of faces a previous stage ruled unreliable —
-    smoothness alone places them. Chart scope: the smoothness term never
-    crosses an authored UV seam; the data term is untouched. `raster` = the
-    vote's texel ownership (fid_map, cov).
-    """
-    labels = np.unique(face_label[face_label >= 0])
-    if len(labels) < 2 or raster is None:
-        return face_label
-
-    # data term: count of each face's OWN texels per palette label
-    F = np.asarray(mesh.faces, dtype=np.int64)
-    nF, L = len(F), len(palette_rgb)
-    fid_map, cov = raster
-    ys, xs = np.nonzero(cov)
-    tex_lab, _ = _map_to_palette_rgb(
-        _quantize_rgb(tex_rgba[ys, xs, :3].astype(np.uint8),
-                      color_quant_step).astype(np.float32), palette_rgb)
-    key = fid_map[ys, xs].astype(np.int64) * L + tex_lab.astype(np.int64)
-    evidence = np.bincount(key, minlength=nF * L).reshape(nF, L)
-
-    tot = evidence.sum(axis=1, keepdims=True).astype(np.float64)
-    p = (evidence + 0.5) / (tot + 0.5 * L)
-    D = np.clip(-np.log(np.maximum(p, 1e-12)), 0.0, _D_CLIP)
-    D[tot[:, 0] == 0] = 0.0  # unseen faces: decided by smoothness alone
-    if distrust is not None and np.any(distrust):
-        D[np.asarray(distrust, dtype=bool)] = 0.0
-    if prior > 0:
-        ok = face_label >= 0
-        D[np.nonzero(ok)[0], face_label[ok]] -= prior
-    D = np.clip(D, 0.0, _D_CLIP)
-    # area-weighted unary: geometric integral, like the boundary term
-    area = np.asarray(mesh.area_faces, np.float64)
-    D *= (area / max(float(np.mean(area)), 1e-12))[:, None]
-
-    # smoothness term: face adjacency ACROSS UV seams (welded by position —
-    # authored indexing severs adjacency exactly where a boundary likes to sit;
-    # built by hand because trimesh's face_adjacency drops 14% of the faces on
-    # a welded sliver mesh), Potts weight high on flat surfaces, low on creases
-    V = np.asarray(mesh.vertices, dtype=np.float64)
-    inv = _weld_index(V, decimals=3)
-    pairs, hs, sel = _welded_face_pairs(inv, F, drop_collapsed=True,
-                                        dedupe=True)
-    isl = _authored_islands(mesh) if islands is None else islands
-    same = isl[pairs[:, 0]] == isl[pairs[:, 1]]
-    pairs, sel = pairs[same], sel[same]
-    w_int = np.zeros(0, dtype=np.int64)
-    if len(pairs):
-        ends = np.zeros((int(inv.max()) + 1, 3), dtype=np.float64)
-        ends[inv] = V
-        e = hs[sel]
-        length = np.linalg.norm(ends[e[:, 0]] - ends[e[:, 1]], axis=1)
-        n = np.asarray(mesh.face_normals, dtype=np.float64)
-        c = V[F].mean(axis=1)
-        na, nb = n[pairs[:, 0]], n[pairs[:, 1]]
-        angle = np.arccos(np.clip(np.einsum("ij,ij->i", na, nb), -1.0, 1.0))
-        convex = np.einsum("ij,ij->i",
-                           c[pairs[:, 1]] - c[pairs[:, 0]], na) < 0.0
-        flat = np.clip((1.0 + np.cos(angle)) * 0.5, 0.0, 1.0)  # 1 = coplanar
-        pen = np.where(convex, flat, flat * _CONCAVE_ETA)      # valleys cheap
-        ln = length / max(float(np.mean(length)), 1e-12)
-        w_int = np.rint(lam * ln * np.maximum(pen, _WEIGHT_FLOOR)
-                        * _SCALE).astype(np.int64)
-
-    lab = face_label.copy()
-    for cycle in range(max_cycles):
-        moved = 0
-        for alpha in labels:
-            new = _expand(lab, int(alpha), D, pairs, w_int)
-            changed = int((new != lab).sum())
-            if changed:
-                moved += changed
-                lab = new
-        if debug_print:
-            print(f"  [graphcut] cycle {cycle + 1}: {moved} faces moved")
-        if moved == 0:
-            break
-    if debug_print:
-        print(f"  [graphcut] {int((lab != face_label).sum())} faces relabelled")
-    return lab
-
-
 _BAND_RINGS = 3
 _BAND_PRIOR = 1.0     # nats: cost of changing a face, scaled by its area
 _BAND_AREA_CAP = 4.0  # low-poly slabs must not overpower lambda
@@ -1270,7 +791,7 @@ def _rasterize_face_labels(uv: np.ndarray, faces: np.ndarray,
 
     Faces crossing the UV 0/1 border (repeat wrapping) are drawn twice with a
     ±1 offset so both sides of the seam are covered.  Texels covered by no
-    face (bake gutter) get the nearest covered label via _fill_gutter.
+    face (gutter) get the nearest covered label via _fill_gutter.
     Returns a label map whose interior regions replicate the face labels
     exactly — the SDF refinement therefore cannot change region ownership.
     """
@@ -1336,304 +857,6 @@ def _smooth_label_map_boundaries(label_map: np.ndarray, sigma: float,
         lm = cand
         it += 1
     return lm
-
-
-def split_glb_by_texture_palette_rgb(
-    in_glb_path: str,
-    out_glb_path: Optional[str] = None,
-    # ── Palette inference (owned texels only) ──
-    # Palette defaults are the "balanced" preset (segvigen/presets.py).
-    color_quant_step: int = 16,
-    palette_min_frac: float = 0.0005,
-    palette_max_colors: int = 256,
-    palette_merge_dist: float = 32,
-    # ── Topology smoothing / denoising ──
-    small_component_min_faces: int = 50,
-    postprocess_iters: int = 3,
-    # ── Boundary refinement (SDF marching-triangle cut) ──
-    refine_boundaries: bool = True,
-    smooth: float = 1.5,
-    boundary_smooth_px: Optional[float] = None,
-    # ── MRF boundary refinement (pre-cut, alpha-expansion graph cut) ──
-    graphcut_refine: bool = True,
-    graphcut_lambda: float = 20.0,
-    graphcut_prior: float = 1.0,
-    # ── Dihedral band re-placement (pre-cut, after the graphcut) ──
-    band_refine: bool = True,
-    # ── One authored UV island = one part (pre-cut) ──
-    island_majority: bool = False,
-    island_dominance: float = 0.0,
-    # ── Fragment cleanup (post-split) ──
-    cleanup_fragments: bool = False,
-    # ── Output ──
-    output_mode: str = "vertex_colors",
-    min_faces_per_part: int = 1,
-    bake_transforms: bool = True,
-    debug_print: bool = True,
-) -> str:
-    """Split a segmented GLB into per-part sub-meshes.
-
-    1. **Labelling** — each face takes the majority label of its OWNED texels,
-       then the label refinements (02 smoothing / 04 MRF).
-    2. **Boundary refinement** (``refine_boundaries``) — per-label SDFs on the
-       rasterised label map, mesh cut at the zero-crossings (marching
-       triangles): sub-triangle boundaries, ownership unchanged. Off = parts
-       follow original faces, visibly sawtoothed.
-    3. **Fragment cleanup** (``cleanup_fragments``) — detached speckle
-       components reassigned by 3D proximity; see ``postprocess_split_glb``.
-
-    band_refine   : dihedral band re-placement after the graphcut — snaps
-       part boundaries onto real creases within +-3 face rings, across seams.
-    island_majority : one authored UV island = one part, voted on the RAW
-       texel evidence (voting on refined labels turns partial upstream
-       repaints into total ones — measured, loses parts). Short-circuits
-       02/03/04, which only run on the island-OFF path.
-    output_mode   : "texture" keeps the original material (speckle visible);
-       "clean_texture" bakes a flat-colour texture from the labels;
-       "vertex_colors" flat palette colours (QA). All modes preserve the
-       input's UVs on every part.
-    smooth        : SDF Gaussian sigma in px; parts narrower than ~2*sigma
-       texels erode.
-    """
-    if out_glb_path is None:
-        out_glb_path = f"{os.path.splitext(in_glb_path)[0]}_seg.glb"
-
-    # ── texture (once per GLB: all nodes share the atlas) ──
-    tex_rgba = _extract_basecolor_texture_image(in_glb_path, debug_print=debug_print)
-    H_tex, W_tex = tex_rgba.shape[0], tex_rgba.shape[1]
-
-    scene = _load_glb(in_glb_path, force="scene")
-    out_scene = trimesh.Scene()
-    part_count = 0
-    base = os.path.splitext(os.path.basename(in_glb_path))[0]
-
-    # ── stage 0 : texel ownership, then the palette on the OWNED texels
-    #    (counting the whole atlas would let the gutter/background vote) ──
-    node_meshes = []                  # (node_name, mesh, raster-or-None)
-    for node_name in scene.graph.nodes_geometry:
-        geom_name = scene.graph[node_name][1]
-        if geom_name is None:
-            continue
-        geom = scene.geometry.get(geom_name)
-        if geom is None or not isinstance(geom, trimesh.Trimesh):
-            continue
-        mesh = geom.copy()
-        if bake_transforms:
-            T, _ = scene.graph.get(node_name)
-            if T is not None:
-                mesh.apply_transform(T)
-        node_meshes.append((node_name, mesh,
-                            _node_texel_ownership(mesh, W_tex, H_tex)))
-
-    key_flat = _pack_rgb(_quantize_rgb(
-        tex_rgba[..., :3].reshape(-1, 3).astype(np.uint8), color_quant_step))
-    owned = [key_flat[raster[1].ravel()]
-             for _, _, raster in node_meshes if raster is not None]
-    keys, counts = (np.unique(np.concatenate(owned), return_counts=True)
-                    if owned else (np.empty(0, np.int64), np.empty(0, np.int64)))
-    colours = np.stack([(keys >> 16) & 255, (keys >> 8) & 255, keys & 255],
-                       axis=1).astype(np.uint8)
-    palette_rgb = _build_palette_rgb(
-        colours,
-        counts.astype(np.int64),
-        palette_min_frac=palette_min_frac,
-        palette_max_colors=palette_max_colors,
-        palette_merge_dist=palette_merge_dist,
-        debug_print=debug_print,
-    )
-
-    for node_name, mesh, raster in node_meshes:
-        # ── stage 1 : palette labelling ──
-        res = _face_labels_from_texture_rgb(
-            mesh, tex_rgba, palette_rgb,
-            color_quant_step=color_quant_step,
-            raster=raster,
-        )
-        if res is None:
-            if debug_print:
-                print(f"[{node_name}] no uv / cannot sample -> keep orig")
-            out_scene.add_geometry(mesh, geom_name=f"{base}__{node_name}__orig")
-            continue
-        face_label, label_rgb = res
-        raw_face_label = face_label.copy()
-
-        # 02/03/04 only run island-OFF: stage 05 votes on the RAW evidence and
-        # discards them anyway (measured byte-identical on the 4 refs).
-        refine_labels = not island_majority
-        islands = _authored_islands(mesh)
-        label_forced = np.zeros(len(mesh.faces), dtype=bool)
-        if refine_labels:
-            _pre = face_label.copy()
-            face_label = smooth_face_labels_by_topology(
-                mesh, face_label,
-                small_component_min_faces=small_component_min_faces,
-                postprocess_iters=postprocess_iters,
-                islands=islands,
-                debug_print=debug_print,
-            )
-            label_forced |= face_label != _pre
-        if refine_labels and graphcut_refine:
-            _pre = face_label.copy()
-            face_label = refine_face_labels_graphcut(
-                mesh, face_label, tex_rgba, label_rgb, color_quant_step,
-                distrust=label_forced,
-                lam=graphcut_lambda, prior=graphcut_prior,
-                islands=islands, raster=raster,
-                debug_print=debug_print)
-            label_forced |= face_label != _pre
-        if refine_labels and band_refine:
-            _pre = face_label.copy()
-            face_label = refine_face_labels_boundary_band(
-                mesh, face_label, lam=graphcut_lambda,
-                debug_print=debug_print)
-            label_forced |= face_label != _pre
-
-        if island_majority:
-            _pre = face_label.copy()
-            face_label = collapse_islands_to_majority(
-                mesh, face_label, vote_label=raw_face_label,
-                dominance=island_dominance, islands=islands,
-                debug_print=debug_print)
-            label_forced |= face_label != _pre
-
-        if debug_print:
-            uniq_labels, cnts = np.unique(face_label[face_label >= 0],
-                                          return_counts=True)
-            print(f"[{node_name}] faces={len(mesh.faces)} "
-                  f"labels_used={len(uniq_labels)} palette_size={len(label_rgb)}")
-
-        # ── stage 2 : SDF boundary refinement (or legacy submesh) ──
-        parts = None
-        if refine_boundaries:
-            try:
-                V_np = np.asarray(mesh.vertices, dtype=np.float64)
-                UV_np = np.asarray(mesh.visual.uv, dtype=np.float64)
-                F_np = np.asarray(mesh.faces, dtype=np.int64)
-                H, W = tex_rgba.shape[0], tex_rgba.shape[1]
-                label_map, cov = _rasterize_face_labels(
-                    UV_np, F_np, face_label, W, H)
-                if not (graphcut_refine or island_majority):
-                    # texel-accurate re-vote — under the MRF or the island
-                    # rule the boundaries are final, so it is skipped entirely
-                    tex_lab, _ = _map_to_palette_rgb(
-                        _quantize_rgb(tex_rgba[..., :3].reshape(-1, 3)
-                                      .astype(np.uint8),
-                                      color_quant_step).astype(np.float32),
-                        label_rgb)
-                    tex_map = tex_lab.reshape(H, W).astype(np.int32)
-                    if label_forced.any():
-                        # relabelled faces keep the FACE label — the texture
-                        # still carries the old colour there
-                        fid_map, _ = _rasterize_face_labels(
-                            UV_np, F_np, np.arange(len(F_np)), W, H)
-                        over = cov.copy()
-                        over[cov] = ~label_forced[fid_map[cov]]
-                        label_map[over] = tex_map[over]
-                    else:
-                        label_map[cov] = tex_map[cov]
-                label_map = _fill_gutter(label_map, cov)
-                sigma_b = (boundary_smooth_px if boundary_smooth_px is not None
-                           else 1.0)
-                if sigma_b > 0:
-                    label_map = _smooth_label_map_boundaries(
-                        label_map, sigma_b, iters=1)
-                parts = _split_by_sdf_labels(
-                    V_np, UV_np, F_np, label_map, smooth=smooth)
-            except Exception as exc:  # pragma: no cover
-                if debug_print:
-                    print(f"[{node_name}] boundary refinement failed ({exc}) "
-                          f"-> falling back to legacy face-split")
-                parts = None
-
-        if parts is None:
-            # legacy path: partition original faces, no geometry change
-            groups = defaultdict(list)
-            for fi, lab in enumerate(face_label):
-                if int(lab) >= 0:
-                    groups[int(lab)].append(fi)
-            parts = {}
-            for lab, face_ids in groups.items():
-                sub = mesh.submesh([np.array(face_ids, dtype=np.int64)],
-                                   append=True, repair=False)
-                if isinstance(sub, (list, tuple)):
-                    sub = sub[0] if sub else None
-                if sub is None:
-                    continue
-                parts[int(lab)] = (
-                    np.asarray(sub.vertices, np.float64),
-                    np.asarray(sub.visual.uv, np.float64)
-                    if getattr(sub.visual, "uv", None) is not None
-                    else np.zeros((len(sub.vertices), 2)),
-                    np.asarray(sub.faces, np.int64),
-                )
-
-        # ── clean texture: flat palette colours baked on the same UVs ──
-        clean_mat = None
-        if output_mode == "clean_texture":
-            try:
-                H, W = tex_rgba.shape[0], tex_rgba.shape[1]
-                lm_c, cov_c = _rasterize_face_labels(
-                    np.asarray(mesh.visual.uv, np.float64),
-                    np.asarray(mesh.faces, np.int64),
-                    face_label, W, H)
-                pal_arr = np.array(
-                    [label_rgb[k] if k < len(label_rgb) else (0, 0, 0)
-                     for k in range(int(lm_c.max()) + 1)], np.uint8)
-                clean_img = Image.fromarray(pal_arr[lm_c])
-                clean_mat = trimesh.visual.material.PBRMaterial(
-                    baseColorTexture=clean_img)
-            except Exception:
-                clean_mat = None
-
-        # ── export parts ──
-        for lab, (Vp, UVp, Fp) in parts.items():
-            if len(Fp) < min_faces_per_part:
-                continue
-            m = trimesh.Trimesh(vertices=Vp, faces=Fp, process=False)
-            if output_mode == "vertex_colors":
-                # flat colour via the MATERIAL — ColorVisuals cannot carry uvs;
-                # baseColorFactor is linear, the palette colour is sRGB
-                rgb = (np.array(label_rgb[lab], np.float64)
-                       if 0 <= lab < len(label_rgb) else np.zeros(3))
-                lin = (rgb / 255.0) ** 2.2
-                m.visual = trimesh.visual.texture.TextureVisuals(
-                    uv=UVp, material=trimesh.visual.material.PBRMaterial(
-                        baseColorFactor=[*lin, 1.0], metallicFactor=0.0))
-            elif output_mode == "clean_texture" and clean_mat is not None:
-                m.visual = trimesh.visual.texture.TextureVisuals(
-                    uv=UVp, material=clean_mat)
-            else:
-                m.visual = trimesh.visual.texture.TextureVisuals(
-                    uv=UVp, material=mesh.visual.material)
-            r, g, b = ([int(x) for x in label_rgb[lab]]
-                       if 0 <= lab < len(label_rgb) else (0, 0, 0))
-            out_scene.add_geometry(
-                m, geom_name=f"{base}__{node_name}__label_{lab}__rgb_{r}_{g}_{b}")
-            part_count += 1
-
-    if part_count == 0:
-        if debug_print:
-            print("[INFO] no parts produced -> exporting original scene")
-        out_scene = scene
-
-    out_scene.export(out_glb_path)
-    if debug_print:
-        print(f"[INFO] exported {part_count} part(s) -> {out_glb_path}")
-
-    # ── stage 4 : reassign the speckle fragments this split leaves behind ──
-    # Texture speckle gives each label a correct main body plus small detached
-    # components that actually belong to a NEIGHBOURING label. Stage-1 smoothing
-    # cannot catch them: it votes over shared edges, and an isolated island has
-    # none. Runs on the exported scene (path in, path out) so the split's own
-    # output stays the single source of truth for node names and materials.
-    if cleanup_fragments and part_count:
-        try:
-            postprocess_split_glb(out_glb_path, out_glb_path,
-                                  debug_print=debug_print)
-        except Exception as exc:      # never lose a good split to cleanup
-            if debug_print:
-                print(f"[PostProcess] skipped ({type(exc).__name__}: {exc})")
-    return out_glb_path
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1830,7 +1053,7 @@ def postprocess_split_glb(
     if out_glb_path is None:
         out_glb_path = in_glb_path.replace(".glb", "_clean.glb")
 
-    scene = _load_glb(in_glb_path, force="scene")
+    scene = _load_glb(in_glb_path)
 
     # ── flatten nodes (bake transforms), collect per-label arrays ──
     nodes = []          # {name, V, uv, F, visual}
@@ -1885,23 +1108,186 @@ def postprocess_split_glb(
     return stats
 
 
-# The presets, from SegviGen's segvigen/presets.py, kept next to the split they tune.
-# palette_min_frac is a fraction of the OWNED texels (surface actually mapped
-# by faces), scale-invariant across atlas resolutions. The old absolute
-# palette_min_pixels values were only meaningful against the split's former
-# 2M-pixel palette sample: 1000/2000/10000 px ≈ 0.05%/0.1%/0.5% of it — and
-# 0.5% measurably dropped real parts, so "cleanest" lands at 0.1%.
-SPLIT_PRESETS = {
-    # ⚡ Fast: fine quantisation, no colour merging, sharp boundaries
-    "max_parts": dict(color_quant_step=1,  palette_min_frac=0.0001,
-                      palette_max_colors=1024, palette_merge_dist=0,
-                      smooth=0.5, min_faces_per_part=1,  bake_transforms=True),
-    # ⚖ Balanced: sensible defaults
-    "balanced":  dict(color_quant_step=16, palette_min_frac=0.0005,
-                      palette_max_colors=256,  palette_merge_dist=32,
-                      smooth=1.5, min_faces_per_part=1,  bake_transforms=True),
-    # ✨ Cleanest: coarse quantisation, aggressive merge, smooth boundaries
-    "cleanest":  dict(color_quant_step=32, palette_min_frac=0.001,
-                      palette_max_colors=128,  palette_merge_dist=64,
-                      smooth=3.0, min_faces_per_part=50, bake_transforms=True),
-}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SPLIT FROM PER-FACE LABELS: SegviGen's refinements and SDF cut, fed the
+#  lift's labels directly.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def split_glb_by_face_labels(
+    in_glb_path: str,
+    face_labels: np.ndarray,
+    out_glb_path: Optional[str] = None,
+    mode: Literal["sdf", "faces"] = "sdf",
+    # ── Topology smoothing / denoising ──
+    small_component_min_faces: int = 50,
+    postprocess_iters: int = 3,
+    # ── Boundary refinement ──
+    smooth: float = 1.5,
+    band_refine: bool = True,
+    # ── One authored UV island = one part ──
+    island_majority: bool = False,
+    # ── Fragment cleanup (post-split) ──
+    cleanup_fragments: bool = False,
+    # ── Output ──
+    min_faces_per_part: int = 1,
+    debug_print: bool = True,
+) -> str:
+    """Split a GLB into per-part sub-meshes from labels indexing its faces.
+
+    ``mode="sdf"`` keeps the marching-triangle cut, which
+    evaluates per-label distance fields in UV space: boundaries fall inside
+    triangles, as they do today, and the mesh needs usable UVs.
+    ``mode="faces"`` needs none and leaves boundaries on existing edges.
+
+    The MRF graph cut is texture-only (its data term counts a face's own
+    texels), so it does not run here; ``band_refine`` places the boundaries
+    instead, on dihedral angle alone.
+    """
+    from geosam2.util.labels import UNASSIGNED_LABELS, label_palette  # labels imports split
+
+    if out_glb_path is None:
+        out_glb_path = f"{os.path.splitext(in_glb_path)[0]}_faceseg.glb"
+
+    scene = _load_glb(in_glb_path)
+    face_labels = np.asarray(face_labels).reshape(-1)
+    pal = label_palette(face_labels)
+    out_scene = trimesh.Scene()
+    part_count = 0
+    base = os.path.splitext(os.path.basename(in_glb_path))[0]
+    offset = 0
+    by_label: Dict[int, list] = {}
+
+    for node_name in scene.graph.nodes_geometry:
+        geom_name = scene.graph[node_name][1]
+        if geom_name is None:
+            continue
+        geom = scene.geometry.get(geom_name)
+        if geom is None or not isinstance(geom, trimesh.Trimesh):
+            continue
+        mesh = geom.copy()
+        T, _ = scene.graph.get(node_name)
+        if T is not None:
+            mesh.apply_transform(T)
+
+        # Labels index the whole mesh's faces, node after node in scene order.
+        if offset + len(mesh.faces) > len(face_labels):
+            raise ValueError(
+                f"{len(face_labels)} labels for at least "
+                f"{offset + len(mesh.faces)} faces")
+        raw_face_label, offset = face_labels[offset:offset + len(mesh.faces)], offset + len(mesh.faces)
+
+        # -1 is "no label" downstream; the lift writes 0 for unassigned.
+        raw_face_label = raw_face_label.astype(np.int64)
+        ids = sorted(set(np.unique(raw_face_label).tolist()) - set(UNASSIGNED_LABELS))
+        lut = np.full(int(raw_face_label.max()) + 1, -1, np.int32)
+        lut[ids] = np.arange(len(ids))
+        face_label = lut[raw_face_label]
+        if not len(ids) or (face_label < 0).all():
+            if debug_print:
+                print(f"[{node_name}] no labelled face -> keep orig")
+            out_scene.add_geometry(mesh, geom_name=f"{base}__{node_name}__orig")
+            continue
+
+        islands = _authored_islands(mesh)
+        refine_labels = not island_majority
+        if refine_labels:
+            face_label = smooth_face_labels_by_topology(
+                mesh, face_label,
+                small_component_min_faces=small_component_min_faces,
+                postprocess_iters=postprocess_iters,
+                islands=islands, debug_print=debug_print)
+        if refine_labels and band_refine:
+            face_label = refine_face_labels_boundary_band(
+                mesh, face_label, debug_print=debug_print)
+        if island_majority:
+            face_label = collapse_islands_to_majority(
+                mesh, face_label, vote_label=face_label, islands=islands,
+                debug_print=debug_print)
+
+        used = np.unique(face_label[face_label >= 0])
+        if debug_print:
+            print(f"[{node_name}] faces={len(mesh.faces)} "
+                  f"labels_used={len(used)} palette_size={len(ids)}")
+
+        parts = None
+        uv = getattr(mesh.visual, "uv", None)
+        # one label: nothing to cut, and the 4096² maps cost ~0.5 s per node
+        if mode == "sdf" and uv is not None and len(used) > 1:
+            try:
+                V_np = np.asarray(mesh.vertices, np.float64)
+                UV_np = np.asarray(uv, np.float64)
+                F_np = np.asarray(mesh.faces, np.int64)
+                # the cut reads a rasterised label map, so its resolution is
+                # the boundary's; 4096 is the resolution the cut was tuned on
+                W = H = 4096
+                label_map, cov = _rasterize_face_labels(UV_np, F_np, face_label, W, H)
+                label_map = _fill_gutter(label_map, cov)
+                label_map = _smooth_label_map_boundaries(label_map, 1.0, iters=1)
+                parts = _split_by_sdf_labels(V_np, UV_np, F_np, label_map, smooth=smooth)
+            except Exception as exc:  # pragma: no cover
+                if debug_print:
+                    print(f"[{node_name}] sdf cut failed ({exc}) -> face split")
+                parts = None
+
+        if parts is None:
+            parts = {}
+            for lab in np.unique(face_label[face_label >= 0]):
+                sub = mesh.submesh([np.flatnonzero(face_label == lab)],
+                                   append=True, repair=False)
+                if isinstance(sub, (list, tuple)):
+                    sub = sub[0] if sub else None
+                if sub is None:
+                    continue
+                sub_uv = getattr(sub.visual, "uv", None)
+                parts[int(lab)] = (
+                    np.asarray(sub.vertices, np.float64),
+                    np.asarray(sub_uv, np.float64) if sub_uv is not None
+                    else np.zeros((len(sub.vertices), 2)),
+                    np.asarray(sub.faces, np.int64),
+                )
+
+        for lab, (Vp, UVp, Fp) in parts.items():
+            if len(Fp) < min_faces_per_part:
+                continue
+            # accumulated per LABEL, not per node: the labels span the whole
+            # mesh, and a source split into material nodes would otherwise hand
+            # back one part per (node, label) -- 16 for 7 labels on a sofa.
+            chunk = trimesh.Trimesh(vertices=Vp, faces=Fp, process=False)
+            chunk.visual = trimesh.visual.texture.TextureVisuals(uv=UVp)  # kept, as stage 6 does
+            by_label.setdefault(ids[lab], []).append(chunk)
+
+    for label_id, chunks in sorted(by_label.items()):
+        m = trimesh.util.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        if len(m.faces) < min_faces_per_part:
+            continue
+        rgb = np.array(pal[label_id], np.float64)
+        # flat colour via the MATERIAL: ColorVisuals cannot carry uvs, and
+        # baseColorFactor is linear
+        m.visual = trimesh.visual.texture.TextureVisuals(
+            uv=getattr(m.visual, "uv", None),
+            material=trimesh.visual.material.PBRMaterial(
+                baseColorFactor=[*(rgb / 255.0) ** 2.2, 1.0], metallicFactor=0.0))
+        r, g, b = (int(x) for x in rgb)
+        out_scene.add_geometry(
+            m, geom_name=f"{base}__label_{label_id}__rgb_{r}_{g}_{b}")
+        part_count += 1
+
+    if part_count == 0:
+        if debug_print:
+            print("[INFO] no parts produced -> exporting original scene")
+        out_scene = scene
+
+    out_scene.export(out_glb_path)
+    if debug_print:
+        print(f"[INFO] exported {part_count} part(s) -> {out_glb_path}")
+
+    if cleanup_fragments and part_count:
+        try:
+            postprocess_split_glb(out_glb_path, out_glb_path, debug_print=debug_print)
+        except Exception as exc:
+            if debug_print:
+                print(f"[PostProcess] skipped ({type(exc).__name__}: {exc})")
+    return out_glb_path

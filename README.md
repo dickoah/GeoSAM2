@@ -11,7 +11,7 @@ the way `segvigen` is for SegviGen in pixmesh-segmentation: one class that
 keeps the model loaded, the utilities around it, no Hydra, no Blender, no
 sibling checkout. Around the model it adds what the paper leaves to the
 user: the views rendered in-process, the seed map painted by a VLM, the
-labels baked to a texture and split into parts with SegviGen's code.
+labels split into parts with SegviGen's code.
 
 ## Layout
 
@@ -26,7 +26,7 @@ geosam2/                  the package (the only top-level name)
 └── util/
     ├── views.py          the 12 canonical views: rendered, validated, read back
     ├── guidance.py       the seed: view pick, VLM description, palette, painted map
-    ├── labels.py         labels onto the mesh: palette, baked texture, parts
+    ├── labels.py         labels onto the mesh: palette, fill, parts
     ├── split.py          SegviGen's split, a copy this package owns
     └── logs.py
 server.py + static/       the step-by-step app, port 7862
@@ -41,6 +41,7 @@ Linux, Python 3.10+, a CUDA GPU, PyTorch 2.3+ already in the environment.
 
 ```bash
 pip install -r requirements.txt
+pip install --no-deps 'pyrender>=0.1.45'   # its PyOpenGL pin is stale; see requirements.txt
 pip install -e . --no-build-isolation      # compiles geosam2/ext/mode_ext.cpp
 cp .env.dist .env                          # GEMINI_API_KEY for the VLM stage
 ```
@@ -66,8 +67,7 @@ seg = GeoSAM2Segmenter()                                         # loads on the 
 parts_glb = seg.run(f"{work}/views", seed.map_path, view, f"{work}/out")
 # -> out/parts.glb (one geometry per part, the input's frame), parts.npy, labels_raw.npy, labels_post.npy
 
-baked = labels.bake_labels_to_glb(f"{work}/views/mesh.glb", f"{work}/out/parts.npy", f"{work}/baked.glb")
-split.split_glb_by_texture_palette_rgb(f"{work}/baked.glb", f"{work}/split.glb", **split.SPLIT_PRESETS["balanced"])
+split.split_glb_by_face_labels(f"{work}/views/mesh.glb", np.load(f"{work}/out/parts.npy"), f"{work}/split.glb")
 seg.clear_vram()
 ```
 
@@ -86,7 +86,7 @@ and two consecutive runs give the same labels.
 python app.py        # http://127.0.0.1:7862
 ```
 
-The stages one at a time -- render, pick the view, guidance, GeoSAM2, bake,
+The stages one at a time -- render, pick the view, guidance, GeoSAM2, fill,
 split -- each a job on file paths, so a stage can be re-run on its own and
 its result compared with the previous one in the viewer. The bundled
 `example/sample_*` skip the render.
