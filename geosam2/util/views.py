@@ -674,6 +674,14 @@ def _quantize_rgb(rgb: np.ndarray, step: int) -> np.ndarray:
     return q.astype(np.uint8)
 
 
+def _to_int_label_map(mask_like: np.ndarray) -> np.ndarray:
+    if mask_like.ndim != 2:
+        raise ValueError(f"Mask must be HxW, got shape: {mask_like.shape}")
+    if np.issubdtype(mask_like.dtype, np.floating):
+        return np.rint(mask_like).astype(np.int32)
+    return mask_like.astype(np.int32)
+
+
 def extract_mask_segments(mask_path: str) -> List[Tuple[Tuple[str, int], np.ndarray]]:
     """Extract mask segments with stable keys from label maps or color previews."""
     ext = os.path.splitext(mask_path)[1].lower()

@@ -43,7 +43,6 @@ class PropagationSettings:
     shrink_kernel: int = 5              # opening of every mask: kernel (px) ...
     shrink_iters: int = 3               # ... and iterations; erases what is thinner than ~kernel*iters
     # The automatic mask generator on the opposite view.
-    points_per_side: int = 64           # a grid of N x N clicks
     pred_iou_thresh: float = 0.7        # min predicted quality of a mask
     stability_score_thresh: float = 0.7
     box_nms_thresh: float = 0.7         # redundancy suppression between masks
@@ -54,7 +53,7 @@ class PropagationSettings:
     postprocess: bool = True            # complete_labels after the lift (off: post = raw)
 
     def generator_overrides(self) -> Dict:
-        return dict(points_per_side=self.points_per_side, pred_iou_thresh=self.pred_iou_thresh,
+        return dict(pred_iou_thresh=self.pred_iou_thresh,
                     stability_score_thresh=self.stability_score_thresh,
                     box_nms_thresh=self.box_nms_thresh, min_mask_region_area=self.min_mask_region_area)
 

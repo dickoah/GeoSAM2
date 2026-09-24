@@ -274,14 +274,13 @@ GEOSAM2_HELP = {
     "merge_iou": "Two objects overlapping more than this (0-1) are merged into one.",
     "shrink_kernel": "Every propagated mask is opened (eroded then dilated): kernel size in px.",
     "shrink_iters": "Opening iterations. Features thinner than about kernel x iters px are erased (handles, thin legs).",
-    "points_per_side": "Automatic generator: a grid of N x N clicks on the opposite view.",
     "pred_iou_thresh": "Automatic generator: min predicted quality of a mask.",
     "stability_score_thresh": "Automatic generator: min stability of a mask.",
     "box_nms_thresh": "Automatic generator: masks whose boxes overlap more than this are redundant.",
     "min_mask_region_area": "Automatic generator: masks smaller than this (px) are dropped.",
     "dedup_iou": "Automatic masks overlapping more than this (%) count as one.",
     "samples_per_face": "Points sampled per face to vote its label. More helps large faces.",
-    "postprocess": "GeoSAM2's post-process (complete_labels): speckle removal, filling, renumbering. Off: the post-processed labels are the raw lift.",
+    "postprocess": "GeoSAM2's post-process (complete_labels): speckle removal, filling. Off: the post-processed labels are the raw lift.",
 }
 
 

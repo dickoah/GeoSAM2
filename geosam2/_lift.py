@@ -433,20 +433,6 @@ def complete_labels(face_labels, mesh, PA=0.025):
     nearest_labels = face_labels[face_lable_idx][unlabel_top3_indices]
     most_frequent_labels = torch.mode(nearest_labels, dim=1).values
     face_labels[face_unlable_idx] = most_frequent_labels
-
-    labels_seen = set()
-    labels_curr = face_labels.max().item() + 1
-    labels_orig = labels_curr
-    for comp in components:
-        face = comp.pop()
-        label = face_labels[face]
-        comp.add(face)
-        if label == 0 or label in labels_seen: # background or repeated label
-            for face in comp:
-                face_labels[face] = labels_curr
-            labels_curr += 1
-        labels_seen.add(label)
-    print(f"Split {labels_curr - labels_orig} component(s) into unique labels")
     return face_labels
 
 def label_components(face_labels, face_adjacency: np.ndarray) -> list[set]:
@@ -497,7 +483,6 @@ def filter_iou(all_seg_result, video_segments, track_id, iou_thresh=0.8):
         track_id: Anchor frame used for overlap comparison.
         iou_thresh: Overlap above which two objects are one.
     """
-    start = __import__('time').time()
     accept_id = []
 
     for obj_id in list(video_segments[0].keys()):
@@ -530,9 +515,6 @@ def filter_iou(all_seg_result, video_segments, track_id, iou_thresh=0.8):
     for obj_id in discard_id:
         for _ in range(12):
             video_segments[_].pop(obj_id)
-
-    end = __import__('time').time()
-    _ = end - start
 
     return video_segments, all_seg_result
 
