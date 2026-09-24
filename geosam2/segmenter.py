@@ -166,7 +166,9 @@ class GeoSAM2Segmenter:
             mesh = load_mesh(mesh_path)
             if len(labels) != len(mesh.faces):
                 raise RuntimeError(f"label/mesh mismatch: {len(labels)} labels for {len(mesh.faces)} faces")
-            sub = mesh.submesh([assigned], append=True, repair=False)
+            # geometry only: submesh would concatenate the texture per call
+            sub = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False).submesh(
+                [assigned], append=True, repair=False)
             labels = labels.copy()
             labels[assigned] = clean_label_fragments(labels[assigned], sub).numpy()
         scene, structure = export_parts(mesh_path, labels)

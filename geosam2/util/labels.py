@@ -1,22 +1,17 @@
-"""Per-face labels onto the input mesh: the palette, the baked texture, the parts.
+"""Per-face labels onto the input mesh: the palette, the fill, the parts.
 
-The palette is keyed by label id and shared by every stage, so a part keeps
-its colour from the raw lift to the split. ``bake_labels_to_glb`` paints the
-labels into a flat-colour texture on the mesh's own UVs, which is what
-SegviGen's split (``geosam2.util.split``) reads. ``export_parts`` cuts the
-mesh into one geometry per label, in the input's own frame.
+The palette is keyed by label id and shared by every stage, so a part keeps its
+colour from the raw lift to the split. ``export_parts`` cuts the mesh into one
+geometry per label, in the input's own frame.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
-import cv2
 import numpy as np
 import trimesh
-from PIL import Image
 from scipy.spatial import cKDTree
 
 from geosam2.util.logs import get_logger
@@ -27,7 +22,7 @@ from geosam2.util.views import load_mesh
 logger = get_logger("geosam2.labels")
 
 # THE palette: one colour per label id, the same at every stage (raw lift,
-# post-process, bake, split), so a part keeps its colour from one viewer entry
+# post-process, fill, split), so a part keeps its colour from one viewer entry
 # to the next. Keyed by the id's VALUE, not its rank -- the raw lift and the
 # post-process carry different id sets, and a rank-based palette would shift
 # every colour between the two.
@@ -69,7 +64,7 @@ def to_linear_u8(rgb) -> np.ndarray:
 
     Textures are sRGB in glTF and vertex colours are linear; a viewer converts
     the latter on output. The palette is authored in sRGB (it is what the
-    swatches and the baked texture show), so a vertex-colour export has to be
+    swatches show), so a vertex-colour export has to be
     encoded, or the same part comes out lighter than its texture.
     """
     c = np.asarray(rgb, np.float64) / 255.0
@@ -83,104 +78,6 @@ def label_palette(labels: np.ndarray) -> Dict[int, Tuple[int, int, int]]:
     parts = [i for i in ids if i not in UNASSIGNED_LABELS]
     seq = _colour_sequence(max(parts, default=-1) + 1)
     return {i: (UNASSIGNED_RGB if i in UNASSIGNED_LABELS else seq[i]) for i in ids}
-
-
-def _unwrap(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """The same faces, in the same order, with a UV atlas from xatlas.
-
-    Seam vertices are duplicated, so the vertex array changes; the faces keep
-    their index and their positions, which is all the labels rely on.
-    """
-    import xatlas
-
-    vmap, faces, uv = xatlas.parametrize(np.asarray(mesh.vertices, np.float32),
-                                         np.asarray(mesh.faces, np.uint32))
-    out = trimesh.Trimesh(vertices=mesh.vertices[vmap], faces=faces.astype(np.int64), process=False)
-    out.visual = trimesh.visual.TextureVisuals(uv=uv)
-    logger.info("[bake] xatlas: %d -> %d vertices", len(mesh.vertices), len(vmap))
-    return out
-
-
-# A part with fewer texels than this per face cannot carry its colour in the
-# atlas: the bake paints a few texels the viewer smears, and the split has
-# nothing to read. Measured: 8 texels/face at worst on the reference meshes,
-# 0.01 on a desk whose UVs tile a wood pattern.
-_MIN_TEXELS_PER_FACE = 4.0
-_MIN_FACES_TO_JUDGE = 50
-
-
-def _atlas_usable(mesh: trimesh.Trimesh, labels: np.ndarray, size: int) -> bool:
-    """Whether every part of some size gets at least _MIN_TEXELS_PER_FACE texels per face.
-
-    The UV area of each part's triangles, in texels of a ``size`` atlas, over its
-    face count -- analytic, so it costs nothing on a dense mesh.
-    """
-    tri = np.asarray(mesh.visual.uv)[np.asarray(mesh.faces)] * size
-    area = 0.5 * np.abs((tri[:, 1, 0] - tri[:, 0, 0]) * (tri[:, 2, 1] - tri[:, 0, 1])
-                        - (tri[:, 2, 0] - tri[:, 0, 0]) * (tri[:, 1, 1] - tri[:, 0, 1]))
-    ids, inverse, n_faces = np.unique(labels, return_inverse=True, return_counts=True)
-    texels = np.bincount(inverse, weights=area, minlength=len(ids))
-    judged = n_faces >= _MIN_FACES_TO_JUDGE
-    return bool(np.all(texels[judged] >= _MIN_TEXELS_PER_FACE * n_faces[judged]))
-
-
-def bake_labels_to_glb(mesh_path: str, face_labels: np.ndarray, out_glb: str,
-                       size: int = 4096, atlas: str = "auto") -> Dict[int, Tuple[int, int, int]]:
-    """Write ``mesh_path`` with a flat-colour texture carrying ``face_labels``.
-
-    Each face's UV triangle is filled with its label's colour. Loaded with
-    ``load_mesh``, as the labels were made (force="mesh", default processing)
-    so the face order the labels index is the same.
-
-    ``atlas``: "keep" uses the mesh's own UVs; "xatlas" generates an atlas
-    (same face order); "auto" keeps them when every part has room in them
-    (see ``_atlas_usable``) and generates one otherwise. A mesh without UVs
-    always gets one.
-    """
-    if atlas not in ("auto", "keep", "xatlas"):
-        raise ValueError(f"atlas must be auto, keep or xatlas, got {atlas!r}")
-    mesh = load_mesh(mesh_path)
-    labels = np.asarray(face_labels).reshape(-1).astype(np.int64)
-    if len(labels) != len(mesh.faces):
-        raise ValueError(f"{len(labels)} labels for {len(mesh.faces)} faces")
-    uv = getattr(mesh.visual, "uv", None)
-    has_uv = uv is not None and len(uv) == len(mesh.vertices)
-    if not has_uv:
-        logger.info("[bake] no UVs on the mesh: atlas generated")
-    elif atlas == "xatlas":
-        logger.info("[bake] atlas regenerated as asked")
-    elif atlas == "auto" and not _atlas_usable(mesh, labels, size):
-        logger.info("[bake] the mesh's UVs leave a part fewer than %g texels per face: atlas regenerated",
-                    _MIN_TEXELS_PER_FACE)
-        has_uv = False
-    if not has_uv or atlas == "xatlas":
-        mesh = _unwrap(mesh)
-        uv = mesh.visual.uv
-
-    palette = label_palette(labels)
-    img = np.zeros((size, size, 3), np.uint8)
-    # u right, v up in glTF/trimesh; image rows go down.
-    px = np.stack([uv[:, 0] * (size - 1), (1.0 - uv[:, 1]) * (size - 1)], axis=1)
-    faces = np.asarray(mesh.faces)
-    shift = 4
-    for label, colour in palette.items():
-        tris = (px[faces[labels == label]] * (1 << shift)).round().astype(np.int32)
-        # The array is handed to PIL as RGB; cv2 writes the tuple in channel
-        # order, so it is NOT reversed here (that swap painted blue parts brown).
-        rgb = tuple(int(c) for c in colour)
-        cv2.fillPoly(img, list(tris), rgb, lineType=cv2.LINE_8, shift=shift)
-        # Thin triangles can rasterise to nothing; their edges still own texels.
-        cv2.polylines(img, list(tris), True, rgb, 1, lineType=cv2.LINE_8, shift=shift)
-    pil = Image.fromarray(img)
-
-    material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=pil, metallicFactor=0.0, roughnessFactor=1.0)
-    baked = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False)
-    baked.visual = trimesh.visual.TextureVisuals(uv=uv, image=pil, material=material)
-    os.makedirs(os.path.dirname(out_glb) or ".", exist_ok=True)
-    baked.export(out_glb)
-    logger.info("[bake] %d labels -> %s (%dx%d)", len(palette), out_glb, size, size)
-    return palette
 
 
 # ── Parts ────────────────────────────────────────────────────────────────────
@@ -225,6 +122,8 @@ def export_parts(
 
     scene = trimesh.Scene()
     children: List[Dict[str, Any]] = []
+    # bare: submesh would concatenate the texture into every part, _add_part drops it
+    mesh = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
 
     # Parts are named by label id, not by rank: the raw lift and the
     # post-process share ids, so "part_003" is the same part in both.

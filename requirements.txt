@@ -19,14 +19,14 @@ python-multipart>=0.0.9   # required by FastAPI for the multipart upload endpoin
 # Downloads ckpt/geosam2.pt from Hugging Face when it is missing (utils/segmenter.py).
 huggingface_hub
 
-# Rasterises the 12 canonical views in-process (utils/render.py), replacing the
-# Blender stage. Needs a GL context; it is driven headless through EGL.
-pyrender>=0.1.45
-
-# pyrender pins PyOpenGL==3.1.0, which predates numpy 2 by nine years: under it
-# glGenTextures raises a ctypes ArgumentError, so *any* textured mesh fails to
-# render. Overriding the pin is deliberate -- pip will warn about the conflict.
+# pyrender renders the 12 views (util/views.py) but pins PyOpenGL==3.1.0, which
+# cannot texture a mesh under numpy 2. Newer PyOpenGL here, pyrender separately:
+#   pip install --no-deps 'pyrender>=0.1.45'
 PyOpenGL>=3.1.7
+freetype-py
+imageio
+pyglet>=1.4.10
+six
 
 # VLM describe/paint of the seed view (utils/guidance.py, via SegviGen's code).
 # >=2.11 moved ImageGenerationTool and BinaryImage to the package root.
@@ -40,5 +40,3 @@ python-dotenv>=1.0
 # (utils/auto_prompt.py). Also pulled in by pyrender.
 scipy>=1.10
 
-# A UV atlas for meshes that come without one (utils/labels.py, the bake).
-xatlas

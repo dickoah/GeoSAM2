@@ -174,51 +174,30 @@ font-size:17px;font-weight:600;color:var(--ink2)}
       <div class="row"><label title="Pull of the closest assigned surface (the other side of a thin panel) on each unassigned face. Higher: the thickness wins over the neighbours.">thickness_weight</label><input type="number" id="f-thickness_weight" value="1" step="0.25"/></div>
       <div class="row"><label title="Folds sharper than this (degrees) count as creases, where a boundary is cheap.">crease_deg</label><input type="number" id="f-crease_deg" value="15" step="5"/></div>
       <button id="b4b" disabled>Fill</button>
-      <div class="hint">Grey means no evidence, never a part: every unassigned face takes a label from its neighbours along the surface, or through the thickness where no view saw it. The result is a label file the bake can take.</div>
+      <div class="hint">Grey means no evidence, never a part: every unassigned face takes a label from its neighbours along the surface, or through the thickness where no view saw it. The result is a label file the split can take.</div>
       <div class="out" id="o4b"></div>
     </div>
 
     <div class="step" id="s5">
-      <div class="step-head"><span class="num">5</span><h2>Bake to texture</h2><span class="t" id="t5"></span></div>
+      <div class="step-head"><span class="num">5</span><h2>Split</h2><span class="t" id="t5"></span></div>
       <div class="row"><label>Input</label><select id="in5"></select></div>
-      <div class="row"><label title="Resolution of the flat-colour atlas the labels are painted into">Texture size</label>
-        <select id="texsize">
-          <option value="1024">1024</option>
-          <option value="2048">2048</option>
-          <option value="4096" selected>4096 — thin parts</option>
+      <div class="row"><label title="sdf: keeps the distance-field cut, which reads a label map rasterised in UV space, so boundaries fall inside triangles. faces: no UV at all, boundaries stay on existing edges.">Mode</label>
+        <select id="q-mode">
+          <option value="sdf" selected>sdf — cut inside triangles (needs UVs)</option>
+          <option value="faces">faces — boundaries on existing edges</option>
         </select></div>
-      <div class="row"><label title="auto: the mesh's own UVs when every part has at least 4 texels per face in them, an xatlas atlas otherwise (UVs made to tile a pattern give a part a handful of texels). keep: always the mesh's UVs. xatlas: always a new atlas.">Atlas</label>
-        <select id="atlas"><option value="auto" selected>auto</option><option value="keep">keep the mesh's UVs</option><option value="xatlas">xatlas</option></select></div>
-      <button id="b5" disabled>Bake</button>
-      <div class="hint">The split reads a textured mesh, not a label list: each triangle is
-      painted its label's colour in the UV atlas. Any label file can go in — GeoSAM2's raw lift,
-      its post-process, or its post-process — so GeoSAM2's own post-process can be weighed.</div>
+      <div class="row"><label title="Blur radius in label-map pixels before detecting boundaries (sdf mode only)">Smooth (px sigma)</label><input type="number" id="q-smooth" value="1.5" min="0" max="5" step="0.25"/></div>
+      <div class="row"><label title="Components below this many faces are absorbed by their neighbours">Small component min faces</label><input type="number" id="q-small_component_min_faces" value="50" min="0"/></div>
+      <div class="row"><label title="Passes of the topology smoothing">Postprocess iters</label><input type="number" id="q-postprocess_iters" value="3" min="0"/></div>
+      <div class="row"><label title="Snap part boundaries onto real creases within a few face rings">Band refine</label><input type="checkbox" id="q-band_refine" checked/></div>
+      <div class="row"><label title="Force each authored UV chart to remain a separate part">One UV island = one part</label><input type="checkbox" id="q-island_majority"/></div>
+      <div class="row"><label title="Remove parts smaller than this many faces">Min faces / part</label><input type="number" id="q-min_faces_per_part" value="1" min="0"/></div>
+      <div class="row"><label title="Reassign tiny disconnected pieces after the split">Cleanup fragments (post-cut)</label><input type="checkbox" id="q-cleanup_fragments" checked/></div>
+      <button id="b5" disabled>Split from labels</button>
+      <div class="hint">Cuts the mesh along the label boundaries, one mesh per part, straight from
+      the label file. Mode <b>sdf</b> puts boundaries inside triangles and needs the mesh's UVs;
+      <b>faces</b> leaves them on existing edges and needs none.</div>
       <div class="out" id="o5"></div>
-    </div>
-
-    <div class="step" id="s6">
-      <div class="step-head"><span class="num">6</span><h2>Split</h2><span class="t" id="t6"></span></div>
-      <div class="row"><label>Input</label><select id="in6"></select></div>
-      <div class="row" id="pbar"><label>Preset</label></div>
-      <div class="row"><label title="Blur radius in atlas pixels before detecting boundaries">Smooth (px sigma)</label><input type="number" id="p-smooth" value="1.5" min="0" max="5" step="0.25"/></div>
-      <div class="row"><label title="RGB quantisation step: larger values merge nearby texture colours">Color quant step</label><input type="number" id="p-color_quant_step" value="16" min="1" max="64"/></div>
-      <div class="row"><label title="Minimum fraction of UV-owned texels needed to keep a colour as a part">Palette min frac</label><input type="number" id="p-palette_min_frac" value="0.0005" min="0" max="1" step="0.0001"/></div>
-      <div class="row"><label title="Maximum number of candidate colours in the palette">Palette max colors</label><input type="number" id="p-palette_max_colors" value="256" min="1"/></div>
-      <div class="row"><label title="RGB distance below which two palette colours are merged">Palette merge dist</label><input type="number" id="p-palette_merge_dist" value="32" min="0"/></div>
-      <div class="row"><label title="Remove parts smaller than this many faces after palette labelling">Min faces / part</label><input type="number" id="p-min_faces_per_part" value="1" min="0"/></div>
-      <div class="row"><label title="Force each authored UV chart to remain a separate part">One UV island = one part</label><input type="checkbox" id="p-island_majority"/></div>
-      <div class="row"><label title="Reassign tiny disconnected pieces after the SDF cut">Cleanup fragments (post-cut)</label><input type="checkbox" id="p-cleanup_fragments"/></div>
-      <div class="row"><label>Output mode</label>
-        <select id="p-output_mode">
-          <option value="vertex_colors" selected>vertex_colors — flat colour per part</option>
-          <option value="clean_texture">clean_texture — flat texture from labels</option>
-          <option value="texture">texture — the baked label atlas</option>
-        </select></div>
-      <button id="b6" disabled>Split</button>
-      <div class="hint">Palette on the covered texels, smoothing, graph-cut +
-      re-placement on real creases, distance-field cut in the atlas. The only stage that creates
-      new vertices.</div>
-      <div class="out" id="o6"></div>
       <div class="row" style="margin-top:9px"><label>Compare</label><select id="which"></select></div>
     </div>
 
@@ -403,9 +382,9 @@ async function uploadMesh(f){
 }
 // A new mesh invalidates every result: the registry, the selectors, the gates.
 function resetStages(){
-  for(const b of ['b2','b3','b4','b4b','b5','b6']) $(b).disabled=true;
-  for(const s of ['s1','s2','s3','s4','s4b','s5','s6']) mark(s,null);
-  S.results=[]; for(const w of ['in4b','in5','in6','which']) $(w).innerHTML='';
+  for(const b of ['b2','b3','b4','b4b','b5']) $(b).disabled=true;
+  for(const s of ['s1','s2','s3','s4','s4b','s5']) mark(s,null);
+  S.results=[]; for(const w of ['in4b','in5','which']) $(w).innerHTML='';
 }
 
 $('file').onchange=async e=>{
@@ -463,17 +442,16 @@ $('b4').onclick=()=>step('s4','t4','o4','/api/jobs/segment',
 // ── Steps 5-6: each runnable on ANY earlier result ───────────────────────
 // Every result is registered with its kind, so a stage's Input selector
 // lists everything of the kind it consumes -- not just the stage before. That
-// is how a method's weight is measured: bake GeoSAM2's raw lift or its
-// post-process, split the same bake with two presets, and compare in the viewer.
-//   labels : a per-face label file (what 5 bakes)  -> in5
-//   baked  : a textured mesh (what 6 splits)       -> in6
+// is how a method's weight is measured: split GeoSAM2's raw lift or its
+// post-process, split the same labels in two modes, and compare in the viewer.
+//   labels : a per-face label file -- what 4b fills and 5 cuts -> in4b, in5
 // Each entry has a short id; a result's tag names its input by id, so the
 // lineage of what is on screen reads off the Compare list.
 S.results=[];
 function register(kind,label,data,glb){
   const id='#'+(S.results.length+1);
   S.results.push({id,kind,label:id+' '+label,data,glb});
-  for(const [k,sel] of [['labels','in4b'],['labels','in5'],['baked','in6']]){
+  for(const [k,sel] of [['labels','in4b'],['labels','in5']]){
     const w=$(sel), items=S.results.filter(r=>r.kind===k);
     w.innerHTML=items.map(r=>'<option value="'+r.id+'">'+r.label+'</option>').join('');
     if(items.length){ w.value=items[items.length-1].id; $('b'+sel.slice(2)).disabled=false; }
@@ -500,36 +478,20 @@ $('b4b').onclick=()=>{ const inp=picked('in4b'); return step('s4b','t4b','o4b','
       {data_root:inp.data.data_root,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
   }); };
 
-// 5 ── any label file onto the UVs
-$('b5').onclick=()=>{ const inp=picked('in5'); return step('s5','t5','o5','/api/jobs/bake',
-  {...inp.data, texture_size:+$('texsize').value, atlas:$('atlas').value},r=>{
-    $('o5').textContent=r.n_labels+' labels painted into a '+r.texture_size+'² atlas';
-    register('baked','5 '+r.texture_size+' ← '+inp.id,
-      {work_dir:inp.data.work_dir,baked_glb:r.baked_glb},r.baked_glb);
-  }); };
-
-// 6 ── the split on any bake. One input per field, id "p-<field>".
-const SPLIT=['smooth','color_quant_step','palette_min_frac','palette_max_colors',
-  'palette_merge_dist','min_faces_per_part','island_majority','cleanup_fragments','output_mode'];
-const splitVal=k=>{const e=$('p-'+k);return e.type==='checkbox'?e.checked:e.type==='number'?+e.value:e.value;};
-const presets=await (await fetch('/api/presets/split')).json();
-let preset='custom';
-for(const [name,vals] of Object.entries(presets)){
-  const b=document.createElement('button');b.textContent=name.replace('_',' ');b.style.cssText='flex:0;white-space:nowrap';
-  b.onclick=()=>{preset=name;for(const [k,v] of Object.entries(vals)) if($('p-'+k)) $('p-'+k).value=v;};
-  $('pbar').appendChild(b);
-}
-for(const k of SPLIT) $('p-'+k).oninput=()=>{preset='custom';};
-$('b6').onclick=()=>{ const inp=picked('in6'); const opts=Object.fromEntries(SPLIT.map(k=>[k,splitVal(k)]));
-  return step('s6','t6','o6','/api/jobs/split',{...inp.data,...opts},r=>{
-    $('o6').textContent=r.n_split_parts+' parts ('+r.output_mode+')';
-    register('split','6 '+preset+' '+opts.output_mode+' '+r.n_split_parts+'p ← '+inp.id,
-      {},r.segvigen_glb);
-  }); };
+// 5 ── the split, on any label file. Fields id "q-<field>".
+const FSPLIT=['mode','smooth','small_component_min_faces','postprocess_iters',
+  'band_refine','island_majority','min_faces_per_part','cleanup_fragments'];
+const fsplitVal=k=>{const e=$('q-'+k);return e.type==='checkbox'?e.checked:e.type==='number'?+e.value:e.value;};
+$('b5').onclick=()=>{ const inp=picked('in5'); const opts=Object.fromEntries(FSPLIT.map(k=>[k,fsplitVal(k)]));
+  return step('s5','t5','o5','/api/jobs/split',
+    {data_root:inp.data.data_root,work_dir:inp.data.work_dir,labels_path:inp.data.labels_path,...opts},r=>{
+      $('o5').textContent=r.n_split_parts+' parts ('+r.mode+')';
+      register('split','5 '+r.mode+' '+r.n_split_parts+'p ← '+inp.id,{},r.segvigen_glb);
+    }); };
 
 // ── All steps ────────────────────────────────────────────────────────────
 // The buttons return step()'s promise, so the chain is the buttons themselves:
-// the seed view comes from the VLM, and the bake and the split take the latest
+// the seed view comes from the VLM, and the fill and the split take the latest
 // result, which the registry selects by default.
 $('ball').onclick=async()=>{
   if(!S.mesh) return;
@@ -539,9 +501,8 @@ $('ball').onclick=async()=>{
     await $('b2').onclick();
     await $('b3').onclick();
     await $('b4').onclick();
-    await $('b4b').onclick();                      // fill: the bake then takes the filled labels
+    await $('b4b').onclick();                      // fill: the split then takes the filled labels
     await $('b5').onclick();
-    await $('b6').onclick();
     log('✔ all steps in '+((Date.now()-t0)/1000).toFixed(0)+' s');
   }catch(e){ log('✘ stopped: '+e.message); }
   finally{ $('ball').disabled=false; }

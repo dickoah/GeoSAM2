@@ -34,8 +34,8 @@ dependencies = [
     "opencv-python<5",
     "tqdm",
     "trimesh",
-    "xatlas",
     "ninja",
+    # No pyrender/PyOpenGL: its stale pin makes any resolve fail. See requirements.txt.
 ]
 
 [project.urls]

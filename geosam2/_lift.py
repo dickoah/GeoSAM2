@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import math
 import torch.nn.functional as F
-from collections import defaultdict
 import cv2
 from geosam2.sam2.utils.amg import calculate_stability_score
 from scipy.sparse import coo_matrix
@@ -224,8 +223,8 @@ def transform_points_homo(pos: torch.FloatTensor, mtx: torch.FloatTensor):
     pos_homo = torch.cat(
         [pos, torch.ones_like(pos[...,0:1])], dim=-1
     )
-    pos = (pos_homo[None,:,None] * mtx.unsqueeze(1)).sum(-1)[...,:3]
-    return pos
+    # a matmul, not a [V, N, 4, 4] broadcast: that was 2.5 GB on 3.3M points
+    return (pos_homo @ mtx.transpose(1, 2))[..., :3]
 
 
 def cal_link(imgs_mask, depth_images, c2ws, fovy_deg, coord):
@@ -323,23 +322,18 @@ def lift_2dmask_3d(imgs_mask, depth_imgs, c2ws, fovy_deg, coord, selected_frames
         sample_num_per_face: Number of points sampled per face.
         prior_keys: Optional object ids with prompt-priority in aggregation.
     """
-    all_masks = mask_aggregation(video_segments,prior_keys=prior_keys)
-    link = torch.ones([coord.shape[0], 3, len(selected_frames)], dtype=torch.int)
-    link[:, 0:3, :] = cal_link(imgs_mask, depth_imgs, c2ws, fovy_deg, coord).permute(1,2,0)
+    all_masks = torch.from_numpy(mask_aggregation(video_segments, prior_keys=prior_keys))
+    link = cal_link(imgs_mask, depth_imgs, c2ws, fovy_deg, coord).permute(1,2,0).to(torch.int)
     grid_normalized = (link[:,:-1,:].permute(2,0,1).unsqueeze(-2).to(torch.float32) / (1024 - 1)) * 2 - 1
-    pc_labels = F.grid_sample(
-        torch.from_numpy(all_masks),
-        grid_normalized,
-        mode="nearest"
-    ).squeeze(1)
+    pc_labels = F.grid_sample(all_masks, grid_normalized, mode="nearest").squeeze(1)
     link_ = link.permute(2,0,1)[:,:,-1:].to(torch.bool)
     pc_labels[~link_] = 0
 
     pc_labels = pc_labels.squeeze().permute(1,0)
-    pc_label = mode_except_negative_one(pc_labels.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
+    pc_label = mode_except_negative_one(pc_labels.to(torch.int32)).to(all_masks.dtype)
 
     pc_label = pc_label.reshape(-1, sample_num_per_face)
-    return mode_except_negative_one(pc_label.to(torch.int32)).to(torch.from_numpy(all_masks).dtype)
+    return mode_except_negative_one(pc_label.to(torch.int32)).to(all_masks.dtype)
 
 
 def sample_points_on_faces_parallel(face_to_vertex, num_points=3, use_vertex=False):
@@ -375,62 +369,58 @@ def sample_points_on_faces_parallel(face_to_vertex, num_points=3, use_vertex=Fal
     return sampled_points
 
 
-def complete_labels(face_labels, mesh, PA=0.025, smooth_type="knn"):
-    """Remove tiny components and fill unlabeled faces.
+def complete_labels(face_labels, mesh, PA=0.025):
+    """Remove tiny components and fill unlabeled faces, in place; returns them.
 
     Args:
         face_labels: Per-face integer labels.
         mesh: Source mesh with adjacency/geometry.
         PA: Relative threshold for tiny-component removal.
-        smooth_type: Smoothing strategy, currently `adjacent` is implemented.
     """
-    mesh_graph = defaultdict(set)
-    for face1, face2 in mesh.face_adjacency:
-        mesh_graph[face1].add(face2)
-        mesh_graph[face2].add(face1)
+    adjacency = np.asarray(mesh.face_adjacency)
+    # Each face's neighbours in the order a Python set of them iterates in --
+    # neither the adjacency's order nor sorted. VAST's smoothing took the FIRST
+    # non-zero neighbour of such a set, so the order is the contract; the sets
+    # are built as they were and read out into a -1 padded table.
+    keys, vals = adjacency.ravel(), adjacency[:, ::-1].ravel()
+    order = np.argsort(keys, kind="stable")
+    keys, vals = keys[order], vals[order]
+    starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+    neighbours = [list(set(vals[a:b].tolist())) for a, b in zip(starts, np.r_[starts[1:], len(keys)])]
+    degree = np.fromiter(map(len, neighbours), np.int64, len(neighbours))
+    table = np.full((len(face_labels), degree.max()), -1, np.int64)
+    table[np.repeat(keys[starts], degree),
+          np.arange(degree.sum()) - np.repeat(np.cumsum(degree) - degree, degree)] = \
+        np.fromiter((f for nb in neighbours for f in nb), np.int64, degree.sum())
 
-    components = label_components(face_labels, mesh_graph)
-    threshold_percentage_size = PA
-    threshold_percentage_area = PA
-    components = sorted(components, key=lambda x: len(x), reverse=True)
-    components_area = [
-        sum([float(mesh.area_faces[face]) for face in comp]) for comp in components
-    ]
-    max_size = max([len(comp) for comp in components])
+    components = sorted(label_components(face_labels, adjacency), key=len, reverse=True)
+    area_faces = np.asarray(mesh.area_faces)
+    components_area = [area_faces[list(comp)].sum() for comp in components]
+    max_size = max(map(len, components))
     max_area = max(components_area)
 
-    remove_comp_size = set()
-    remove_comp_area = set()
-    for i, comp in enumerate(components):
-        if len(comp)          < max_size * threshold_percentage_size:
-            remove_comp_size.add(i)
-        if components_area[i] < max_area * threshold_percentage_area:
-            remove_comp_area.add(i)
-    remove_comp = remove_comp_size.intersection(remove_comp_area)
+    remove_comp = ({i for i, comp in enumerate(components) if len(comp) < max_size * PA}
+                   & {i for i, area in enumerate(components_area) if area < max_area * PA})
     print(f"Removing {len(remove_comp)} small components")
     for i in remove_comp:
-        for face in components[i]:
-            face_labels[face]=0
+        face_labels[list(components[i])] = 0
 
-    face_label1 = face_labels.clone()
-
-    if smooth_type=="adjacent":
-        # Up to 64 passes; each face still at 0 takes a neighbour's label. VAST's
-        # loop counted the neighbours in a Counter keyed by 0-d tensors, which
-        # hash by identity: every neighbour counted once and most_common() gave
-        # the FIRST non-zero neighbour in adjacency order -- what next() does
-        # here. A pass that changes nothing ends the loop (the next ones would
-        # change nothing either). Read and written through a numpy view of the
-        # tensor: 150k faces x 64 passes of tensor scalar indexing took 26 s.
-        lab = face_labels.numpy()
-        for _ in range(64):
-            changes = {face: nb for face in np.flatnonzero(lab == 0)
-                       for nb in [next((lab[a] for a in mesh_graph[face] if lab[a] != 0), None)]
-                       if nb is not None}
-            if not changes:
-                break
-            for face, label in changes.items():
-                lab[face] = label
+    # Up to 64 passes; each face still at 0 takes its first non-zero neighbour's
+    # label, all read from the state the pass started in. VAST's loop counted
+    # the neighbours in a Counter keyed by 0-d tensors, which hash by identity,
+    # so most_common() gave the first non-zero one in set order -- kept.
+    # A pass that changes nothing ends the loop. Per-face Python over the
+    # unfilled block took 5 s on 664k faces; this is one gather per pass.
+    lab = face_labels.numpy()
+    for _ in range(64):
+        zero = np.flatnonzero(lab == 0)
+        around = table[zero]
+        labels = np.where(around >= 0, lab[np.maximum(around, 0)], 0)
+        found = labels != 0
+        hit = found.any(axis=1)
+        if not hit.any():
+            break
+        lab[zero[hit]] = labels[np.arange(len(zero)), found.argmax(axis=1)][hit]
 
     print("Smoothing labels")
     face_unlable_idx = torch.where(face_labels == 0)[0]
@@ -439,20 +429,10 @@ def complete_labels(face_labels, mesh, PA=0.025, smooth_type="knn"):
     unlabel_xyz = face_centroids[face_unlable_idx]
     label_xyz = face_centroids[face_lable_idx]
 
-    face_normals = mesh.face_normals
-    unlabel_norm = face_normals[face_unlable_idx]
-    label_norm = face_normals[face_lable_idx]
-
-    lambda_norm = 0
-    unlabel_xyz = np.concatenate([unlabel_xyz, unlabel_norm * lambda_norm], axis=-1)
-    label_xyz = np.concatenate([label_xyz, label_norm * lambda_norm], axis=-1)
-
     unlabel_top3_indices = find_nearest_three_points(unlabel_xyz, label_xyz) # [N,3]
     nearest_labels = face_labels[face_lable_idx][unlabel_top3_indices]
     most_frequent_labels = torch.mode(nearest_labels, dim=1).values
     face_labels[face_unlable_idx] = most_frequent_labels
-
-    face_label2 = face_labels.clone()
 
     labels_seen = set()
     labels_curr = face_labels.max().item() + 1
@@ -467,60 +447,46 @@ def complete_labels(face_labels, mesh, PA=0.025, smooth_type="knn"):
             labels_curr += 1
         labels_seen.add(label)
     print(f"Split {labels_curr - labels_orig} component(s) into unique labels")
-    face_label3 = face_labels.clone()
+    return face_labels
 
-    return face_label1, face_label2, face_label3
-
-def label_components(face_labels: dict, mesh_graph) -> list[set]:
-    """Group connected faces that share identical non-zero labels.
+def label_components(face_labels, face_adjacency: np.ndarray) -> list[set]:
+    """Connected groups of adjacent faces sharing one non-zero label, in order
+    of their lowest face -- the order the DFS this replaces found them in.
 
     Args:
         face_labels: Per-face labels.
-        mesh_graph: Face adjacency graph.
+        face_adjacency: Adjacent face pairs, [E, 2].
     """
-    components = []
-    visited = set()
+    labels = np.asarray(face_labels)
+    a, b = face_adjacency.T
+    keep = (labels[a] == labels[b]) & (labels[a] != 0)
+    a, b = a[keep], b[keep]
+    n = len(labels)
+    graph = coo_matrix((np.ones(2 * len(a), np.int8), (np.r_[a, b], np.r_[b, a])), shape=(n, n))
+    _, component = connected_components(graph, directed=False)
 
-    def dfs(source: int):
-        stack = [source]
-        components.append({source})
-        visited.add(source)
-        
-        while stack:
-            node = stack.pop()
-            for adj in mesh_graph[node]:
-                if adj not in visited and face_labels[adj]!=0 and face_labels[adj] == face_labels[node]:
-                    stack.append(adj)
-                    components[-1].add(adj)
-                    visited.add(adj)
-
-    for face in range(face_labels.shape[0]):
-        if face not in visited and face_labels[face]!=0:
-            dfs(face)
-
-    return components
+    faces = np.flatnonzero(labels != 0)
+    order = np.argsort(component[faces], kind="stable")
+    faces, group = faces[order], component[faces][order]
+    starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]])
+    return [set(faces[s:e].tolist()) for s, e in zip(starts, np.r_[starts[1:], len(faces)])]
 
 def find_nearest_three_points(A, B):
-    """Find indices of the nearest 3 points in B for every point in A.
+    """Indices of the nearest 3 points in B for every point in A, [N, 3].
 
-    Args:
-        A: Query points, shape [N, 3], numpy or torch.
-        B: Reference points, shape [M, 3], numpy or torch.
+    A tree, not the dense [N, M] cdist VAST used: that is 319 GB on 664k faces.
     """
     np_array = isinstance(A, np.ndarray)
-    if np_array:
-        A = torch.from_numpy(A).float()
-        B = torch.from_numpy(B).float()
+    A_np = A if np_array else A.numpy()
+    B_np = B if np_array else B.numpy()
 
-    distances = torch.cdist(A, B)  # shape [N, M]
+    k = min(3, len(B_np))
+    _, indices = cKDTree(B_np).query(A_np, k=k, workers=-1)
+    indices = indices.reshape(len(A_np), k)
+    if k < 3:
+        indices = np.repeat(indices[:, :1], 3, axis=1)
 
-    _, indices = torch.topk(distances, k=3, largest=False)  # shape [N, 3]
-
-    ret = indices
-    if np_array:
-        ret = ret.numpy()
-
-    return ret
+    return indices if np_array else torch.from_numpy(indices)
 
 def filter_iou(all_seg_result, video_segments, track_id, iou_thresh=0.8):
     """Filter highly overlapping objects inside and across passes.

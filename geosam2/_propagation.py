@@ -160,6 +160,4 @@ def propagate(predictor, mask_generator, views: Views, postprocess_pa: float,
     )
     if not settings.postprocess:
         return raw, raw.clone()
-    _, _, post = complete_labels(raw.clone(), views.mesh_vanilla,
-                                 smooth_type="adjacent", PA=postprocess_pa)
-    return raw, post
+    return raw, complete_labels(raw.clone(), views.mesh_vanilla, PA=postprocess_pa)
