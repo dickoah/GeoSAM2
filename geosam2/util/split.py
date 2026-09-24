@@ -565,6 +565,7 @@ def _expand(face_label: np.ndarray, alpha: int, D: np.ndarray,
 _BAND_RINGS = 3
 _BAND_PRIOR = 1.0     # nats: cost of changing a face, scaled by its area
 _BAND_AREA_CAP = 4.0  # low-poly slabs must not overpower lambda
+_BAND_LOCK_SHARE = 0.05  # ...nor be repainted: a face this share of its mesh is a part, not a boundary
 _BAND_CREASE = np.radians(15.0)
 
 
@@ -617,7 +618,8 @@ def refine_face_labels_boundary_band(
         m = band[a] | band[b]
         band[a[m]] = True
         band[b[m]] = True
-    band &= lab >= 0
+    area = np.asarray(mesh.area_faces, np.float64)
+    band &= (lab >= 0) & (area < _BAND_LOCK_SHARE * area.sum())
     if not band.any():
         return lab
 
@@ -626,7 +628,6 @@ def refine_face_labels_boundary_band(
     cmp = np.full(nF, -1, np.int64)
     cmp[bidx] = np.arange(len(bidx))
 
-    area = np.asarray(mesh.area_faces, np.float64)
     aw = np.clip(area / max(float(np.mean(area)), 1e-12), 0.0, _BAND_AREA_CAP)
     D = np.tile((_BAND_PRIOR * aw[bidx])[:, None], (1, L))
     D[np.arange(len(bidx)), lab[bidx]] = 0.0

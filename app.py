@@ -363,6 +363,7 @@ def start_fill(params: FillParams) -> dict:
     def _run() -> dict:
         from geosam2.util.labels import export_parts, fill_labels
         labels, report = fill_labels(data_root / "mesh.glb", np.load(params.labels_path),
+                                     np.load(work / "3d_seg" / "labels_raw.npy"),
                                      lam=params.lam, thickness_weight=params.thickness_weight,
                                      crease_deg=params.crease_deg)
         tag = uuid.uuid4().hex[:6]
