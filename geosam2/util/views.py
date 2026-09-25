@@ -359,9 +359,13 @@ LIGHT_YAWS: Tuple[float, ...] = (-40.0, 0.0, 40.0)
 LIGHT_INTENSITY = 0.5
 AMBIENT = 0.45
 
+# Glass keeps this much opacity, PixMesh's ViewGenerator floor: below it a clear part vanishes from the view and from its alpha.
+MIN_ALPHA = 180
+UNTEXTURED_RGBA = np.array([180, 180, 180, 255], dtype=np.uint8)
+
 
 def _lit_scene(scene: trimesh.Scene, matrix: np.ndarray, smooth_normals: bool = False):
-    """The mesh as it is -- textures, PBR factors, everything -- lit from the camera.
+    """The mesh with its textures and PBR factors, lit from the camera, glass held at ``MIN_ALPHA``.
 
     Returns ``(pyrender_scene, camera_node, lights)``, where ``lights`` is what
     :func:`_pose_lit` needs. Pose them together with the camera: the lamps ride
@@ -376,6 +380,20 @@ def _lit_scene(scene: trimesh.Scene, matrix: np.ndarray, smooth_normals: bool = 
     for part in _parts(scene):
         placed = part.copy()
         placed.apply_transform(matrix)
+        material = getattr(placed.visual, "material", None)
+        base = getattr(material, "baseColorFactor", None)
+        if base is not None and base[3] < MIN_ALPHA:
+            base = np.array(base, dtype=np.uint8)
+            base[3] = MIN_ALPHA
+            material.baseColorFactor = base
+        # pyrender writes the texture's alpha into the image in every alphaMode: the factor alone holds the floor.
+        texture = getattr(material, "baseColorTexture", None)
+        if texture is not None and texture.mode != "RGB":
+            material.baseColorTexture = texture.convert("RGB")
+        # A texture without UVs fails pyrender's shader compile: the part falls back to its flat base colour.
+        if material is not None and getattr(placed.visual, "uv", None) is None:
+            rgba = base if base is not None else UNTEXTURED_RGBA
+            placed.visual = trimesh.visual.ColorVisuals(placed, vertex_colors=np.tile(rgba, (len(placed.vertices), 1)))
         pr_scene.add(pyrender.Mesh.from_trimesh(placed, smooth=smooth_normals))
 
     camera_node = pr_scene.add(pyrender.PerspectiveCamera(yfov=camera_angle_x(), aspectRatio=1.0))
