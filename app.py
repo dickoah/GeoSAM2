@@ -156,6 +156,11 @@ def samples() -> dict:
     return {"samples": [{"name": p.name, "path": str(p)} for p in roots]}
 
 
+def _vlm_key() -> bool:
+    """A Gemini key, or OpenRouter serving Gemini in its place (guidance.py handles both)."""
+    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"))
+
+
 @app.get("/api/status")
 def status() -> dict:
     import torch
@@ -163,8 +168,7 @@ def status() -> dict:
     return {
         "checkpoint": {"path": str(ckpt), "present": ckpt.is_file()},
         "cuda": torch.cuda.is_available(),
-        "gemini_key": bool(os.environ.get("GEMINI_API_KEY")
-                           or os.environ.get("GOOGLE_API_KEY")),
+        "gemini_key": _vlm_key(),
     }
 
 
@@ -201,14 +205,14 @@ def start_pickview(params: PickViewParams) -> dict:
     data_root = _require_dir(params.data_root)
 
     def _run() -> dict:
-        from geosam2.util.guidance import VIEW_MAP, pick_seed_view
-        from geosam2.util.views import AZIMUTHS_REFERENCE
+        from geosam2.util.guidance import pick_seed_view
+        from geosam2.util.views import AZIMUTHS_REFERENCE, NUM_VIEWS
         view = pick_seed_view(data_root)
         compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
                    "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
         label = compass[int(((AZIMUTHS_REFERENCE[view] + 22.5) % 360) // 45)]
         return {"seed_view": view, "label": label,
-                "candidates": list(VIEW_MAP.values()),
+                "candidates": list(range(NUM_VIEWS)),
                 "view_image": str(data_root / f"color_{view:04d}.webp")}
 
     return _start_job(_run)
@@ -229,8 +233,8 @@ class GuidanceParams(BaseModel):
 @app.post("/api/jobs/guidance")
 def start_guidance(params: GuidanceParams) -> dict:
     data_root = _writable_views(params.data_root)
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        raise HTTPException(400, "GEMINI_API_KEY is not set (see .env at the repo root).")
+    if not _vlm_key():
+        raise HTTPException(400, "Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is set (see .env at the repo root).")
 
     def _run() -> dict:
         from geosam2.util.guidance import generate_seed

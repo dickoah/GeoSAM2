@@ -18,22 +18,25 @@ import copy
 import json
 import math
 import os
+import re
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
-from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.capabilities import ImageGeneration
 from pydantic_ai.messages import BinaryImage
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.settings import ModelSettings
 
 from geosam2.util.logs import get_logger
+from geosam2.util.views import ELEVATIONS, NUM_VIEWS
 
 logger = get_logger("geosam2.guidance")
 
@@ -90,9 +93,10 @@ _POV_OPP: Dict[str, set] = {
 
 # ── Rendering ─────────────────────────────────────────────────────────────
 
-# Candidates offered to the single-mode picker. bottom is left out: an object
-# that sits on the ground never segments best from underneath.
-VIEW_CANDIDATES = ("main", "main_high", "front", "back", "left", "right", "top")
+
+
+# Camera height of each rig elevation, as the picker tags its tiles.
+_HEIGHT = {0.0: "LEVEL", 25.0: "ABOVE", -25.0: "BELOW"}
 
 
 # ── Grid assembly ──────────────────────────────────────────────────────────
@@ -243,20 +247,61 @@ _PROVIDER_KEYS = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
 }
-# Fallback chains, filtered by available keys at call time.
-_DESCRIBE_FALLBACKS = ("anthropic:claude-sonnet-4-6", "openai:gpt-5-mini")
+# OpenRouter serves a provider only when its own key is empty, on the maker's own servers.
+_OPENROUTER_PROVIDER = {"order": ["google-ai-studio", "anthropic", "openai"], "allow_fallbacks": False}
+# Default fallback chains, for when .env sets none; filtered by available keys at call time.
+_DESCRIBE_FALLBACKS = ("anthropic:claude-sonnet-5", "openai:gpt-5.6-luna")
 _GENERATE_FALLBACKS = ("google:gemini-2.5-flash-image",)
 
 
+def _env_models(var: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Comma-separated 'provider:model' names from ``var``; the default when it is unset or empty."""
+    models = tuple(m.strip() for m in os.environ.get(var, "").split(",") if m.strip())
+    return models or default
+
+
 def _resolve_model(model: str, fallbacks: Tuple[str, ...]):
-    """'provider:name' string (bare names get 'google:') + keyed fallbacks."""
+    """'provider:name' string (bare names get 'google:') + keyed fallbacks, OPENROUTER_API_KEY last."""
     if ":" not in model:
         model = f"google:{model}"
-    chain = [m for m in dict.fromkeys([model, *fallbacks])
-             if any(os.environ.get(k) for k in _PROVIDER_KEYS[m.split(":", 1)[0]])]
+    chain = []
+    for m in dict.fromkeys([model, *fallbacks]):
+        provider, name = m.split(":", 1)
+        if any(os.environ.get(k) for k in _PROVIDER_KEYS[provider]):
+            chain.append(m)
+        elif os.environ.get("OPENROUTER_API_KEY"):
+            if provider == "anthropic":
+                name = re.sub(r"-(\d+)-(\d+)$", r"-\1.\2", name)  # OpenRouter writes claude-sonnet-4.6
+            chain.append(OpenRouterModel(f"{provider}/{name}", settings=ModelSettings(openrouter_provider=_OPENROUTER_PROVIDER)))
     if not chain:
         raise RuntimeError(f"No API key configured for {model} (see .env).")
     return chain[0] if len(chain) == 1 else FallbackModel(*chain)
+
+
+def _openrouter_image(models: List[str], prompt: str, image: BinaryContent, system: str,
+                      timeout: float = 180) -> bytes:
+    """One image from the first of ``models`` OpenRouter serves, as pixmesh's ImageGenerator does.
+
+    pydantic-ai reads no image back from OpenRouter, so its chat API is called directly.
+    """
+    from openai import OpenAI
+
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"], timeout=timeout)
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": [{"type": "text", "text": prompt},
+                                             {"type": "image_url", "image_url": {"url": image.data_uri}}]}]
+    extra_body = {"modalities": ["image", "text"], "provider": _OPENROUTER_PROVIDER,
+                  "image_config": {"aspect_ratio": "1:1"}}
+    errors = []
+    for m in dict.fromkeys(m if ":" in m else f"google:{m}" for m in models):
+        try:
+            message = client.chat.completions.create(model=m.replace(":", "/", 1), messages=messages,
+                                                     temperature=0.0, extra_body=extra_body).choices[0].message
+            return BinaryContent.from_data_uri(message.model_extra["images"][0]["image_url"]["url"]).data
+        except Exception as exc:                   # noqa: BLE001 - the next model is tried
+            logger.warning("%s returned no image through OpenRouter: %s", m, exc)
+            errors.append(exc)
+    raise RuntimeError(f"Image generation failed on {models} through OpenRouter: {errors}")
 
 
 def _run_agent(agent: Agent, content: list, **run_kwargs):
@@ -303,143 +348,94 @@ class _SceneDesc(BaseModel):
     objects: List[_ObjectDesc]
 
 
-class _ViewChoice(BaseModel):
-    # Field order is the answering order, and it is the whole point here: every
-    # step the model used to skip when it was only asked for in the prose is now
-    # a field it must write before it can reach `index`. It dropped the family
-    # on an ambiguously shaped object, and it never listed the bulb of a lamp —
-    # so the tile that alone showed it lost to one that merely looked cleaner.
-    parts: List[str] = Field(
-        description="Every part of the object, short names. Repeated "
-                    "interchangeable elements count once. Text, logos and "
-                    "surface texture are not parts.")
-    essential: List[str] = Field(
-        description="The parts the object needs to do its job — what it lights, "
-                    "holds, displays, supports, pours. Names from `parts`.")
-    family: Literal["A", "B"] = Field(
-        description="A = parts around a volume, B = parts along one axis")
-    axis: str = Field(
-        description="For B, the dominant axis (horizontal / vertical / the "
-                    "direction it runs). For A, write 'none'.")
-    eligible: List[int] = Field(
-        description="Tiles allowed by your family: [1, 2] for A; for B the "
-                    "tiles perpendicular to the axis, plus any tile added for "
-                    "an essential part seen nowhere else.")
-    reasoning: str = Field(description="Your per-part scan, brief")
-    index: int = Field(description="Chosen tile — MUST be one of `eligible`")
-    reason: str = Field(description="One sentence")
+class _PartSeen(BaseModel):
+    part: str = Field(description="A name from `parts`")
+    tiles: List[int] = Field(description="Tile numbers (1-12) where it has a region of its own, however small")
 
-# The traced-outline definition and the per-part scan were measured on 22
-# assets. Step 0 came later: a three-quarter view wins on compact objects but
-# tilts the axis of anything strung along one, stacking the sequence — and
-# whenever tiles 1-2 are eligible the model gravitates to them, so they must be
-# earned through the essential-part exception, never offered. It is eliminatory;
-# offered as a mere hint, the model read it and picked on separation anyway.
-_VIEW_PICK_PROMPT = (
-    "### TASK\n"
-    "One image: 7 renders of the SAME object, numbered 1-7 in a black badge.\n"
-    "Tiles 1 and 2 are three-quarter views. Pick the ONE tile to segment from.\n"
-    "\n"
-    "The chosen tile is the only image used downstream: an artist flood-fills each\n"
-    "visible part with a flat colour, and those regions are projected back onto the\n"
-    "mesh. A part that is missing, or that blends into its neighbour, is lost.\n"
-    "So the best tile is the one showing the MOST parts — and an `essential` part\n"
-    "lost outranks any count.\n"
-    "\n"
-    "### STEP 1 — FILL `parts` AND `essential` FIRST\n"
-    "Inventory the object across all 7 tiles before you judge any tile. A part you\n"
-    "never listed cannot weigh on the choice — that is how the one tile showing a\n"
-    "lamp's bulb lost to a tile that merely looked cleaner.\n"
-    "Look for the small ones: a bulb under a shade, a latch, a spout. Something\n"
-    "visible in a single tile still belongs in `parts`.\n"
-    "\n"
-    "Then mark in `essential` the parts the object needs to do its job — the bulb\n"
-    "of a lamp, the plates of a dumbbell, the seat of a chair. Not its bulk: the\n"
-    "widest part is often not the essential one.\n"
-    "\n"
-    "### STEP 2 — FILL `family`, `axis` AND `eligible`\n"
-    "Are the parts distributed around a volume, or strung along one axis?\n"
-    "\n"
-    "A. AROUND A VOLUME — front, side and top each carry different parts.\n"
-    "   -> eligible = [1, 2]. A flat-on view would stack those faces.\n"
-    "\n"
-    "B. ALONG ONE AXIS — a sequence of elements on a line, often symmetric.\n"
-    "   A thin support plus one wide element still counts as B when the parts\n"
-    "   follow the support.\n"
-    "   -> Tiles 1 and 2 tilt that axis toward the camera: the sequence\n"
-    "      foreshortens and its elements stack. NOT eligible.\n"
-    "   -> eligible = the tiles looking perpendicular to the axis.\n"
-    "\n"
-    "`index` MUST be one of `eligible`. A tile outside it cannot be the answer,\n"
-    "however good it looks. ONE exception: an `essential` part hidden in every\n"
-    "eligible tile adds the single tile that shows it — say why in `reasoning`.\n"
-    "\n"
-    "### SEPARATION\n"
-    "A part counts when you could trace its outline: a visible boundary, a change of\n"
-    "brightness or material, or a gap. Foreshortening is fine as long as the region\n"
-    "stays distinct. It does not count when it blends into a same-coloured neighbour.\n"
-    "\n"
-    "### STEP 3 — SCAN, THEN PICK (write your work in `reasoning`)\n"
-    "1. Take the parts from `parts` ONE AT A TIME. For each, scan the tiles and note\n"
-    "   where it is visible and separated. Finish a part before the next — a\n"
-    "   tile-by-tile scan forgets the small parts. If you cannot actually see it in\n"
-    "   a tile, do not list that tile.\n"
-    "2. An eligible tile that loses an `essential` part is DISQUALIFIED, whatever\n"
-    "   else it shows. A part lying in a horizontal plane needs a raised view; a\n"
-    "   part tucked under another needs a level one.\n"
-    "3. Among the tiles still standing, most parts wins. On a tie, the lower number.\n"
-    "\n"
-    "### DO NOT\n"
-    "- Credit a tile for a part hidden behind or inside the object.\n"
-    "- Prefer a tile for looking sharper, more detailed or more symmetrical.\n"
-)
+
+class _ViewChoice(BaseModel):
+    # Field order is the answering order: every part is located tile by tile before the model may
+    # name one, so the tile it names is the one its own audit covers best.
+    analysis: str = Field(description="A few lines: what the object is, which parts hide under, behind or inside "
+                                      "it, and which tiles show those rare parts")
+    parts: List[str] = Field(description="Pieces an artist would paint separately; mirror twins listed once; "
+                                         "include what hides under, behind and inside the object")
+    seen: List[_PartSeen] = Field(description="One entry per part, in the same order")
+    index: int = Field(ge=1, le=12, description="Chosen tile number, 1-12")
+    reason: str = Field(description="One sentence naming the rarely seen parts this tile shows")
+
+    def coverage(self) -> Dict[int, List[str]]:
+        """Tile number -> the parts it shows."""
+        seen = {}
+        for entry in self.seen:
+            for t in entry.tiles:
+                seen.setdefault(t, []).append(entry.part)
+        return seen
+
+    @model_validator(mode="after")
+    def _follows_its_audit(self):
+        # The tile showing the most parts, per the model's own per-tile audit; a slip goes back as a retry.
+        names = [e.part for e in self.seen]
+        if sorted(names) != sorted(self.parts):
+            raise ValueError(f"`seen` must list every name from `parts` exactly once; got {names} for {self.parts}.")
+        bad = [t for e in self.seen for t in e.tiles if not 1 <= t <= NUM_VIEWS]
+        if bad:
+            raise ValueError(f"Tile numbers run from 1 to {NUM_VIEWS}; got {bad}.")
+        coverage = self.coverage()
+        best = max(len(v) for v in coverage.values()) if coverage else 0
+        tiles = sorted(t for t, v in coverage.items() if len(v) == best)
+        if self.index not in tiles:
+            missing = [p for p in self.parts if p not in coverage.get(self.index, [])]
+            raise ValueError(f"Tile {self.index} lacks {missing} by your own `seen`, while {tiles} show {best} parts: "
+                             f"`index` must be one of {tiles}. Fix `seen` if a tile was mislisted, else pick among them.")
+        return self
+
+
+# GeoSAM2 segments only what the seed shows, so the pick is the tile where every part has a region,
+# however small: the parts few tiles show are the ones that decide.
+_VIEW_PICK_PROMPT = """The image is a grid of renders of one 3D object, one tile per camera. Each tile is badged with its number and its camera height: ABOVE (camera looks down), LEVEL or BELOW (camera looks up).
+
+One tile becomes the seed of a 3D segmentation: an artist paints every visible part of it with a flat colour, and each colour is then propagated over the whole mesh. The segmenter is precise, but it cannot segment what it does not see: a part with no region of its own in the seed does not exist in the result, however well the other tiles show it. A tiny region is enough, the propagation grows it.
+
+So the best tile is the one where EVERY part has a region, even a sliver. The parts that decide are the ones few tiles show: the mechanism under a chair's seat is seen only from a low or level side view, the soil in a plant pot only from above, the drawers of a desk only from the front. The parts every tile shows (a backrest, the pot itself) never separate the tiles.
+
+Fill the fields in order:
+1. analysis: think first, in a few lines: what the object is, which of its parts hide under, behind or inside it, and which tiles show those rare parts.
+2. parts: the pieces an artist would paint separately; list mirror twins once (a tile that shows either twin shows the part). Look for what hides under, behind and inside the object: a mechanism under a seat, the underside of a top, what sits inside a container, a lever or a knob. A part you never list cannot weigh on the choice.
+3. seen: for each part, the tiles where it has a region of its own, however small. A part seen edge-on still has a region (a slab's rim); a part fully hidden behind another has none. Check every tile for every part, one part at a time; do not assume a tile shows what its neighbours show.
+4. index: the tile that shows the most parts. On a tie, the tile where the parts sit side by side instead of stacking behind each other, then a LEVEL tile over a raised or lowered one.
+5. reason: one sentence naming the rarely seen parts this tile shows."""
 
 
 def pick_best_view(
-    shots: Dict[str, Image.Image],
-    bg_color: Tuple[int, int, int] = (255, 255, 255),
+    shots: Dict[int, Image.Image],
     model: str = "gemini-3-flash-preview",
     debug_dir: Optional[str] = None,
-) -> str:
-    """Return the key of the candidate view that shows the most parts.
+) -> int:
+    """Return the rig index of the view whose tile shows the most parts.
 
-    ``shots`` are the textured renders, keyed by ``VIEW_CANDIDATES`` name; the
-    caller owns the rendering, which is the only part the two apps do
-    differently. They are tiled into one badged grid and a VLM picks a tile.
-
-    The VLM decides alone. An earlier version scored the tiles on silhouette
-    span and edge density and let those numbers override the model on ties, but
-    edge density rewards exactly the flat-on views that stack parts on top of
-    each other — on a 13-asset ground truth it never once picked the wanted
-    view, and it pulled correct VLM answers off the right tile. Falling back to
-    the three-quarter view when the call fails beats falling back to a metric
-    that is wrong on purpose.
+    ``shots`` are the twelve renders on white, keyed by rig index. They are tiled
+    in rig order into one 6x2 grid, each tile badged with its number and its
+    camera height, and a VLM picks a tile. Falls back to view 1 when the call fails.
     """
-    order = [v for v in VIEW_CANDIDATES if v in shots]
-    if not order:
-        raise ValueError("no candidate view was rendered")
-
-    cols, tile = 4, 512
-    grid = _assemble_grid(shots, order, cols=cols, tile_size=tile, add_labels=False)
-    # The badge is the model's only handle on a tile — load_default() is 11px.
+    order = sorted(shots)
+    cols, tile = 6, 512
+    grid = Image.new("RGB", (cols * tile, math.ceil(len(order) / cols) * tile), (255, 255, 255))
     draw = ImageDraw.Draw(grid)
     try:
-        badge_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+        badge_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 64)
+        height_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 26)
     except OSError:
-        badge_font = ImageFont.load_default(size=64)
-    # Invert the badge on a dark backdrop — black on black is no handle at all.
-    dark_bg = sum(grid.getpixel((0, 0))) / 3 < 128
-    badge_fill = (255, 255, 255) if dark_bg else (0, 0, 0)
-    badge_ink = (0, 0, 0) if dark_bg else (255, 255, 255)
-    for i in range(len(order)):
+        badge_font, height_font = ImageFont.load_default(size=64), ImageFont.load_default(size=26)
+    for i, v in enumerate(order):
         x, y = (i % cols) * tile, (i // cols) * tile
-        draw.rectangle([x, y, x + tile - 1, y + tile - 1],
-                       outline=(160, 160, 160), width=2)
-        draw.rectangle([x + 6, y + 6, x + 76, y + 82], fill=badge_fill)
-        draw.text((x + 26, y + 8), str(i + 1), fill=badge_ink, font=badge_font)
+        grid.paste(shots[v].convert("RGB").resize((tile, tile), Image.LANCZOS), (x, y))
+        draw.rectangle([x, y, x + tile - 1, y + tile - 1], outline=(160, 160, 160), width=2)
+        draw.rectangle([x + 6, y + 6, x + 96, y + 82], fill=(0, 0, 0))
+        draw.text((x + 14, y + 8), str(i + 1), fill=(255, 255, 255), font=badge_font)
+        draw.text((x + 104, y + 10), _HEIGHT[ELEVATIONS[v]], fill=(0, 0, 0), font=height_font)
 
-    default = "main" if "main" in order else order[0]
+    default = 1 if 1 in order else order[0]
     choice, view = None, default
     span = (logfire.span("guidance.pick_view", model=model)
             if logfire else nullcontext())
@@ -449,51 +445,43 @@ def pick_best_view(
             # identical calls diverge, and it made them slow.
             choice = _run_agent(
                 Agent(output_type=_ViewChoice, retries=4),
-                [_img_to_content(grid), "Pick the best tile."],
-                model=_resolve_model(model, _DESCRIBE_FALLBACKS),
+                [_img_to_content(grid), f"{len(order)} tiles, numbered 1-{len(order)}, in a {cols}-column grid; "
+                                        "the camera turns 30 degrees per tile. Heights: "
+                                        + ", ".join(f"{i + 1} {_HEIGHT[ELEVATIONS[v]]}" for i, v in enumerate(order))
+                                        + ". Pick the seed tile."],
+                model=_resolve_model(model, _env_models("GEOSAM2_DESCRIBE_FALLBACKS", _DESCRIBE_FALLBACKS)),
                 model_settings=ModelSettings(temperature=0.0, seed=7,
-                                             thinking="low", max_tokens=4000,
-                                             timeout=120),
+                                             thinking="low", max_tokens=8000,
+                                             timeout=180),
                 instructions=_VIEW_PICK_PROMPT,
             ).output
     except Exception as exc:                       # noqa: BLE001 - never fatal
         print(f"  → view VLM unavailable ({type(exc).__name__}: "
-              f"{str(exc)[:160]}), falling back to {default}")
+              f"{str(exc)[:160]}), falling back to view {default}")
 
     if choice is not None:
-        if 1 <= choice.index <= len(order):
-            view = order[choice.index - 1]
-        else:
-            print(f"  → model returned tile {choice.index}, out of range — "
-                  f"falling back to {default}")
-    if choice is not None:
+        view = order[choice.index - 1]
         print(f"  → parts: {', '.join(choice.parts)}")
-        print(f"  → essential: {', '.join(choice.essential)}")
-        print(f"  → family {choice.family} ({choice.axis}), "
-              f"eligible {choice.eligible}")
-    print(f"  → {view}" + (f": {choice.reason}" if choice else ""))
+        # The parts few tiles show are the ones that decided.
+        rare = [f"{e.part} {sorted(e.tiles)}" for e in choice.seen if len(e.tiles) <= 4]
+        print(f"  → analysis: {' '.join(choice.analysis.split())[:300]}")
+        print(f"  → rarely seen: {'; '.join(rare) or '-'}")
+        coverage = choice.coverage()
+        print(f"  → tile {choice.index} shows {len(coverage.get(choice.index, []))}/{len(choice.parts)} parts")
+    print(f"  → view {view}" + (f": {choice.reason}" if choice else ""))
 
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
-        # The grid the model saw, winner boxed; the individual tiles add nothing.
+        # The grid the model saw, winner boxed.
         i = order.index(view)
         draw.rectangle([(i % cols) * tile, (i // cols) * tile,
                         (i % cols) * tile + tile - 1, (i // cols) * tile + tile - 1],
                        outline=(0, 230, 60), width=10)
         grid.save(os.path.join(debug_dir, f"00_grid_choice_{view}.png"))
         with open(os.path.join(debug_dir, "stats.txt"), "w") as f:
-            f.write(f"model: {model}\nchosen: {view}\n\n")
-            for i, v in enumerate(order, 1):
-                f.write(f"  tile {i}  {v}\n")
-            if choice is not None:
-                f.write(f"\nparts: {', '.join(choice.parts)}\n"
-                        f"essential: {', '.join(choice.essential)}\n"
-                        f"\nfamily {choice.family} — axis: {choice.axis}\n"
-                        f"eligible tiles: {choice.eligible}\n"
-                        f"\nmodel picked tile {choice.index} — {choice.reason}\n"
-                        f"\nreasoning:\n{choice.reasoning}\n")
-            else:
-                f.write("\nthe VLM call failed; fell back to the default view\n")
+            f.write(f"model: {model}\nchosen: view {view}\n\n")
+            f.write(json.dumps(choice.model_dump(), indent=1) if choice is not None
+                    else "the VLM call failed; fell back to the default view\n")
         print(f"  → view debug written to {debug_dir}")
     return view
 
@@ -630,7 +618,7 @@ def _vlm_describe(
     with span:
         result = _run_agent(
             agent, [_img_to_content(image), user_prompt],
-            model=_resolve_model(model, _DESCRIBE_FALLBACKS),
+            model=_resolve_model(model, _env_models("GEOSAM2_DESCRIBE_FALLBACKS", _DESCRIBE_FALLBACKS)),
             model_settings=ModelSettings(temperature=0.0, max_tokens=8000,
                                          timeout=120),
             instructions=system_prompt,
@@ -728,19 +716,23 @@ def _vlm_segment(
         "a band or a stripe to place a leftover colour.\n"
     )
 
-    agent = Agent(output_type=BinaryImage,
-                  capabilities=[ImageGeneration(aspect_ratio="1:1")])
+    fallbacks = _env_models("GEOSAM2_PAINT_FALLBACKS", _GENERATE_FALLBACKS)
     span = (logfire.span("guidance.generate_segmentation", model=model,
                          view=view_name)
             if logfire else nullcontext())
     with span:
-        result = _run_agent(
-            agent, [user_prompt, _img_to_content(image)],
-            model=_resolve_model(model, _GENERATE_FALLBACKS),
-            model_settings=ModelSettings(temperature=0.0, timeout=180),
-            instructions=system_prompt,
-        )
-    img = Image.open(BytesIO(result.output.data)).convert("RGB")
+        if not any(os.environ.get(k) for k in _PROVIDER_KEYS["google"]) and os.environ.get("OPENROUTER_API_KEY"):
+            data = _openrouter_image([model, *fallbacks], user_prompt, _img_to_content(image), system_prompt)
+        else:
+            agent = Agent(output_type=BinaryImage,
+                          capabilities=[ImageGeneration(aspect_ratio="1:1")])
+            data = _run_agent(
+                agent, [user_prompt, _img_to_content(image)],
+                model=_resolve_model(model, fallbacks),
+                model_settings=ModelSettings(temperature=0.0, timeout=180),
+                instructions=system_prompt,
+            ).output.data
+    img = Image.open(BytesIO(data)).convert("RGB")
     if img.size != (W, H):
         img = img.resize((W, H), Image.LANCZOS)
     return img
@@ -751,18 +743,17 @@ def _vlm_segment(
 
 # ── geosam2's seed on top of it ──────────────────────────────────────────────
 
-# SegviGen's view names -> geosam2 canonical view index. Its picker only
-# accepts its own names, in this order (tiles 1-2 must be the three-quarter
-# views, the prompt says so). There is no level view at azimuth 0 in geosam2's
-# ring (view 3 there looks up from below), so "front"/"back" take the nearest
+# SegviGen's view names -> geosam2 canonical view index: the painter's context views
+# and the names of the seed the app reports. There is no level view at azimuth 0 in
+# geosam2's ring (view 3 there looks up from below), so "front"/"back" take the nearest
 # level views; "top" has no counterpart and is left out.
 VIEW_MAP: Dict[str, int] = {
     "main": 1, "main_high": 5, "front": 4, "back": 10, "left": 0, "right": 6,
 }
 WHITE = (255, 255, 255)
 
-DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL", "google:gemini-3.7-flash")
-PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL", "google:gemini-3.1-flash-image")
+DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL") or "google:gemini-3.7-flash"
+PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL") or "google:gemini-3.1-flash-image"
 
 
 def view_on_white(data_root: Path, view: int) -> Image.Image:
@@ -774,10 +765,8 @@ def view_on_white(data_root: Path, view: int) -> Image.Image:
 
 
 def pick_seed_view(data_root: Path, model: str = DESCRIBE_MODEL) -> int:
-    """SegviGen's view picker over geosam2's renders."""
-    shots = {name: view_on_white(data_root, v) for name, v in VIEW_MAP.items()}
-    name = pick_best_view(shots, WHITE, model)
-    return VIEW_MAP[name]
+    """The rig view to seed from, picked by a VLM among all twelve."""
+    return pick_best_view({v: view_on_white(data_root, v) for v in range(NUM_VIEWS)}, model)
 
 
 class Seed(NamedTuple):
@@ -805,7 +794,7 @@ def generate_seed(data_root: Path, seed_view: int, size: int = 1024,
     """
     data_root = Path(data_root)
     rendered = view_on_white(data_root, seed_view)
-    view_name = next((n for n, v in VIEW_MAP.items() if v == seed_view), "main")
+    view_name = next((n for n, v in VIEW_MAP.items() if v == seed_view), _HEIGHT[ELEVATIONS[seed_view]].lower())
 
     pov = None
     if mode == "grid":
