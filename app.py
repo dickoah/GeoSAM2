@@ -201,14 +201,13 @@ def start_pickview(params: PickViewParams) -> dict:
     data_root = _require_dir(params.data_root)
 
     def _run() -> dict:
-        from geosam2.util.guidance import VIEW_MAP, pick_seed_view
-        from geosam2.util.views import AZIMUTHS_REFERENCE
+        from geosam2.util.guidance import _HEIGHT, pick_seed_view
+        from geosam2.util.views import AZIMUTHS_REFERENCE, ELEVATIONS, NUM_VIEWS
         view = pick_seed_view(data_root)
-        compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
-                   "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
-        label = compass[int(((AZIMUTHS_REFERENCE[view] + 22.5) % 360) // 45)]
+        # The camera height and azimuth, never a compass word: where the front faces varies per asset.
+        label = f"view {view}, {_HEIGHT[ELEVATIONS[view]].lower()}, azimuth {AZIMUTHS_REFERENCE[view]:.0f}°"
         return {"seed_view": view, "label": label,
-                "candidates": list(VIEW_MAP.values()),
+                "candidates": list(range(NUM_VIEWS)),
                 "view_image": str(data_root / f"color_{view:04d}.webp")}
 
     return _start_job(_run)
