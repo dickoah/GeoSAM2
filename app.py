@@ -156,9 +156,15 @@ def samples() -> dict:
     return {"samples": [{"name": p.name, "path": str(p)} for p in roots]}
 
 
-def _vlm_key() -> bool:
-    """A Gemini key, or OpenRouter serving Gemini in its place (guidance.py handles both)."""
-    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"))
+def _vlm_unusable() -> Optional[str]:
+    """Why the seed's model chains cannot run, or None: a chain with no link its key can build."""
+    from geosam2.util.guidance import DESCRIBE_MODEL, PAINT_MODEL, PICK_MODEL, _resolve_chain
+    for chain in dict.fromkeys((PICK_MODEL, DESCRIBE_MODEL, PAINT_MODEL)):
+        try:
+            _resolve_chain(chain)
+        except RuntimeError as exc:
+            return str(exc)
+    return None
 
 
 @app.get("/api/status")
@@ -168,7 +174,7 @@ def status() -> dict:
     return {
         "checkpoint": {"path": str(ckpt), "present": ckpt.is_file()},
         "cuda": torch.cuda.is_available(),
-        "gemini_key": _vlm_key(),
+        "vlm": _vlm_unusable() is None,
     }
 
 
@@ -232,8 +238,8 @@ class GuidanceParams(BaseModel):
 @app.post("/api/jobs/guidance")
 def start_guidance(params: GuidanceParams) -> dict:
     data_root = _writable_views(params.data_root)
-    if not _vlm_key():
-        raise HTTPException(400, "Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is set (see .env at the repo root).")
+    if (why := _vlm_unusable()) is not None:
+        raise HTTPException(400, why)
 
     def _run() -> dict:
         from geosam2.util.guidance import generate_seed

@@ -128,9 +128,10 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         </select></div>
       <div class="row"><label>Analyze model</label>
         <select id="amodel">
+          <option value="" selected>.env — GEOSAM2_DESCRIBE_MODEL chain</option>
           <option value="gemini-3.1-pro-preview">gemini-3.1-pro</option>
           <option value="gemini-3.8-flash">gemini-3.8-flash</option>
-          <option value="gemini-3.7-flash" selected>gemini-3.7-flash — faster</option>
+          <option value="gemini-3.7-flash">gemini-3.7-flash — faster</option>
           <option value="gemini-3-flash-preview">gemini-3-flash</option>
           <option value="gemini-2.5-pro">gemini-2.5-pro</option>
           <option value="gemini-2.5-flash">gemini-2.5-flash</option>
@@ -140,7 +141,8 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         </select></div>
       <div class="row"><label>Generate model</label>
         <select id="pmodel">
-          <option value="gemini-3.1-flash-image" selected>gemini-3.1-flash-image</option>
+          <option value="" selected>.env — GEOSAM2_PAINT_MODEL chain</option>
+          <option value="gemini-3.1-flash-image">gemini-3.1-flash-image</option>
           <option value="gemini-3-pro-image">gemini-3-pro-image</option>
           <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
         </select></div>
@@ -546,7 +548,7 @@ $('greset').onclick=()=>{for(const p of GSET){const i=$('g-'+p.name);
 // ── Status ───────────────────────────────────────────────────────────────
 const st = await (await fetch('/api/status')).json();
 log('checkpoint '+(st.checkpoint.present?'ok':'MISSING: '+st.checkpoint.path)
-   +' · cuda '+(st.cuda?'ok':'off')+' · gemini key '+(st.gemini_key?'ok':'MISSING'));
+   +' · cuda '+(st.cuda?'ok':'off')+' · vlm key '+(st.vlm?'ok':'MISSING'));
 </script>
 </body>
 </html>

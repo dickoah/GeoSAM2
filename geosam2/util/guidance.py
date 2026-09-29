@@ -254,22 +254,26 @@ DESCRIBE_MODEL = (os.environ.get("GEOSAM2_DESCRIBE_MODEL")
                   or "google:gemini-3.7-flash,anthropic:claude-sonnet-5,openai:gpt-5.6-luna")
 PAINT_MODEL = (os.environ.get("GEOSAM2_PAINT_MODEL")
                or "google:gemini-3.1-flash-image,google:gemini-2.5-flash-image")
+PICK_MODEL = os.environ.get("GEOSAM2_PICK_MODEL") or DESCRIBE_MODEL
 
 
 def _resolve_chain(chain: str) -> list:
     """The keyed links of ``chain``, in order (a bare name gets 'google:')."""
-    models, skipped = [], []
+    models, skipped = [], {}
     for name in (n.strip() for n in chain.split(",") if n.strip()):
         if ":" not in name:
             name = f"google:{name}"
         try:
             models.append(infer_model(name))
-        except UserError:                       # the provider's key is unset: not this link
-            skipped.append(name)
+        except Exception as exc:                  # noqa: BLE001 - a link that cannot be built is not this link
+            # An unset key is pydantic-ai's UserError; a key left EMPTY (as .env.dist ships them) reaches
+            # the provider's SDK, which raises its own error. Either way the link is out, and says why.
+            skipped[name] = f"{type(exc).__name__}: {str(exc).splitlines()[0][:80]}"
     if not models:
-        raise RuntimeError(f"No API key configured for any of {chain} (see .env).")
+        raise RuntimeError(f"No usable link in {chain!r} (see .env): "
+                           + "; ".join(f"{n} -> {why}" for n, why in skipped.items()))
     logger.info("[vlm route] %s%s", " -> ".join(f"{m.system}:{m.model_name}" for m in models),
-                f"  (no key: {', '.join(skipped)})" if skipped else "")
+                f"  (skipped: {', '.join(skipped)})" if skipped else "")
     return models
 
 
@@ -357,25 +361,27 @@ class _SceneDesc(BaseModel):
 
 class _PartSeen(BaseModel):
     part: str = Field(description="A name from `parts`")
-    tiles: List[int] = Field(description="Tile numbers (1-12) where it has a region of its own, however small")
+    tiles: List[int] = Field(description="Tiles where this part has its own region to paint and name; "
+                                         "not mostly covered by a piece in front; edge-on counts")
 
 
 class _ViewChoice(BaseModel):
     # Field order is the answering order: every part is located tile by tile before the model may
-    # name one, so the tile it names is the one its own audit covers best.
-    analysis: str = Field(description="A few lines: what the object is, which parts hide under, behind or inside "
-                                      "it, and which tiles show those rare parts")
-    parts: List[str] = Field(description="Pieces an artist would paint separately; mirror twins listed once; "
-                                         "include what hides under, behind and inside the object")
+    # name one, so the tile it names is the one its own audit covers best. Each instance is its own
+    # part: "twins listed once" let a dumbbell's three-quarter view count 5/5 with every rear plate a
+    # crescent, and GeoSAM2 never labels a twin the seed hides.
+    analysis: str = Field(description="A few lines: the object, its rarely seen parts, and the tiles that show them")
+    parts: List[str] = Field(description="Pieces an artist would paint separately, each instance its own entry; "
+                                         "a crowd of like pieces is one; include what hides under, behind or inside")
     seen: List[_PartSeen] = Field(description="One entry per part, in the same order")
-    index: int = Field(ge=1, le=12, description="Chosen tile number, 1-12")
+    index: int = Field(ge=1, le=NUM_VIEWS, description="The tile your `seen` credits with the most parts; LEVEL on a tie")
     reason: str = Field(description="One sentence naming the rarely seen parts this tile shows")
 
     def coverage(self) -> Dict[int, List[str]]:
         """Tile number -> the parts it shows."""
         seen = {}
         for entry in self.seen:
-            for t in entry.tiles:
+            for t in set(entry.tiles):
                 seen.setdefault(t, []).append(entry.part)
         return seen
 
@@ -395,38 +401,51 @@ class _ViewChoice(BaseModel):
             missing = [p for p in self.parts if p not in coverage.get(self.index, [])]
             raise ValueError(f"Tile {self.index} lacks {missing} by your own `seen`, while {tiles} show {best} parts: "
                              f"`index` must be one of {tiles}. Fix `seen` if a tile was mislisted, else pick among them.")
+        # The tie-break the prompt states, held here: left to the model, a dumbbell's raised three-quarter
+        # view won over its level profile on looks, with both at full count.
+        level = [t for t in tiles if _HEIGHT[ELEVATIONS[t - 1]] == "LEVEL"]
+        if level and self.index not in level:
+            raise ValueError(f"Tiles {level} show the same {best} parts and are LEVEL: on a tie a LEVEL tile wins, "
+                             f"so `index` must be one of {level}.")
         return self
 
 
-# GeoSAM2 segments only what the seed shows, so the pick is the tile where every part has a region,
-# however small: the parts few tiles show are the ones that decide.
-_VIEW_PICK_PROMPT = """The image is a grid of renders of one 3D object, one tile per camera. Each tile is badged with its number and its camera height: ABOVE (camera looks down), LEVEL or BELOW (camera looks up).
+# GeoSAM2 segments only what the seed shows, so the pick is the tile where the most parts have a
+# readable region. The validator holds the count and the LEVEL tie-break; the prompt only has to get
+# the inventory right and "readable" right: a sliver left by a piece in front is not a region (it tied
+# a dumbbell's three-quarter view with its profile), a slab seen edge-on is.
+_VIEW_PICK_PROMPT = """A grid of renders of one 3D object, each tile badged with its number and camera height.
 
-One tile becomes the seed of a 3D segmentation: an artist paints every visible part of it with a flat colour, and each colour is then propagated over the whole mesh. The segmenter is precise, but it cannot segment what it does not see: a part with no region of its own in the seed does not exist in the result, however well the other tiles show it. A tiny region is enough, the propagation grows it.
-
-So the best tile is the one where EVERY part has a region, even a sliver. The parts that decide are the ones few tiles show: the mechanism under a chair's seat is seen only from a low or level side view, the soil in a plant pot only from above, the drawers of a desk only from the front. The parts every tile shows (a backrest, the pot itself) never separate the tiles.
+One tile seeds a 3D segmentation: its visible parts are painted and propagated over the mesh. 
+A part without a readable region there is lost: propagation grows a partly hidden region, not a sliver, and never labels a twin the seed hides.
 
 Fill the fields in order:
-1. analysis: think first, in a few lines: what the object is, which of its parts hide under, behind or inside it, and which tiles show those rare parts.
-2. parts: the pieces an artist would paint separately; list mirror twins once (a tile that shows either twin shows the part). Look for what hides under, behind and inside the object: a mechanism under a seat, the underside of a top, what sits inside a container, a lever or a knob. A part you never list cannot weigh on the choice.
-3. seen: for each part, the tiles where it has a region of its own, however small. A part seen edge-on still has a region (a slab's rim); a part fully hidden behind another has none. Check every tile for every part, one part at a time; do not assume a tile shows what its neighbours show.
-4. index: the tile that shows the most parts. On a tie, the tile where the parts sit side by side instead of stacking behind each other, then a LEVEL tile over a raised or lowered one.
-5. reason: one sentence naming the rarely seen parts this tile shows."""
-
+1. analysis: a few lines on the object, its rarely seen parts and the tiles that show them.
+2. parts: every piece an artist would paint separately, each instance its own entry (left and right, each of four legs); 
+   a crowd of like pieces you could only number (foliage, keys) is one entry. 
+   Include what hides under, behind or inside: a mechanism under a seat, the soil in a pot.
+3. seen: per part, the tiles where it is readable: its own region you could paint and name. 
+   Partly hidden counts; mostly covered by a piece in front, leaving a crescent or an edge, does not. Foreshortening is not occlusion: a slab seen edge-on counts. 
+   Pieces lined up along an axis are all readable only perpendicular to it. A crowd counts where most members show. 
+   Check every tile for every part; never copy a neighbour.
+4. index: a tile your seen credits with the most parts, LEVEL on a tie.
+5. reason: one sentence naming the rare parts it shows."""
 
 def pick_best_view(
     shots: Dict[int, Image.Image],
-    model: str = DESCRIBE_MODEL,
+    model: str = PICK_MODEL,
     debug_dir: Optional[str] = None,
 ) -> int:
     """Return the rig index of the view whose tile shows the most parts.
 
     ``shots`` are the twelve renders on white, keyed by rig index. They are tiled
-    in rig order into one 6x2 grid, each tile badged with its number and its
+    in rig order into one 4x3 grid, each tile badged with its number and its
     camera height, and a VLM picks a tile. Falls back to view 1 when the call fails.
     """
     order = sorted(shots)
-    cols, tile = 6, 512
+    # 4 columns: the 2048x1536 grid keeps 392 px per tile after the 1568 px cap Claude applies, where
+    # 6 columns left 261; a crescent and a readable disc must tell apart.
+    cols, tile = 4, 512
     grid = Image.new("RGB", (cols * tile, math.ceil(len(order) / cols) * tile), (255, 255, 255))
     draw = ImageDraw.Draw(grid)
     try:
@@ -459,7 +478,7 @@ def pick_best_view(
                 model=_resolve_model(model),
                 # No temperature: Anthropic rejects any value but 1 once thinking is on (400), so a Claude
                 # link failed every time and the chain fell through to the next model.
-                model_settings=ModelSettings(seed=7, thinking="low", max_tokens=8000, timeout=180),
+                model_settings=ModelSettings(seed=7, thinking="medium", max_tokens=8000, timeout=180),
                 instructions=_VIEW_PICK_PROMPT,
             ).output
     except Exception as exc:                       # noqa: BLE001 - never fatal
@@ -777,7 +796,7 @@ def view_on_white(data_root: Path, view: int) -> Image.Image:
     return out
 
 
-def pick_seed_view(data_root: Path, model: str = DESCRIBE_MODEL) -> int:
+def pick_seed_view(data_root: Path, model: str = PICK_MODEL) -> int:
     """The rig view to seed from, picked by a VLM among all twelve."""
     return pick_best_view({v: view_on_white(data_root, v) for v in range(NUM_VIEWS)}, model)
 
