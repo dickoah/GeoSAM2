@@ -14,11 +14,11 @@ loads no ``.env``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import math
 import os
-import re
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -31,8 +31,10 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.capabilities import ImageGeneration
 from pydantic_ai.messages import BinaryImage
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.models import infer_model
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.settings import ModelSettings
 
 from geosam2.util.logs import get_logger
@@ -242,77 +244,86 @@ def _img_to_content(image: Image.Image) -> BinaryContent:
     return BinaryContent(data=buf.getvalue(), media_type="image/png")
 
 
-_PROVIDER_KEYS = {
-    "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "openai": ("OPENAI_API_KEY",),
-}
-# OpenRouter serves a provider only when its own key is empty, on the maker's own servers.
-_OPENROUTER_PROVIDER = {"order": ["google-ai-studio", "anthropic", "openai"], "allow_fallbacks": False}
-# Default fallback chains, for when .env sets none; filtered by available keys at call time.
-_DESCRIBE_FALLBACKS = ("anthropic:claude-sonnet-5", "openai:gpt-5.6-luna")
-_GENERATE_FALLBACKS = ("google:gemini-2.5-flash-image",)
+# A model is a chain: comma-separated pydantic-ai 'provider:model' names, tried in order, each on its
+# provider's own key (GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY...). A link whose key is
+# unset is skipped, so a gateway (openrouter:google/..., or whatever comes next) is one more link in
+# .env, never a case in this code. The part map is an image generation: pydantic-ai has it natively on
+# google, and an OpenAI-compatible chat link (a gateway) returns it through the completion's image
+# modality (_paint_by_chat).
+DESCRIBE_MODEL = (os.environ.get("GEOSAM2_DESCRIBE_MODEL")
+                  or "google:gemini-3.7-flash,anthropic:claude-sonnet-5,openai:gpt-5.6-luna")
+PAINT_MODEL = (os.environ.get("GEOSAM2_PAINT_MODEL")
+               or "google:gemini-3.1-flash-image,google:gemini-2.5-flash-image")
+PICK_MODEL = os.environ.get("GEOSAM2_PICK_MODEL") or DESCRIBE_MODEL
 
 
-def _env_models(var: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
-    """Comma-separated 'provider:model' names from ``var``; the default when it is unset or empty."""
-    models = tuple(m.strip() for m in os.environ.get(var, "").split(",") if m.strip())
-    return models or default
-
-
-def _resolve_model(model: str, fallbacks: Tuple[str, ...]):
-    """'provider:name' string (bare names get 'google:') + keyed fallbacks, OPENROUTER_API_KEY last."""
-    if ":" not in model:
-        model = f"google:{model}"
-    chain = []
-    for m in dict.fromkeys([model, *fallbacks]):
-        provider, name = m.split(":", 1)
-        if any(os.environ.get(k) for k in _PROVIDER_KEYS[provider]):
-            chain.append(m)
-        elif os.environ.get("OPENROUTER_API_KEY"):
-            if provider == "anthropic":
-                name = re.sub(r"-(\d+)-(\d+)$", r"-\1.\2", name)  # OpenRouter writes claude-sonnet-4.6
-            chain.append(OpenRouterModel(f"{provider}/{name}", settings=ModelSettings(openrouter_provider=_OPENROUTER_PROVIDER)))
-    if not chain:
-        raise RuntimeError(f"No API key configured for {model} (see .env).")
-    return chain[0] if len(chain) == 1 else FallbackModel(*chain)
-
-
-def _openrouter_image(models: List[str], prompt: str, image: BinaryContent, system: str,
-                      timeout: float = 180) -> bytes:
-    """One image from the first of ``models`` OpenRouter serves, as pixmesh's ImageGenerator does.
-
-    pydantic-ai reads no image back from OpenRouter, so its chat API is called directly.
-    """
-    from openai import OpenAI
-
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"], timeout=timeout)
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": [{"type": "text", "text": prompt},
-                                             {"type": "image_url", "image_url": {"url": image.data_uri}}]}]
-    extra_body = {"modalities": ["image", "text"], "provider": _OPENROUTER_PROVIDER,
-                  "image_config": {"aspect_ratio": "1:1"}}
-    errors = []
-    for m in dict.fromkeys(m if ":" in m else f"google:{m}" for m in models):
+def _resolve_chain(chain: str) -> list:
+    """The keyed links of ``chain``, in order (a bare name gets 'google:')."""
+    models, skipped = [], {}
+    for name in (n.strip() for n in chain.split(",") if n.strip()):
+        if ":" not in name:
+            name = f"google:{name}"
         try:
-            message = client.chat.completions.create(model=m.replace(":", "/", 1), messages=messages,
-                                                     temperature=0.0, extra_body=extra_body).choices[0].message
-            return BinaryContent.from_data_uri(message.model_extra["images"][0]["image_url"]["url"]).data
-        except Exception as exc:                   # noqa: BLE001 - the next model is tried
-            logger.warning("%s returned no image through OpenRouter: %s", m, exc)
-            errors.append(exc)
-    raise RuntimeError(f"Image generation failed on {models} through OpenRouter: {errors}")
+            models.append(infer_model(name))
+        except Exception as exc:                  # noqa: BLE001 - a link that cannot be built is not this link
+            # An unset key is pydantic-ai's UserError; a key left EMPTY (as .env.dist ships them) reaches
+            # the provider's SDK, which raises its own error. Either way the link is out, and says why.
+            skipped[name] = f"{type(exc).__name__}: {str(exc).splitlines()[0][:80]}"
+    if not models:
+        raise RuntimeError(f"No usable link in {chain!r} (see .env): "
+                           + "; ".join(f"{n} -> {why}" for n, why in skipped.items()))
+    logger.info("[vlm route] %s%s", " -> ".join(f"{m.system}:{m.model_name}" for m in models),
+                f"  (skipped: {', '.join(skipped)})" if skipped else "")
+    return models
 
 
-def _run_agent(agent: Agent, content: list, **run_kwargs):
-    """run_sync, or thread out when a loop is already running (async route)."""
+def _resolve_model(chain: str):
+    """The first keyed link of ``chain``, with the later ones as fallbacks."""
+    models = _resolve_chain(chain)
+    return models[0] if len(models) == 1 else FallbackModel(*models)
+
+
+def _sync(coro):
+    """Run a coroutine from sync code, or thread out when a loop is already running (async route)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return agent.run_sync(content, **run_kwargs)
+        return asyncio.run(coro)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(
-            lambda: asyncio.run(agent.run(content, **run_kwargs))).result()
+        return executor.submit(asyncio.run, coro).result()
+
+
+def _run_agent(agent: Agent, content: list, **run_kwargs):
+    result = _sync(agent.run(content, **run_kwargs))
+    # Which link of the chain answered: a fallback that fires silently is a prompt drift nobody sees.
+    logger.info("[vlm answered] %s:%s", result.response.provider_name, result.response.model_name)
+    return result
+
+
+def _paint_by_chat(model: OpenAIChatModel, instructions: str, prompt: str, image: Image.Image) -> bytes:
+    """The image out of an OpenAI-compatible chat completion asked for the image modality.
+
+    This is how a gateway serves an image model: pydantic-ai's ImageGeneration
+    has no native tool there and rejects the run before any request.
+    """
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    reply = _sync(model.client.chat.completions.create(
+        model=model.model_name, temperature=0.0, timeout=180,
+        messages=[{"role": "system", "content": instructions},
+                  {"role": "user", "content": [{"type": "text", "text": prompt},
+                                               {"type": "image_url", "image_url": {"url": data_url}}]}],
+        extra_body={"modalities": ["image", "text"]},
+    ))
+    message = reply.choices[0].message
+    images = getattr(message, "images", None) or (message.model_extra or {}).get("images") or []
+    if not images:
+        raise RuntimeError(f"{model.model_name} returned no image: {(message.content or '')[:200]!r}")
+    logger.info("[vlm answered] %s:%s", model.system, reply.model)
+    first = images[0]
+    url = first["image_url"]["url"] if isinstance(first, dict) else first.image_url.url
+    return base64.b64decode(url.split(",", 1)[1])
 
 
 # ── VLM calls (pydantic-ai) ────────────────────────────────────────────────
@@ -350,25 +361,27 @@ class _SceneDesc(BaseModel):
 
 class _PartSeen(BaseModel):
     part: str = Field(description="A name from `parts`")
-    tiles: List[int] = Field(description="Tile numbers (1-12) where it has a region of its own, however small")
+    tiles: List[int] = Field(description="Tiles where this part has its own region to paint and name; "
+                                         "not mostly covered by a piece in front; edge-on counts")
 
 
 class _ViewChoice(BaseModel):
     # Field order is the answering order: every part is located tile by tile before the model may
-    # name one, so the tile it names is the one its own audit covers best.
-    analysis: str = Field(description="A few lines: what the object is, which parts hide under, behind or inside "
-                                      "it, and which tiles show those rare parts")
-    parts: List[str] = Field(description="Pieces an artist would paint separately; mirror twins listed once; "
-                                         "include what hides under, behind and inside the object")
+    # name one, so the tile it names is the one its own audit covers best. Each instance is its own
+    # part: "twins listed once" let a dumbbell's three-quarter view count 5/5 with every rear plate a
+    # crescent, and GeoSAM2 never labels a twin the seed hides.
+    analysis: str = Field(description="A few lines: the object, its rarely seen parts, and the tiles that show them")
+    parts: List[str] = Field(description="Pieces an artist would paint separately, each instance its own entry; "
+                                         "a crowd of like pieces is one; include what hides under, behind or inside")
     seen: List[_PartSeen] = Field(description="One entry per part, in the same order")
-    index: int = Field(ge=1, le=12, description="Chosen tile number, 1-12")
+    index: int = Field(ge=1, le=NUM_VIEWS, description="The tile your `seen` credits with the most parts; LEVEL on a tie")
     reason: str = Field(description="One sentence naming the rarely seen parts this tile shows")
 
     def coverage(self) -> Dict[int, List[str]]:
         """Tile number -> the parts it shows."""
         seen = {}
         for entry in self.seen:
-            for t in entry.tiles:
+            for t in set(entry.tiles):
                 seen.setdefault(t, []).append(entry.part)
         return seen
 
@@ -388,38 +401,51 @@ class _ViewChoice(BaseModel):
             missing = [p for p in self.parts if p not in coverage.get(self.index, [])]
             raise ValueError(f"Tile {self.index} lacks {missing} by your own `seen`, while {tiles} show {best} parts: "
                              f"`index` must be one of {tiles}. Fix `seen` if a tile was mislisted, else pick among them.")
+        # The tie-break the prompt states, held here: left to the model, a dumbbell's raised three-quarter
+        # view won over its level profile on looks, with both at full count.
+        level = [t for t in tiles if _HEIGHT[ELEVATIONS[t - 1]] == "LEVEL"]
+        if level and self.index not in level:
+            raise ValueError(f"Tiles {level} show the same {best} parts and are LEVEL: on a tie a LEVEL tile wins, "
+                             f"so `index` must be one of {level}.")
         return self
 
 
-# GeoSAM2 segments only what the seed shows, so the pick is the tile where every part has a region,
-# however small: the parts few tiles show are the ones that decide.
-_VIEW_PICK_PROMPT = """The image is a grid of renders of one 3D object, one tile per camera. Each tile is badged with its number and its camera height: ABOVE (camera looks down), LEVEL or BELOW (camera looks up).
+# GeoSAM2 segments only what the seed shows, so the pick is the tile where the most parts have a
+# readable region. The validator holds the count and the LEVEL tie-break; the prompt only has to get
+# the inventory right and "readable" right: a sliver left by a piece in front is not a region (it tied
+# a dumbbell's three-quarter view with its profile), a slab seen edge-on is.
+_VIEW_PICK_PROMPT = """A grid of renders of one 3D object, each tile badged with its number and camera height.
 
-One tile becomes the seed of a 3D segmentation: an artist paints every visible part of it with a flat colour, and each colour is then propagated over the whole mesh. The segmenter is precise, but it cannot segment what it does not see: a part with no region of its own in the seed does not exist in the result, however well the other tiles show it. A tiny region is enough, the propagation grows it.
-
-So the best tile is the one where EVERY part has a region, even a sliver. The parts that decide are the ones few tiles show: the mechanism under a chair's seat is seen only from a low or level side view, the soil in a plant pot only from above, the drawers of a desk only from the front. The parts every tile shows (a backrest, the pot itself) never separate the tiles.
+One tile seeds a 3D segmentation: its visible parts are painted and propagated over the mesh. 
+A part without a readable region there is lost: propagation grows a partly hidden region, not a sliver, and never labels a twin the seed hides.
 
 Fill the fields in order:
-1. analysis: think first, in a few lines: what the object is, which of its parts hide under, behind or inside it, and which tiles show those rare parts.
-2. parts: the pieces an artist would paint separately; list mirror twins once (a tile that shows either twin shows the part). Look for what hides under, behind and inside the object: a mechanism under a seat, the underside of a top, what sits inside a container, a lever or a knob. A part you never list cannot weigh on the choice.
-3. seen: for each part, the tiles where it has a region of its own, however small. A part seen edge-on still has a region (a slab's rim); a part fully hidden behind another has none. Check every tile for every part, one part at a time; do not assume a tile shows what its neighbours show.
-4. index: the tile that shows the most parts. On a tie, the tile where the parts sit side by side instead of stacking behind each other, then a LEVEL tile over a raised or lowered one.
-5. reason: one sentence naming the rarely seen parts this tile shows."""
-
+1. analysis: a few lines on the object, its rarely seen parts and the tiles that show them.
+2. parts: every piece an artist would paint separately, each instance its own entry (left and right, each of four legs); 
+   a crowd of like pieces you could only number (foliage, keys) is one entry. 
+   Include what hides under, behind or inside: a mechanism under a seat, the soil in a pot.
+3. seen: per part, the tiles where it is readable: its own region you could paint and name. 
+   Partly hidden counts; mostly covered by a piece in front, leaving a crescent or an edge, does not. Foreshortening is not occlusion: a slab seen edge-on counts. 
+   Pieces lined up along an axis are all readable only perpendicular to it. A crowd counts where most members show. 
+   Check every tile for every part; never copy a neighbour.
+4. index: a tile your seen credits with the most parts, LEVEL on a tie.
+5. reason: one sentence naming the rare parts it shows."""
 
 def pick_best_view(
     shots: Dict[int, Image.Image],
-    model: str = "gemini-3-flash-preview",
+    model: str = PICK_MODEL,
     debug_dir: Optional[str] = None,
 ) -> int:
     """Return the rig index of the view whose tile shows the most parts.
 
     ``shots`` are the twelve renders on white, keyed by rig index. They are tiled
-    in rig order into one 6x2 grid, each tile badged with its number and its
+    in rig order into one 4x3 grid, each tile badged with its number and its
     camera height, and a VLM picks a tile. Falls back to view 1 when the call fails.
     """
     order = sorted(shots)
-    cols, tile = 6, 512
+    # 4 columns: the 2048x1536 grid keeps 392 px per tile after the 1568 px cap Claude applies, where
+    # 6 columns left 261; a crescent and a readable disc must tell apart.
+    cols, tile = 4, 512
     grid = Image.new("RGB", (cols * tile, math.ceil(len(order) / cols) * tile), (255, 255, 255))
     draw = ImageDraw.Draw(grid)
     try:
@@ -449,10 +475,10 @@ def pick_best_view(
                                         "the camera turns 30 degrees per tile. Heights: "
                                         + ", ".join(f"{i + 1} {_HEIGHT[ELEVATIONS[v]]}" for i, v in enumerate(order))
                                         + ". Pick the seed tile."],
-                model=_resolve_model(model, _env_models("GEOSAM2_DESCRIBE_FALLBACKS", _DESCRIBE_FALLBACKS)),
-                model_settings=ModelSettings(temperature=0.0, seed=7,
-                                             thinking="low", max_tokens=8000,
-                                             timeout=180),
+                model=_resolve_model(model),
+                # No temperature: Anthropic rejects any value but 1 once thinking is on (400), so a Claude
+                # link failed every time and the chain fell through to the next model.
+                model_settings=ModelSettings(seed=7, thinking="medium", max_tokens=8000, timeout=180),
                 instructions=_VIEW_PICK_PROMPT,
             ).output
     except Exception as exc:                       # noqa: BLE001 - never fatal
@@ -488,7 +514,7 @@ def pick_best_view(
 
 def _vlm_describe(
     image: Image.Image,
-    model: str = "gemini-2.5-flash",
+    model: str = DESCRIBE_MODEL,
     is_grid: bool = False,
     preferred_language: str = "en",
 ) -> Dict[str, Any]:
@@ -618,7 +644,7 @@ def _vlm_describe(
     with span:
         result = _run_agent(
             agent, [_img_to_content(image), user_prompt],
-            model=_resolve_model(model, _env_models("GEOSAM2_DESCRIBE_FALLBACKS", _DESCRIBE_FALLBACKS)),
+            model=_resolve_model(model),
             model_settings=ModelSettings(temperature=0.0, max_tokens=8000,
                                          timeout=120),
             instructions=system_prompt,
@@ -630,7 +656,7 @@ def _vlm_segment(
     image: Image.Image,
     description: Dict[str, Any],
     color_table: Dict[str, str],
-    model: str = "gemini-3-pro-image",
+    model: str = PAINT_MODEL,
     image_size: Tuple[int, int] = (512, 512),
     bg_color_hex: str = "#ffffff",
     view_name: str = "main",
@@ -716,22 +742,30 @@ def _vlm_segment(
         "a band or a stripe to place a leftover colour.\n"
     )
 
-    fallbacks = _env_models("GEOSAM2_PAINT_FALLBACKS", _GENERATE_FALLBACKS)
+    agent = Agent(output_type=BinaryImage,
+                  capabilities=[ImageGeneration(aspect_ratio="1:1")])
     span = (logfire.span("guidance.generate_segmentation", model=model,
                          view=view_name)
             if logfire else nullcontext())
+    # The chain is walked here rather than by FallbackModel: a chat link paints through
+    # _paint_by_chat, the others through the agent, and either failure hands over to the next.
     with span:
-        if not any(os.environ.get(k) for k in _PROVIDER_KEYS["google"]) and os.environ.get("OPENROUTER_API_KEY"):
-            data = _openrouter_image([model, *fallbacks], user_prompt, _img_to_content(image), system_prompt)
-        else:
-            agent = Agent(output_type=BinaryImage,
-                          capabilities=[ImageGeneration(aspect_ratio="1:1")])
-            data = _run_agent(
-                agent, [user_prompt, _img_to_content(image)],
-                model=_resolve_model(model, fallbacks),
-                model_settings=ModelSettings(temperature=0.0, timeout=180),
-                instructions=system_prompt,
-            ).output.data
+        for i, link in enumerate(links := _resolve_chain(model)):
+            try:
+                if isinstance(link, OpenAIChatModel):
+                    data = _paint_by_chat(link, system_prompt, user_prompt, image)
+                else:
+                    data = _run_agent(
+                        agent, [user_prompt, _img_to_content(image)], model=link,
+                        model_settings=ModelSettings(temperature=0.0, timeout=180),
+                        instructions=system_prompt,
+                    ).output.data
+                break
+            except Exception as exc:                  # noqa: BLE001 - the next link is the answer
+                if i == len(links) - 1:
+                    raise
+                logger.warning("[vlm paint] %s:%s failed (%s: %s), next link",
+                               link.system, link.model_name, type(exc).__name__, str(exc)[:160])
     img = Image.open(BytesIO(data)).convert("RGB")
     if img.size != (W, H):
         img = img.resize((W, H), Image.LANCZOS)
@@ -752,8 +786,6 @@ VIEW_MAP: Dict[str, int] = {
 }
 WHITE = (255, 255, 255)
 
-DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL") or "google:gemini-3.7-flash"
-PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL") or "google:gemini-3.1-flash-image"
 
 
 def view_on_white(data_root: Path, view: int) -> Image.Image:
@@ -764,7 +796,7 @@ def view_on_white(data_root: Path, view: int) -> Image.Image:
     return out
 
 
-def pick_seed_view(data_root: Path, model: str = DESCRIBE_MODEL) -> int:
+def pick_seed_view(data_root: Path, model: str = PICK_MODEL) -> int:
     """The rig view to seed from, picked by a VLM among all twelve."""
     return pick_best_view({v: view_on_white(data_root, v) for v in range(NUM_VIEWS)}, model)
 

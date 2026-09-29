@@ -128,9 +128,10 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         </select></div>
       <div class="row"><label>Analyze model</label>
         <select id="amodel">
+          <option value="" selected>.env — GEOSAM2_DESCRIBE_MODEL chain</option>
           <option value="gemini-3.1-pro-preview">gemini-3.1-pro</option>
           <option value="gemini-3.8-flash">gemini-3.8-flash</option>
-          <option value="gemini-3.7-flash" selected>gemini-3.7-flash — faster</option>
+          <option value="gemini-3.7-flash">gemini-3.7-flash — faster</option>
           <option value="gemini-3-flash-preview">gemini-3-flash</option>
           <option value="gemini-2.5-pro">gemini-2.5-pro</option>
           <option value="gemini-2.5-flash">gemini-2.5-flash</option>
@@ -140,7 +141,8 @@ font-size:17px;font-weight:600;color:var(--ink2)}
         </select></div>
       <div class="row"><label>Generate model</label>
         <select id="pmodel">
-          <option value="gemini-3.1-flash-image" selected>gemini-3.1-flash-image</option>
+          <option value="" selected>.env — GEOSAM2_PAINT_MODEL chain</option>
+          <option value="gemini-3.1-flash-image">gemini-3.1-flash-image</option>
           <option value="gemini-3-pro-image">gemini-3-pro-image</option>
           <option value="gemini-2.5-flash-image">gemini-2.5-flash-image</option>
         </select></div>
@@ -194,7 +196,7 @@ font-size:17px;font-weight:600;color:var(--ink2)}
       <div class="row"><label title="Snap part boundaries onto real creases within a few face rings">Band refine</label><input type="checkbox" id="q-band_refine" checked/></div>
       <div class="row"><label title="Force each authored UV chart to remain a separate part">One UV island = one part</label><input type="checkbox" id="q-island_majority"/></div>
       <div class="row"><label title="Remove parts smaller than this many faces">Min faces / part</label><input type="number" id="q-min_faces_per_part" value="1" min="0"/></div>
-      <div class="row"><label title="Reassign tiny disconnected pieces after the split">Cleanup fragments (post-cut)</label><input type="checkbox" id="q-cleanup_fragments" checked/></div>
+      <div class="row"><label title="Reassign tiny disconnected pieces after the split">Cleanup fragments (post-cut)</label><input type="checkbox" id="q-cleanup_fragments"/></div>
       <button id="b5" disabled>Split from labels</button>
       <div class="hint">Cuts the mesh along the label boundaries, one mesh per part, straight from
       the label file. Mode <b>sdf</b> puts boundaries inside triangles and needs the mesh's UVs;
@@ -439,7 +441,7 @@ $('b4').onclick=()=>step('s4','t4','o4','/api/jobs/segment',
     listParts('pl4',r.parts);
     if(r.raw_labels_path) register('labels','4 raw lift',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.raw_labels_path},r.raw_glb);
-    register('labels',gsettings().postprocess===false?'4 raw (post-process off)':'4 post-processed',
+    register('labels',$('g-postprocess').checked?'4 post-processed':'4 raw (post-process off)',
       {data_root:S.dataRoot,work_dir:r.work_dir,labels_path:r.labels_path},r.glb_path);
   });
 
@@ -546,7 +548,7 @@ $('greset').onclick=()=>{for(const p of GSET){const i=$('g-'+p.name);
 // ── Status ───────────────────────────────────────────────────────────────
 const st = await (await fetch('/api/status')).json();
 log('checkpoint '+(st.checkpoint.present?'ok':'MISSING: '+st.checkpoint.path)
-   +' · cuda '+(st.cuda?'ok':'off')+' · gemini key '+(st.gemini_key?'ok':'MISSING'));
+   +' · cuda '+(st.cuda?'ok':'off')+' · vlm key '+(st.vlm?'ok':'MISSING'));
 </script>
 </body>
 </html>

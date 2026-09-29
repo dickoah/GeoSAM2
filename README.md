@@ -74,7 +74,11 @@ seg.clear_vram()
 `run()` takes any 2D mask on one of the views: a label map (`.npy`, `.exr`)
 or a flat-colour image such as the painted seed. `postprocess_pa` (0.02) is
 the one knob VAST documents; `GeoSAM2Segmenter.POSTPROCESS_PA_CANDIDATES`
-lists the values worth trying.
+lists the values worth trying. The post-process itself is off by default
+(`PropagationSettings.postprocess`): it erases every component under that
+share of the largest one, which loses the small parts for good, and the fill
+places the unseen faces better than its flood. The split's fragment cleanup
+is off by default for the same reason.
 
 What the process-wide settings of VAST's script did -- bf16 autocast, TF32,
 the seeds -- is scoped to each `run()`, so a host process is left as it was,
@@ -95,8 +99,10 @@ its result compared with the previous one in the viewer. The bundled
 
 `.env` at the repository root, read by the app (the library reads
 `os.environ` only): `GEMINI_API_KEY`, and optionally `GEOSAM2_DESCRIBE_MODEL`
-/ `GEOSAM2_PAINT_MODEL` (pydantic-ai model names), `GEOSAM2_LOG_LEVEL`,
-`GEOSAM2_APP_HOST` / `GEOSAM2_APP_PORT`.
+/ `GEOSAM2_PAINT_MODEL` / `GEOSAM2_PICK_MODEL` (comma-separated chains of
+pydantic-ai `provider:model` names, tried in order on their providers' keys;
+see `.env.dist`),
+`GEOSAM2_LOG_LEVEL`, `GEOSAM2_APP_HOST` / `GEOSAM2_APP_PORT`.
 
 ## Acknowledgements
 
