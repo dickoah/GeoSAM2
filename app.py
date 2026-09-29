@@ -156,6 +156,11 @@ def samples() -> dict:
     return {"samples": [{"name": p.name, "path": str(p)} for p in roots]}
 
 
+def _vlm_key() -> bool:
+    """A Gemini key, or OpenRouter serving Gemini in its place (guidance.py handles both)."""
+    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"))
+
+
 @app.get("/api/status")
 def status() -> dict:
     import torch
@@ -163,8 +168,7 @@ def status() -> dict:
     return {
         "checkpoint": {"path": str(ckpt), "present": ckpt.is_file()},
         "cuda": torch.cuda.is_available(),
-        "gemini_key": bool(os.environ.get("GEMINI_API_KEY")
-                           or os.environ.get("GOOGLE_API_KEY")),
+        "gemini_key": _vlm_key(),
     }
 
 
@@ -228,8 +232,8 @@ class GuidanceParams(BaseModel):
 @app.post("/api/jobs/guidance")
 def start_guidance(params: GuidanceParams) -> dict:
     data_root = _writable_views(params.data_root)
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        raise HTTPException(400, "GEMINI_API_KEY is not set (see .env at the repo root).")
+    if not _vlm_key():
+        raise HTTPException(400, "Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is set (see .env at the repo root).")
 
     def _run() -> dict:
         from geosam2.util.guidance import generate_seed

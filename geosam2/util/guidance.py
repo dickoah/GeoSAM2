@@ -25,7 +25,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
-from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
@@ -250,10 +250,10 @@ def _img_to_content(image: Image.Image) -> BinaryContent:
 # .env, never a case in this code. The part map is an image generation: pydantic-ai has it natively on
 # google, and an OpenAI-compatible chat link (a gateway) returns it through the completion's image
 # modality (_paint_by_chat).
-DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL",
-                                "google:gemini-3.7-flash,google:gemini-3.8-flash,google:gemini-3.1-pro-preview")
-PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL",
-                             "google:gemini-3.1-flash-image,google:gemini-2.5-flash-image")
+DESCRIBE_MODEL = (os.environ.get("GEOSAM2_DESCRIBE_MODEL")
+                  or "google:gemini-3.7-flash,anthropic:claude-sonnet-5,openai:gpt-5.6-luna")
+PAINT_MODEL = (os.environ.get("GEOSAM2_PAINT_MODEL")
+               or "google:gemini-3.1-flash-image,google:gemini-2.5-flash-image")
 
 
 def _resolve_chain(chain: str) -> list:
@@ -355,46 +355,63 @@ class _SceneDesc(BaseModel):
     objects: List[_ObjectDesc]
 
 
+class _PartSeen(BaseModel):
+    part: str = Field(description="A name from `parts`")
+    tiles: List[int] = Field(description="Tile numbers (1-12) where it has a region of its own, however small")
+
+
 class _ViewChoice(BaseModel):
-    # Field order is the answering order: every camera height is audited for the parts it loses
-    # before the model may name a tile, so a three-quarter view is never taken on looks alone.
-    parts: List[str] = Field(description="Pieces an artist would paint separately; mirror twins listed once")
-    lost_above: List[str] = Field(description="Parts with no region of their own in any ABOVE tile and no visible twin")
-    lost_level: List[str] = Field(description="Same, for the LEVEL tiles")
-    lost_below: List[str] = Field(description="Same, for the BELOW tiles")
-    height: Literal["ABOVE", "LEVEL", "BELOW"] = Field(description="Fewest lost parts; tie -> LEVEL, then ABOVE")
-    candidates: List[int] = Field(description="Tile numbers (1-12) tagged with that height")
+    # Field order is the answering order: every part is located tile by tile before the model may
+    # name one, so the tile it names is the one its own audit covers best.
+    analysis: str = Field(description="A few lines: what the object is, which parts hide under, behind or inside "
+                                      "it, and which tiles show those rare parts")
+    parts: List[str] = Field(description="Pieces an artist would paint separately; mirror twins listed once; "
+                                         "include what hides under, behind and inside the object")
+    seen: List[_PartSeen] = Field(description="One entry per part, in the same order")
     index: int = Field(ge=1, le=12, description="Chosen tile number, 1-12")
-    reason: str = Field(description="One sentence")
+    reason: str = Field(description="One sentence naming the rarely seen parts this tile shows")
+
+    def coverage(self) -> Dict[int, List[str]]:
+        """Tile number -> the parts it shows."""
+        seen = {}
+        for entry in self.seen:
+            for t in entry.tiles:
+                seen.setdefault(t, []).append(entry.part)
+        return seen
 
     @model_validator(mode="after")
     def _follows_its_audit(self):
-        # The height losing the fewest parts (tie: LEVEL, then ABOVE) and one of its tiles; a slip goes back as a retry.
-        lost = {"LEVEL": self.lost_level, "ABOVE": self.lost_above, "BELOW": self.lost_below}
-        # A lost entry is a whole piece: a hidden face ("seat top") made a raised view win over a level one.
-        faces = [p for h in lost.values() for p in h if p not in self.parts]
-        if faces:
-            raise ValueError(f"{faces} are not names from `parts`: a lost entry is a whole piece from `parts`, "
-                             "never one of its faces; a piece whose top is hidden still shows its sides.")
-        height = min(lost, key=lambda h: len(lost[h]))
-        tiles = [v + 1 for v in range(NUM_VIEWS) if _HEIGHT[ELEVATIONS[v]] == height]
+        # The tile showing the most parts, per the model's own per-tile audit; a slip goes back as a retry.
+        names = [e.part for e in self.seen]
+        if sorted(names) != sorted(self.parts):
+            raise ValueError(f"`seen` must list every name from `parts` exactly once; got {names} for {self.parts}.")
+        bad = [t for e in self.seen for t in e.tiles if not 1 <= t <= NUM_VIEWS]
+        if bad:
+            raise ValueError(f"Tile numbers run from 1 to {NUM_VIEWS}; got {bad}.")
+        coverage = self.coverage()
+        best = max(len(v) for v in coverage.values()) if coverage else 0
+        tiles = sorted(t for t, v in coverage.items() if len(v) == best)
         if self.index not in tiles:
-            raise ValueError(f"{height} loses the fewest parts, so `height` is {height} and `index` must be one of {tiles}.")
+            missing = [p for p in self.parts if p not in coverage.get(self.index, [])]
+            raise ValueError(f"Tile {self.index} lacks {missing} by your own `seen`, while {tiles} show {best} parts: "
+                             f"`index` must be one of {tiles}. Fix `seen` if a tile was mislisted, else pick among them.")
         return self
 
 
-# GeoSAM2 tracks only what the seed shows, so the pick is the view where the most parts each get a region.
-_VIEW_PICK_PROMPT = """Twelve renders of one 3D object, a 6x2 grid numbered 1-12. Each tile is tagged ABOVE (camera looks down), LEVEL or BELOW (camera looks up); the camera turns 30 degrees per tile.
+# GeoSAM2 segments only what the seed shows, so the pick is the tile where every part has a region,
+# however small: the parts few tiles show are the ones that decide.
+_VIEW_PICK_PROMPT = """The image is a grid of renders of one 3D object, one tile per camera. Each tile is badged with its number and its camera height: ABOVE (camera looks down), LEVEL or BELOW (camera looks up).
 
-One tile becomes the seed: an artist paints every visible part of it with a flat colour, and those colours are propagated over the whole mesh. A part with no visible region of its own in the seed is lost, unless its mirror twin is visible (the twin's colour carries over). Choose the tile where the most parts each get a visible, separable region.
+One tile becomes the seed of a 3D segmentation: an artist paints every visible part of it with a flat colour, and each colour is then propagated over the whole mesh. The segmenter is precise, but it cannot segment what it does not see: a part with no region of its own in the seed does not exist in the result, however well the other tiles show it. A tiny region is enough, the propagation grows it.
+
+So the best tile is the one where EVERY part has a region, even a sliver. The parts that decide are the ones few tiles show: the mechanism under a chair's seat is seen only from a low or level side view, the soil in a plant pot only from above, the drawers of a desk only from the front. The parts every tile shows (a backrest, the pot itself) never separate the tiles.
 
 Fill the fields in order:
-1. parts: the pieces an artist would paint separately (structure, movable pieces, decoration); list mirror twins once.
-2. lost_above / lost_level / lost_below: for each camera height, the parts with no region of their own in any tile at that height and no visible twin. A part mostly hidden behind another, showing only a sliver, is lost; a part merely seen edge-on is not (a slab's rim is still its own region); and parts lying side by side in one flat plane merge into a single band edge-on and are lost, like what sits inside a surface. Typical cases: a keyboard's keys or a mug's inside are lost at LEVEL and BELOW; what hangs under a body (a car's axles, a laptop's feet) is lost at LEVEL and ABOVE; what sits on the sides and supports (a guitar's knobs, a bicycle's frame tubes) reads best at LEVEL, where perspective shows the far supports between the near ones.
-3. height: the height with the fewest lost parts; on a tie prefer LEVEL, then ABOVE.
-4. candidates: the tile numbers tagged with that height.
-5. index: among the candidates, the azimuth where the parts spread apart instead of stacking behind each other: face-on to the side that carries the most parts, or a corner only when two adjacent sides both carry parts. A raised three-quarter view is not a default.
-6. reason: one sentence."""
+1. analysis: think first, in a few lines: what the object is, which of its parts hide under, behind or inside it, and which tiles show those rare parts.
+2. parts: the pieces an artist would paint separately; list mirror twins once (a tile that shows either twin shows the part). Look for what hides under, behind and inside the object: a mechanism under a seat, the underside of a top, what sits inside a container, a lever or a knob. A part you never list cannot weigh on the choice.
+3. seen: for each part, the tiles where it has a region of its own, however small. A part seen edge-on still has a region (a slab's rim); a part fully hidden behind another has none. Check every tile for every part, one part at a time; do not assume a tile shows what its neighbours show.
+4. index: the tile that shows the most parts. On a tie, the tile where the parts sit side by side instead of stacking behind each other, then a LEVEL tile over a raised or lowered one.
+5. reason: one sentence naming the rarely seen parts this tile shows."""
 
 
 def pick_best_view(
@@ -435,7 +452,10 @@ def pick_best_view(
             # identical calls diverge, and it made them slow.
             choice = _run_agent(
                 Agent(output_type=_ViewChoice, retries=4),
-                [_img_to_content(grid), "Pick the best tile."],
+                [_img_to_content(grid), f"{len(order)} tiles, numbered 1-{len(order)}, in a {cols}-column grid; "
+                                        "the camera turns 30 degrees per tile. Heights: "
+                                        + ", ".join(f"{i + 1} {_HEIGHT[ELEVATIONS[v]]}" for i, v in enumerate(order))
+                                        + ". Pick the seed tile."],
                 model=_resolve_model(model),
                 # No temperature: Anthropic rejects any value but 1 once thinking is on (400), so a Claude
                 # link failed every time and the chain fell through to the next model.
@@ -449,9 +469,12 @@ def pick_best_view(
     if choice is not None:
         view = order[choice.index - 1]
         print(f"  → parts: {', '.join(choice.parts)}")
-        print(f"  → lost above: {', '.join(choice.lost_above) or '-'} | level: "
-              f"{', '.join(choice.lost_level) or '-'} | below: {', '.join(choice.lost_below) or '-'}")
-        print(f"  → height {choice.height}, candidates {choice.candidates}")
+        # The parts few tiles show are the ones that decided.
+        rare = [f"{e.part} {sorted(e.tiles)}" for e in choice.seen if len(e.tiles) <= 4]
+        print(f"  → analysis: {' '.join(choice.analysis.split())[:300]}")
+        print(f"  → rarely seen: {'; '.join(rare) or '-'}")
+        coverage = choice.coverage()
+        print(f"  → tile {choice.index} shows {len(coverage.get(choice.index, []))}/{len(choice.parts)} parts")
     print(f"  → view {view}" + (f": {choice.reason}" if choice else ""))
 
     if debug_dir:
@@ -735,10 +758,9 @@ def _vlm_segment(
 
 # ── geosam2's seed on top of it ──────────────────────────────────────────────
 
-# SegviGen's view names -> geosam2 canonical view index. Its picker only
-# accepts its own names, in this order (tiles 1-2 must be the three-quarter
-# views, the prompt says so). There is no level view at azimuth 0 in geosam2's
-# ring (view 3 there looks up from below), so "front"/"back" take the nearest
+# SegviGen's view names -> geosam2 canonical view index: the painter's context views
+# and the names of the seed the app reports. There is no level view at azimuth 0 in
+# geosam2's ring (view 3 there looks up from below), so "front"/"back" take the nearest
 # level views; "top" has no counterpart and is left out.
 VIEW_MAP: Dict[str, int] = {
     "main": 1, "main_high": 5, "front": 4, "back": 10, "left": 0, "right": 6,
