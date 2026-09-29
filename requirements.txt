@@ -31,6 +31,9 @@ six
 # VLM describe/paint of the seed view (utils/guidance.py, via SegviGen's code).
 # >=2.11 moved ImageGenerationTool and BinaryImage to the package root.
 pydantic-ai>=2.11
+# OpenRouter, when a provider's own key is empty: pydantic-ai's OpenRouter model, and the
+# image call made directly because pydantic-ai reads no image back from it.
+openai
 
 # Loads GEMINI_API_KEY from .env. pydantic-ai's Google provider reads either
 # GOOGLE_API_KEY or GEMINI_API_KEY, despite only naming the first when it fails.

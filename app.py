@@ -156,6 +156,17 @@ def samples() -> dict:
     return {"samples": [{"name": p.name, "path": str(p)} for p in roots]}
 
 
+def _vlm_unusable() -> Optional[str]:
+    """Why the seed's model chains cannot run, or None: a chain with no link its key can build."""
+    from geosam2.util.guidance import DESCRIBE_MODEL, PAINT_MODEL, PICK_MODEL, _resolve_chain
+    for chain in dict.fromkeys((PICK_MODEL, DESCRIBE_MODEL, PAINT_MODEL)):
+        try:
+            _resolve_chain(chain)
+        except RuntimeError as exc:
+            return str(exc)
+    return None
+
+
 @app.get("/api/status")
 def status() -> dict:
     import torch
@@ -163,8 +174,7 @@ def status() -> dict:
     return {
         "checkpoint": {"path": str(ckpt), "present": ckpt.is_file()},
         "cuda": torch.cuda.is_available(),
-        "gemini_key": bool(os.environ.get("GEMINI_API_KEY")
-                           or os.environ.get("GOOGLE_API_KEY")),
+        "vlm": _vlm_unusable() is None,
     }
 
 
@@ -201,14 +211,13 @@ def start_pickview(params: PickViewParams) -> dict:
     data_root = _require_dir(params.data_root)
 
     def _run() -> dict:
-        from geosam2.util.guidance import VIEW_MAP, pick_seed_view
-        from geosam2.util.views import AZIMUTHS_REFERENCE
+        from geosam2.util.guidance import _HEIGHT, pick_seed_view
+        from geosam2.util.views import AZIMUTHS_REFERENCE, ELEVATIONS, NUM_VIEWS
         view = pick_seed_view(data_root)
-        compass = ("FRONT", "FRONT-RIGHT", "RIGHT", "BACK-RIGHT",
-                   "BACK", "BACK-LEFT", "LEFT", "FRONT-LEFT")
-        label = compass[int(((AZIMUTHS_REFERENCE[view] + 22.5) % 360) // 45)]
+        # The camera height and azimuth, never a compass word: where the front faces varies per asset.
+        label = f"view {view}, {_HEIGHT[ELEVATIONS[view]].lower()}, azimuth {AZIMUTHS_REFERENCE[view]:.0f}°"
         return {"seed_view": view, "label": label,
-                "candidates": list(VIEW_MAP.values()),
+                "candidates": list(range(NUM_VIEWS)),
                 "view_image": str(data_root / f"color_{view:04d}.webp")}
 
     return _start_job(_run)
@@ -229,8 +238,8 @@ class GuidanceParams(BaseModel):
 @app.post("/api/jobs/guidance")
 def start_guidance(params: GuidanceParams) -> dict:
     data_root = _writable_views(params.data_root)
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        raise HTTPException(400, "GEMINI_API_KEY is not set (see .env at the repo root).")
+    if (why := _vlm_unusable()) is not None:
+        raise HTTPException(400, why)
 
     def _run() -> dict:
         from geosam2.util.guidance import generate_seed
@@ -397,7 +406,9 @@ class FaceSplitParams(BaseModel):
     band_refine: bool = True
     island_majority: bool = False
     min_faces_per_part: int = 1
-    cleanup_fragments: bool = True
+    # Off: the cleanup moved 4.5 to 9.3% of the faces on four of five cached runs, taking the
+    # detached end of a part or a population's small members for a neighbour on size alone.
+    cleanup_fragments: bool = False
 
 
 FACE_SPLIT_FIELDS = ("mode", "small_component_min_faces", "postprocess_iters",
