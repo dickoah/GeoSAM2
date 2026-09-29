@@ -406,7 +406,9 @@ class FaceSplitParams(BaseModel):
     band_refine: bool = True
     island_majority: bool = False
     min_faces_per_part: int = 1
-    cleanup_fragments: bool = True
+    # Off: the cleanup moved 4.5 to 9.3% of the faces on four of five cached runs, taking the
+    # detached end of a part or a population's small members for a neighbour on size alone.
+    cleanup_fragments: bool = False
 
 
 FACE_SPLIT_FIELDS = ("mode", "small_component_min_faces", "postprocess_iters",

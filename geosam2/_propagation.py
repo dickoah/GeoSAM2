@@ -50,7 +50,10 @@ class PropagationSettings:
     dedup_iou: float = 85.0             # automatic masks overlapping more than this (%) are one
     # The lift onto the faces.
     samples_per_face: int = SAMPLE_NUM  # points per face voting its label
-    postprocess: bool = True            # complete_labels after the lift (off: post = raw)
+    # Off: complete_labels erases every component under 2% of the largest (4 parts of ~220 faces
+    # on a 145k-face mesh) and refills them from a neighbour, which the fill cannot undo since
+    # those faces had a label in the raw lift; the fill places the rest better than its flood.
+    postprocess: bool = False           # complete_labels after the lift (off: post = raw)
 
     def generator_overrides(self) -> Dict:
         return dict(pred_iou_thresh=self.pred_iou_thresh,
