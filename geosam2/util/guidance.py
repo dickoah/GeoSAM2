@@ -14,11 +14,11 @@ loads no ``.env``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import math
 import os
-import re
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -31,8 +31,10 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.capabilities import ImageGeneration
 from pydantic_ai.messages import BinaryImage
+from pydantic_ai.exceptions import UserError
+from pydantic_ai.models import infer_model
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.settings import ModelSettings
 
 from geosam2.util.logs import get_logger
@@ -242,45 +244,82 @@ def _img_to_content(image: Image.Image) -> BinaryContent:
     return BinaryContent(data=buf.getvalue(), media_type="image/png")
 
 
-_PROVIDER_KEYS = {
-    "google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
-    "anthropic": ("ANTHROPIC_API_KEY",),
-    "openai": ("OPENAI_API_KEY",),
-}
-# OpenRouter serves a provider only when its own key is empty, on the maker's own servers.
-_OPENROUTER_PROVIDER = {"order": ["google-ai-studio", "anthropic", "openai"], "allow_fallbacks": False}
-# Fallback chains, filtered by available keys at call time.
-_DESCRIBE_FALLBACKS = ("google:gemini-3.8-flash", "google:gemini-3.1-pro-preview")
-_GENERATE_FALLBACKS = ("google:gemini-2.5-flash-image",)
+# A model is a chain: comma-separated pydantic-ai 'provider:model' names, tried in order, each on its
+# provider's own key (GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENROUTER_API_KEY...). A link whose key is
+# unset is skipped, so a gateway (openrouter:google/..., or whatever comes next) is one more link in
+# .env, never a case in this code. The part map is an image generation: pydantic-ai has it natively on
+# google, and an OpenAI-compatible chat link (a gateway) returns it through the completion's image
+# modality (_paint_by_chat).
+DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL",
+                                "google:gemini-3.7-flash,google:gemini-3.8-flash,google:gemini-3.1-pro-preview")
+PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL",
+                             "google:gemini-3.1-flash-image,google:gemini-2.5-flash-image")
 
 
-def _resolve_model(model: str, fallbacks: Tuple[str, ...]):
-    """'provider:name' string (bare names get 'google:') + keyed fallbacks, OPENROUTER_API_KEY last."""
-    if ":" not in model:
-        model = f"google:{model}"
-    chain = []
-    for m in dict.fromkeys([model, *fallbacks]):
-        provider, name = m.split(":", 1)
-        if any(os.environ.get(k) for k in _PROVIDER_KEYS[provider]):
-            chain.append(m)
-        elif os.environ.get("OPENROUTER_API_KEY"):
-            if provider == "anthropic":
-                name = re.sub(r"-(\d+)-(\d+)$", r"-\1.\2", name)  # OpenRouter writes claude-sonnet-4.6
-            chain.append(OpenRouterModel(f"{provider}/{name}", settings=ModelSettings(openrouter_provider=_OPENROUTER_PROVIDER)))
-    if not chain:
-        raise RuntimeError(f"No API key configured for {model} (see .env).")
-    return chain[0] if len(chain) == 1 else FallbackModel(*chain)
+def _resolve_chain(chain: str) -> list:
+    """The keyed links of ``chain``, in order (a bare name gets 'google:')."""
+    models, skipped = [], []
+    for name in (n.strip() for n in chain.split(",") if n.strip()):
+        if ":" not in name:
+            name = f"google:{name}"
+        try:
+            models.append(infer_model(name))
+        except UserError:                       # the provider's key is unset: not this link
+            skipped.append(name)
+    if not models:
+        raise RuntimeError(f"No API key configured for any of {chain} (see .env).")
+    logger.info("[vlm route] %s%s", " -> ".join(f"{m.system}:{m.model_name}" for m in models),
+                f"  (no key: {', '.join(skipped)})" if skipped else "")
+    return models
 
 
-def _run_agent(agent: Agent, content: list, **run_kwargs):
-    """run_sync, or thread out when a loop is already running (async route)."""
+def _resolve_model(chain: str):
+    """The first keyed link of ``chain``, with the later ones as fallbacks."""
+    models = _resolve_chain(chain)
+    return models[0] if len(models) == 1 else FallbackModel(*models)
+
+
+def _sync(coro):
+    """Run a coroutine from sync code, or thread out when a loop is already running (async route)."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return agent.run_sync(content, **run_kwargs)
+        return asyncio.run(coro)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(
-            lambda: asyncio.run(agent.run(content, **run_kwargs))).result()
+        return executor.submit(asyncio.run, coro).result()
+
+
+def _run_agent(agent: Agent, content: list, **run_kwargs):
+    result = _sync(agent.run(content, **run_kwargs))
+    # Which link of the chain answered: a fallback that fires silently is a prompt drift nobody sees.
+    logger.info("[vlm answered] %s:%s", result.response.provider_name, result.response.model_name)
+    return result
+
+
+def _paint_by_chat(model: OpenAIChatModel, instructions: str, prompt: str, image: Image.Image) -> bytes:
+    """The image out of an OpenAI-compatible chat completion asked for the image modality.
+
+    This is how a gateway serves an image model: pydantic-ai's ImageGeneration
+    has no native tool there and rejects the run before any request.
+    """
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    reply = _sync(model.client.chat.completions.create(
+        model=model.model_name, temperature=0.0, timeout=180,
+        messages=[{"role": "system", "content": instructions},
+                  {"role": "user", "content": [{"type": "text", "text": prompt},
+                                               {"type": "image_url", "image_url": {"url": data_url}}]}],
+        extra_body={"modalities": ["image", "text"]},
+    ))
+    message = reply.choices[0].message
+    images = getattr(message, "images", None) or (message.model_extra or {}).get("images") or []
+    if not images:
+        raise RuntimeError(f"{model.model_name} returned no image: {(message.content or '')[:200]!r}")
+    logger.info("[vlm answered] %s:%s", model.system, reply.model)
+    first = images[0]
+    url = first["image_url"]["url"] if isinstance(first, dict) else first.image_url.url
+    return base64.b64decode(url.split(",", 1)[1])
 
 
 # ── VLM calls (pydantic-ai) ────────────────────────────────────────────────
@@ -360,7 +399,7 @@ Fill the fields in order:
 
 def pick_best_view(
     shots: Dict[int, Image.Image],
-    model: str = "gemini-3-flash-preview",
+    model: str = DESCRIBE_MODEL,
     debug_dir: Optional[str] = None,
 ) -> int:
     """Return the rig index of the view whose tile shows the most parts.
@@ -397,10 +436,10 @@ def pick_best_view(
             choice = _run_agent(
                 Agent(output_type=_ViewChoice, retries=4),
                 [_img_to_content(grid), "Pick the best tile."],
-                model=_resolve_model(model, _DESCRIBE_FALLBACKS),
-                model_settings=ModelSettings(temperature=0.0, seed=7,
-                                             thinking="low", max_tokens=8000,
-                                             timeout=180),
+                model=_resolve_model(model),
+                # No temperature: Anthropic rejects any value but 1 once thinking is on (400), so a Claude
+                # link failed every time and the chain fell through to the next model.
+                model_settings=ModelSettings(seed=7, thinking="low", max_tokens=8000, timeout=180),
                 instructions=_VIEW_PICK_PROMPT,
             ).output
     except Exception as exc:                       # noqa: BLE001 - never fatal
@@ -433,7 +472,7 @@ def pick_best_view(
 
 def _vlm_describe(
     image: Image.Image,
-    model: str = "gemini-2.5-flash",
+    model: str = DESCRIBE_MODEL,
     is_grid: bool = False,
     preferred_language: str = "en",
 ) -> Dict[str, Any]:
@@ -563,7 +602,7 @@ def _vlm_describe(
     with span:
         result = _run_agent(
             agent, [_img_to_content(image), user_prompt],
-            model=_resolve_model(model, _DESCRIBE_FALLBACKS),
+            model=_resolve_model(model),
             model_settings=ModelSettings(temperature=0.0, max_tokens=8000,
                                          timeout=120),
             instructions=system_prompt,
@@ -575,7 +614,7 @@ def _vlm_segment(
     image: Image.Image,
     description: Dict[str, Any],
     color_table: Dict[str, str],
-    model: str = "gemini-3-pro-image",
+    model: str = PAINT_MODEL,
     image_size: Tuple[int, int] = (512, 512),
     bg_color_hex: str = "#ffffff",
     view_name: str = "main",
@@ -666,14 +705,26 @@ def _vlm_segment(
     span = (logfire.span("guidance.generate_segmentation", model=model,
                          view=view_name)
             if logfire else nullcontext())
+    # The chain is walked here rather than by FallbackModel: a chat link paints through
+    # _paint_by_chat, the others through the agent, and either failure hands over to the next.
     with span:
-        result = _run_agent(
-            agent, [user_prompt, _img_to_content(image)],
-            model=_resolve_model(model, _GENERATE_FALLBACKS),
-            model_settings=ModelSettings(temperature=0.0, timeout=180),
-            instructions=system_prompt,
-        )
-    img = Image.open(BytesIO(result.output.data)).convert("RGB")
+        for i, link in enumerate(links := _resolve_chain(model)):
+            try:
+                if isinstance(link, OpenAIChatModel):
+                    data = _paint_by_chat(link, system_prompt, user_prompt, image)
+                else:
+                    data = _run_agent(
+                        agent, [user_prompt, _img_to_content(image)], model=link,
+                        model_settings=ModelSettings(temperature=0.0, timeout=180),
+                        instructions=system_prompt,
+                    ).output.data
+                break
+            except Exception as exc:                  # noqa: BLE001 - the next link is the answer
+                if i == len(links) - 1:
+                    raise
+                logger.warning("[vlm paint] %s:%s failed (%s: %s), next link",
+                               link.system, link.model_name, type(exc).__name__, str(exc)[:160])
+    img = Image.open(BytesIO(data)).convert("RGB")
     if img.size != (W, H):
         img = img.resize((W, H), Image.LANCZOS)
     return img
@@ -694,8 +745,6 @@ VIEW_MAP: Dict[str, int] = {
 }
 WHITE = (255, 255, 255)
 
-DESCRIBE_MODEL = os.environ.get("GEOSAM2_DESCRIBE_MODEL", "google:gemini-3.7-flash")
-PAINT_MODEL = os.environ.get("GEOSAM2_PAINT_MODEL", "google:gemini-3.1-flash-image")
 
 
 def view_on_white(data_root: Path, view: int) -> Image.Image:

@@ -95,8 +95,9 @@ its result compared with the previous one in the viewer. The bundled
 
 `.env` at the repository root, read by the app (the library reads
 `os.environ` only): `GEMINI_API_KEY`, and optionally `GEOSAM2_DESCRIBE_MODEL`
-/ `GEOSAM2_PAINT_MODEL` (pydantic-ai model names), `GEOSAM2_LOG_LEVEL`,
-`GEOSAM2_APP_HOST` / `GEOSAM2_APP_PORT`.
+/ `GEOSAM2_PAINT_MODEL` (comma-separated chains of pydantic-ai `provider:model`
+names, tried in order on their providers' keys; see `.env.dist`),
+`GEOSAM2_LOG_LEVEL`, `GEOSAM2_APP_HOST` / `GEOSAM2_APP_PORT`.
 
 ## Acknowledgements
 
